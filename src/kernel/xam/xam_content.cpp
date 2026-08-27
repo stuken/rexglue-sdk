@@ -143,7 +143,7 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
 
   auto run = [content_manager, xuid, root_name = root_name.value(), flags, content_data,
               disposition_ptr,
-              license_mask_ptr](uint32_t& extended_error, uint32_t& length) -> X_RESULT {
+              license_mask_ptr, overlapped_ptr](uint32_t& extended_error, uint32_t& length) -> X_RESULT {
     X_RESULT result = X_ERROR_INVALID_PARAMETER;
     kDispositionState disposition = kDispositionState::Unknown;
     switch (flags & 0xF) {
@@ -226,6 +226,10 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
 
     extended_error = X_HRESULT_FROM_WIN32(result);
     length = static_cast<uint32_t>(disposition);
+
+    if (result && overlapped_ptr) {
+      result = X_ERROR_FUNCTION_FAILED;
+    }
     return result;
   };
 
@@ -293,35 +297,54 @@ u32 XamContentClose_entry(mapped_string root_name, mapped_void overlapped_ptr) {
 u32 XamContentGetCreator_entry(u32 user_index, mapped_void content_data_ptr,
                                mapped_u32 is_creator_ptr, mapped_u64 creator_xuid_ptr,
                                mapped_void overlapped_ptr) {
-  auto result = X_ERROR_SUCCESS;
-
-  uint64_t xuid = REX_KERNEL_STATE()->user_profile()->xuid();
-  XCONTENT_AGGREGATE_DATA content_data = *content_data_ptr.as<XCONTENT_DATA*>();
-
-  bool content_exists = REX_KERNEL_STATE()->content_manager()->ContentExists(xuid, content_data);
-
-  if (content_exists) {
-    if (content_data.content_type == XContentType::kSavedGame) {
-      // User always creates saves.
-      *is_creator_ptr = 1;
-      if (creator_xuid_ptr) {
-        *creator_xuid_ptr = xuid;
-      }
-    } else {
-      *is_creator_ptr = 0;
-      if (creator_xuid_ptr) {
-        *creator_xuid_ptr = 0;
-      }
-    }
-  } else {
-    result = X_ERROR_PATH_NOT_FOUND;
+  if (!is_creator_ptr) {
+    return X_ERROR_INVALID_PARAMETER;
   }
 
-  if (overlapped_ptr) {
-    REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped_ptr.guest_address(), result);
-    return X_ERROR_IO_PENDING;
-  } else {
+  uint64_t xuid = REX_KERNEL_STATE()->user_profile()->xuid();
+
+  XCONTENT_AGGREGATE_DATA content_data = *content_data_ptr.as<XCONTENT_DATA*>();
+
+  auto run = [content_data, xuid, is_creator_ptr,
+              creator_xuid_ptr, overlapped_ptr](uint32_t& extended_error,
+                                                uint32_t& length) -> X_RESULT {
+    X_RESULT result = X_ERROR_SUCCESS;
+
+    bool content_exists =
+        REX_KERNEL_STATE()->content_manager()->ContentExists(xuid, content_data);
+
+    if (content_exists) {
+      if (content_data.content_type == XContentType::kSavedGame) {
+        *is_creator_ptr = 1;
+        if (creator_xuid_ptr) {
+          *creator_xuid_ptr = xuid;
+        }
+      } else {
+        *is_creator_ptr = 0;
+        if (creator_xuid_ptr) {
+          *creator_xuid_ptr = 0;
+        }
+      }
+    } else {
+      result = X_ERROR_PATH_NOT_FOUND;
+    }
+
+    extended_error = X_HRESULT_FROM_WIN32(result);
+    length = 0;
+
+    if (result && overlapped_ptr) {
+      result = X_ERROR_FUNCTION_FAILED;
+    }
+
     return result;
+  };
+
+  if (!overlapped_ptr) {
+    uint32_t extended_error, length;
+    return run(extended_error, length);
+  } else {
+    REX_KERNEL_STATE()->CompleteOverlappedDeferredEx(run, overlapped_ptr.guest_address());
+    return X_ERROR_IO_PENDING;
   }
 }
 
