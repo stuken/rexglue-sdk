@@ -15,6 +15,8 @@
 
 // GPU Core
 REXCVAR_DECLARE(bool, vsync);
+REXCVAR_DECLARE(bool, ac6_ground_fix);
+REXCVAR_DECLARE(bool, debug_msaa_2x_as_4x);
 REXCVAR_DECLARE(bool, clear_memory_page_state);
 REXCVAR_DECLARE(bool, half_pixel_offset);
 REXCVAR_DECLARE(bool, async_shader_compilation);

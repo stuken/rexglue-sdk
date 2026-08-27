@@ -385,7 +385,7 @@ bool D3D12RenderTargetCache::Initialize() {
 
     // Check if 2x MSAA is supported or needs to be emulated with 4x MSAA
     // instead.
-    if (REXCVAR_GET(native_2x_msaa)) {
+    if (!REXCVAR_GET(debug_msaa_2x_as_4x)) {
       msaa_2x_supported_ = true;
       static const DXGI_FORMAT kRenderTargetDXGIFormats[] = {
           DXGI_FORMAT_R16G16B16A16_FLOAT,

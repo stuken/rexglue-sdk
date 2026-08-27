@@ -370,7 +370,7 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
   }
 
   // 2x MSAA support.
-  if (REXCVAR_GET(native_2x_msaa)) {
+  if (!REXCVAR_GET(debug_msaa_2x_as_4x)) {
     msaa_2x_attachments_supported_ =
         (device_properties.framebufferColorSampleCounts &
          device_properties.framebufferDepthSampleCounts &
