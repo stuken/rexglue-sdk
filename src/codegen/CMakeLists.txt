@@ -111,7 +111,6 @@ target_link_libraries(rexcodegen
     PRIVATE
         tomlplusplus
         disasm
-        xxHash::xxhash
         simde
 )
 

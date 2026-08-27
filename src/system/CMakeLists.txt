@@ -84,10 +84,11 @@ target_link_libraries(rexruntime
         spdlog::spdlog
         tomlplusplus
         SDL3::SDL3
+        # include/rex/hash.h is a public header that includes <xxhash.h>
+        xxHash::xxhash
     PRIVATE
         aes128
         mspack
-        xxHash::xxhash
 )
 
 if(REXGLUE_ENABLE_TRACY)
