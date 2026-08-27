@@ -687,6 +687,7 @@ VulkanTextureCache::SamplerParameters VulkanTextureCache::GetSamplerParameters(
       xenos::ClampModeUsesBorder(parameters.clamp_y) ||
       xenos::ClampModeUsesBorder(parameters.clamp_z)) {
     parameters.border_color = fetch.border_color;
+    parameters.force_bc_w_to_max = fetch.force_bc_w_to_max;
   } else {
     parameters.border_color = xenos::BorderColor::k_ABGR_Black;
   }
@@ -706,39 +707,16 @@ VulkanTextureCache::SamplerParameters VulkanTextureCache::GetSamplerParameters(
   xenos::AnisoFilter aniso_filter = binding.aniso_filter == xenos::AnisoFilter::kUseFetchConst
                                         ? fetch.aniso_filter
                                         : binding.aniso_filter;
-  aniso_filter = std::min(aniso_filter, max_anisotropy_);
-  if (parameters.mag_linear || parameters.min_linear || parameters.mip_linear ||
-      aniso_filter != xenos::AnisoFilter::kDisabled) {
-    // Check if the texture is actually filterable on the host.
-    bool linear_filterable = true;
-    TextureKey texture_key;
-    uint8_t texture_swizzled_signs;
-    BindingInfoFromFetchConstant(fetch, texture_key, &texture_swizzled_signs);
-    if (texture_key.is_valid) {
-      const HostFormatPair& host_format_pair = GetHostFormatPair(texture_key);
-      if ((texture_util::IsAnySignNotSigned(texture_swizzled_signs) &&
-           !host_format_pair.format_unsigned.linear_filterable) ||
-          (texture_util::IsAnySignSigned(texture_swizzled_signs) &&
-           !host_format_pair.format_signed.linear_filterable)) {
-        linear_filterable = false;
-      }
-    } else {
-      linear_filterable = false;
-    }
-    if (!linear_filterable) {
-      parameters.mag_linear = 0;
-      parameters.min_linear = 0;
-      parameters.mip_linear = 0;
-      aniso_filter = xenos::AnisoFilter::kDisabled;
-    }
-  }
   bool min_mag_linear = parameters.mag_linear && parameters.min_linear;
   bool mip_filter_bilinear_or_trilinear =
       mip_filter == xenos::TextureFilter::kPoint || mip_filter == xenos::TextureFilter::kLinear;
   parameters.mip_base_map = mip_filter == xenos::TextureFilter::kBaseMap;
-  uint32_t mip_min_level, mip_max_level;
-  texture_util::GetSubresourcesFromFetchConstant(fetch, nullptr, nullptr, nullptr, nullptr, nullptr,
-                                                 &mip_min_level, &mip_max_level);
+  uint32_t base_page, mip_min_level, mip_max_level;
+  texture_util::GetSubresourcesFromFetchConstant(fetch, nullptr, nullptr, nullptr, &base_page,
+                                                 nullptr, &mip_min_level, &mip_max_level);
+  if (parameters.mip_base_map && base_page != 0) {
+    mip_min_level = 0;
+  }
   parameters.mip_min_level = mip_min_level;
   bool has_mips = mip_max_level > mip_min_level;
   int32_t anisotropic_override = REXCVAR_GET(anisotropic_override);
@@ -754,6 +732,31 @@ VulkanTextureCache::SamplerParameters VulkanTextureCache::GetSamplerParameters(
     parameters.mip_linear = 1;
   }
   parameters.aniso_filter = aniso_filter;
+
+  // Fall back to point sampling if the host can't linearly filter the formats
+  // the texture will be sampled through. Anisotropic filtering implies linear
+  // filtering too.
+  if (parameters.mag_linear || parameters.min_linear || parameters.mip_linear ||
+      parameters.aniso_filter != xenos::AnisoFilter::kDisabled) {
+    bool linear_filterable = false;
+    TextureKey texture_key;
+    uint8_t texture_swizzled_signs;
+    BindingInfoFromFetchConstant(fetch, texture_key, &texture_swizzled_signs);
+    if (texture_key.is_valid) {
+      const HostFormatPair& host_format_pair = GetHostFormatPair(texture_key);
+      linear_filterable =
+          (!texture_util::IsAnySignNotSigned(texture_swizzled_signs) ||
+           host_format_pair.format_unsigned.linear_filterable) &&
+          (!texture_util::IsAnySignSigned(texture_swizzled_signs) ||
+           host_format_pair.format_signed.linear_filterable);
+    }
+    if (!linear_filterable) {
+      parameters.mag_linear = 0;
+      parameters.min_linear = 0;
+      parameters.mip_linear = 0;
+      parameters.aniso_filter = xenos::AnisoFilter::kDisabled;
+    }
+  }
 
   return parameters;
 }
@@ -899,7 +902,8 @@ VkSampler VulkanTextureCache::UseSampler(SamplerParameters parameters, bool& has
         sampler_custom_border_color_create_info.customBorderColor.float32[1] =
             parameters.border_color == xenos::BorderColor::k_ACBYCR_Black ? 0.0f : 0.5f;
         sampler_custom_border_color_create_info.customBorderColor.float32[2] = 0.5f;
-        sampler_custom_border_color_create_info.customBorderColor.float32[3] = 0.0f;
+        sampler_custom_border_color_create_info.customBorderColor.float32[3] =
+            parameters.force_bc_w_to_max ? 1.0f : 0.0f;
         sampler_custom_border_color_create_info.format =
             vulkan_device->properties().customBorderColorWithoutFormat
                 ? VK_FORMAT_UNDEFINED
@@ -921,11 +925,15 @@ VkSampler VulkanTextureCache::UseSampler(SamplerParameters parameters, bool& has
                 vulkan_device->properties().maxCustomBorderColorSamplers);
           }
         }
-        sampler_create_info.borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
+        sampler_create_info.borderColor =
+            parameters.force_bc_w_to_max ? VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK
+                                         : VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
       }
       break;
     default:
-      sampler_create_info.borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
+      sampler_create_info.borderColor =
+          parameters.force_bc_w_to_max ? VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK
+                                       : VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
       break;
   }
   VkSampler vulkan_sampler;

@@ -941,16 +941,14 @@ D3D12TextureCache::SamplerParameters D3D12TextureCache::GetSamplerParameters(
       xenos::ClampModeUsesBorder(parameters.clamp_y) ||
       xenos::ClampModeUsesBorder(parameters.clamp_z)) {
     parameters.border_color = fetch.border_color;
+    parameters.force_bc_w_to_max = fetch.force_bc_w_to_max;
   } else {
     parameters.border_color = xenos::BorderColor::k_ABGR_Black;
   }
 
-  uint32_t mip_min_level, mip_max_level;
-  texture_util::GetSubresourcesFromFetchConstant(fetch, nullptr, nullptr, nullptr, nullptr, nullptr,
-                                                 &mip_min_level, &mip_max_level);
-  parameters.mip_min_level = mip_min_level;
-  bool has_mips = mip_max_level > mip_min_level;
-
+  uint32_t base_page, mip_min_level, mip_max_level;
+  texture_util::GetSubresourcesFromFetchConstant(fetch, nullptr, nullptr, nullptr, &base_page,
+                                                 nullptr, &mip_min_level, &mip_max_level);
   xenos::TextureFilter mag_filter = binding.mag_filter == xenos::TextureFilter::kUseFetchConst
                                         ? fetch.mag_filter
                                         : binding.mag_filter;
@@ -965,6 +963,11 @@ D3D12TextureCache::SamplerParameters D3D12TextureCache::GetSamplerParameters(
   bool mip_filter_bilinear_or_trilinear =
       mip_filter == xenos::TextureFilter::kPoint || mip_filter == xenos::TextureFilter::kLinear;
   bool mip_base_map = mip_filter == xenos::TextureFilter::kBaseMap;
+  if (mip_base_map && base_page != 0) {
+    mip_min_level = 0;
+  }
+  parameters.mip_min_level = mip_min_level;
+  bool has_mips = mip_max_level > mip_min_level;
 
   // TODO(Triang3l): Disable filtering for texture formats not supporting it.
   xenos::AnisoFilter aniso_filter = binding.aniso_filter == xenos::AnisoFilter::kUseFetchConst
@@ -1055,6 +1058,9 @@ void D3D12TextureCache::WriteSampler(SamplerParameters parameters,
       desc.BorderColor[2] = 0.0f;
       desc.BorderColor[3] = 0.0f;
       break;
+  }
+  if (parameters.force_bc_w_to_max) {
+    desc.BorderColor[3] = 1.0f;
   }
   desc.MinLOD = float(parameters.mip_min_level);
   if (parameters.mip_base_map) {
