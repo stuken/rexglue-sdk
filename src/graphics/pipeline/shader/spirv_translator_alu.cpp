@@ -985,7 +985,7 @@ spv::Id SpirvShaderTranslator::ProcessScalarAluOperation(
                     type_float_, ext_inst_glsl_std_450_, GLSLstd450NClamp,
                     builder_->createUnaryBuiltinCall(type_float_, ext_inst_glsl_std_450_,
                                                      GLSLstd450Floor, maxa_address),
-                    builder_->makeFloatConstant(-256.0f), builder_->makeFloatConstant(255.0f))),
+                    builder_->makeFloatConstant(0.0f), builder_->makeFloatConstant(255.0f))),
             var_main_address_register_);
       }
       if (a == b) {
