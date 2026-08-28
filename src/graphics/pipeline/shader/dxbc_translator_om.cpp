@@ -1563,6 +1563,143 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToRTVs() {
       }
       a_.OpEndIf();
     }
+    // For RT0 with MIN/MAX blend op, pre-multiply by the source blend factor
+    // (since D3D12 MIN/MAX ignores blend factors, but Xbox 360 applies them).
+    if (i == 0 && !edram_rov_used_) {
+      xenos::BlendFactor rgb_factor_for_premult =
+          GetDxbcShaderModification().pixel.rt0_blend_rgb_factor_for_premult;
+      xenos::BlendFactor a_factor_for_premult =
+          GetDxbcShaderModification().pixel.rt0_blend_a_factor_for_premult;
+      bool premult_rgb = rgb_factor_for_premult != xenos::BlendFactor::kOne;
+      bool premult_a = a_factor_for_premult != xenos::BlendFactor::kOne;
+      if (premult_rgb || premult_a) {
+        uint32_t premult_temp = PushSystemTemp();
+        // Compute and apply RGB factor.
+        if (premult_rgb) {
+          switch (rgb_factor_for_premult) {
+            case xenos::BlendFactor::kZero:
+              a_.OpMov(dxbc::Dest::R(system_temp_color, 0b0111),
+                       dxbc::Src::LF(0.0f));
+              break;
+            case xenos::BlendFactor::kSrcColor:
+              // Multiply by itself (square).
+              a_.OpMul(dxbc::Dest::R(system_temp_color, 0b0111),
+                       dxbc::Src::R(system_temp_color),
+                       dxbc::Src::R(system_temp_color));
+              break;
+            case xenos::BlendFactor::kOneMinusSrcColor:
+              a_.OpAdd(dxbc::Dest::R(premult_temp, 0b0111), dxbc::Src::LF(1.0f),
+                       -dxbc::Src::R(system_temp_color));
+              a_.OpMul(dxbc::Dest::R(system_temp_color, 0b0111),
+                       dxbc::Src::R(system_temp_color),
+                       dxbc::Src::R(premult_temp));
+              break;
+            case xenos::BlendFactor::kSrcAlpha:
+              a_.OpMul(dxbc::Dest::R(system_temp_color, 0b0111),
+                       dxbc::Src::R(system_temp_color),
+                       dxbc::Src::R(system_temp_color, dxbc::Src::kWWWW));
+              break;
+            case xenos::BlendFactor::kOneMinusSrcAlpha:
+              a_.OpAdd(dxbc::Dest::R(premult_temp, 0b0001), dxbc::Src::LF(1.0f),
+                       -dxbc::Src::R(system_temp_color, dxbc::Src::kWWWW));
+              a_.OpMul(dxbc::Dest::R(system_temp_color, 0b0111),
+                       dxbc::Src::R(system_temp_color),
+                       dxbc::Src::R(premult_temp, dxbc::Src::kXXXX));
+              break;
+            case xenos::BlendFactor::kConstantColor:
+              a_.OpMul(dxbc::Dest::R(system_temp_color, 0b0111),
+                       dxbc::Src::R(system_temp_color),
+                       LoadSystemConstant(
+                           SystemConstants::Index::kEdramBlendConstant,
+                           offsetof(SystemConstants, edram_blend_constant),
+                           dxbc::Src::kXYZW));
+              break;
+            case xenos::BlendFactor::kOneMinusConstantColor:
+              a_.OpAdd(dxbc::Dest::R(premult_temp, 0b0111), dxbc::Src::LF(1.0f),
+                       -LoadSystemConstant(
+                           SystemConstants::Index::kEdramBlendConstant,
+                           offsetof(SystemConstants, edram_blend_constant),
+                           dxbc::Src::kXYZW));
+              a_.OpMul(dxbc::Dest::R(system_temp_color, 0b0111),
+                       dxbc::Src::R(system_temp_color),
+                       dxbc::Src::R(premult_temp));
+              break;
+            case xenos::BlendFactor::kConstantAlpha:
+              a_.OpMul(dxbc::Dest::R(system_temp_color, 0b0111),
+                       dxbc::Src::R(system_temp_color),
+                       LoadSystemConstant(
+                           SystemConstants::Index::kEdramBlendConstant,
+                           offsetof(SystemConstants, edram_blend_constant),
+                           dxbc::Src::kWWWW));
+              break;
+            case xenos::BlendFactor::kOneMinusConstantAlpha:
+              a_.OpAdd(dxbc::Dest::R(premult_temp, 0b0001), dxbc::Src::LF(1.0f),
+                       -LoadSystemConstant(
+                           SystemConstants::Index::kEdramBlendConstant,
+                           offsetof(SystemConstants, edram_blend_constant),
+                           dxbc::Src::kWWWW));
+              a_.OpMul(dxbc::Dest::R(system_temp_color, 0b0111),
+                       dxbc::Src::R(system_temp_color),
+                       dxbc::Src::R(premult_temp, dxbc::Src::kXXXX));
+              break;
+            default:
+              // kOne or unsupported - no pre-multiply.
+              break;
+          }
+        }
+        // Compute and apply alpha factor.
+        if (premult_a) {
+          switch (a_factor_for_premult) {
+            case xenos::BlendFactor::kZero:
+              a_.OpMov(dxbc::Dest::R(system_temp_color, 0b1000),
+                       dxbc::Src::LF(0.0f));
+              break;
+            case xenos::BlendFactor::kSrcColor:
+            case xenos::BlendFactor::kSrcAlpha:
+              // Alpha * Alpha.
+              a_.OpMul(dxbc::Dest::R(system_temp_color, 0b1000),
+                       dxbc::Src::R(system_temp_color, dxbc::Src::kWWWW),
+                       dxbc::Src::R(system_temp_color, dxbc::Src::kWWWW));
+              break;
+            case xenos::BlendFactor::kOneMinusSrcColor:
+            case xenos::BlendFactor::kOneMinusSrcAlpha:
+              a_.OpAdd(dxbc::Dest::R(premult_temp, 0b0001), dxbc::Src::LF(1.0f),
+                       -dxbc::Src::R(system_temp_color, dxbc::Src::kWWWW));
+              a_.OpMul(dxbc::Dest::R(system_temp_color, 0b1000),
+                       dxbc::Src::R(system_temp_color, dxbc::Src::kWWWW),
+                       dxbc::Src::R(premult_temp, dxbc::Src::kXXXX));
+              break;
+            case xenos::BlendFactor::kConstantColor:
+            case xenos::BlendFactor::kConstantAlpha:
+              a_.OpMul(dxbc::Dest::R(system_temp_color, 0b1000),
+                       dxbc::Src::R(system_temp_color, dxbc::Src::kWWWW),
+                       LoadSystemConstant(
+                           SystemConstants::Index::kEdramBlendConstant,
+                           offsetof(SystemConstants, edram_blend_constant),
+                           dxbc::Src::kWWWW));
+              break;
+            case xenos::BlendFactor::kOneMinusConstantColor:
+            case xenos::BlendFactor::kOneMinusConstantAlpha:
+              a_.OpAdd(dxbc::Dest::R(premult_temp, 0b0001), dxbc::Src::LF(1.0f),
+                       -LoadSystemConstant(
+                           SystemConstants::Index::kEdramBlendConstant,
+                           offsetof(SystemConstants, edram_blend_constant),
+                           dxbc::Src::kWWWW));
+              a_.OpMul(dxbc::Dest::R(system_temp_color, 0b1000),
+                       dxbc::Src::R(system_temp_color, dxbc::Src::kWWWW),
+                       dxbc::Src::R(premult_temp, dxbc::Src::kXXXX));
+              break;
+            case xenos::BlendFactor::kSrcAlphaSaturate:
+              // For alpha, SrcAlphaSaturate is 1.0, so no pre-multiply needed.
+              break;
+            default:
+              // kOne or unsupported - no pre-multiply.
+              break;
+          }
+        }
+        PopSystemTemp();  // premult_temp
+      }
+    }
     // Copy the color from a readable temp register to an output register.
     a_.OpMov(dxbc::Dest::O(i), dxbc::Src::R(system_temp_color));
   }
