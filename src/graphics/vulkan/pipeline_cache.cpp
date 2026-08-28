@@ -358,6 +358,13 @@ bool VulkanPipelineCache::Initialize() {
         "async placeholder hot-swap will be unavailable");
   }
 
+  if (REXCVAR_GET(force_depth_clamp) && !vulkan_device->properties().depthClamp) {
+    REXGPU_WARN(
+        "force_depth_clamp is enabled, but the device doesn't support depth "
+        "clamping - guest draws with clipping enabled will still be clipped "
+        "to the host planes");
+  }
+
   uint32_t logical_processor_count = rex::thread::logical_processor_count();
   if (!logical_processor_count) {
     logical_processor_count = 6;
@@ -1460,8 +1467,16 @@ bool VulkanPipelineCache::GetCurrentStateDescription(
   description_out.primitive_topology = primitive_topology;
   description_out.primitive_restart = primitive_processing_result.host_primitive_reset_enabled;
 
+  // With force_depth_clamp, use the host viewport clamp instead of near and far
+  // Z plane clipping. X/Y/W clipping is unchanged. Both 494707EE and 41560881
+  // have passes that rely on alpha inputs that currently gets dropped by
+  // near-plane clipping.
+  // TODO(boma): Investigate whether the difference is in shader arithmetic or
+  // the clipper itself.
   description_out.depth_clamp_enable =
-      device_properties.depthClamp && regs.Get<reg::PA_CL_CLIP_CNTL>().clip_disable;
+      device_properties.depthClamp &&
+      (regs.Get<reg::PA_CL_CLIP_CNTL>().clip_disable ||
+       REXCVAR_GET(force_depth_clamp));
 
   // Tessellated draws are patch-domain polygonal primitives regardless of guest
   // register ambiguity in non-explicit major mode configurations.

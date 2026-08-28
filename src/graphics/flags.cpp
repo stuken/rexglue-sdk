@@ -32,6 +32,11 @@ REXCVAR_DEFINE_BOOL(
     ac6_ground_fix, false, "HACKS",
     "This fixes(hide) issues with black ground in AC6. Use only in AC6. "
     "Might cause issues in other titles.");
+REXCVAR_DEFINE_BOOL(
+    force_depth_clamp, false, "GPU",
+    "Use host depth clamping instead of near and far plane clipping when "
+    "guest clipping is enabled. X/Y/W clipping is unaffected. On Vulkan, "
+    "this requires depthClamp support.");
 REXCVAR_DEFINE_STRING(dump_shaders, "", "GPU.Debug", "Path to dump shaders to");
 REXCVAR_DEFINE_BOOL(use_fuzzy_alpha_epsilon, false, "GPU",
                     "Use approximate compare for alpha test values to prevent "
