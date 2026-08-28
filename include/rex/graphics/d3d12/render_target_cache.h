@@ -190,6 +190,13 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
       kResolveCopyShaders[size_t(draw_util::ResolveCopyShaderIndex::kCount)];
   ID3D12PipelineState* resolve_copy_pipelines_[size_t(draw_util::ResolveCopyShaderIndex::kCount)] =
       {};
+  // Unscaled variants for fully native resolves. Only created with resolution
+  // scaling, otherwise the main set is already unscaled. A separate set because
+  // the scaled shaders can't just run at 1x1, their root constants and
+  // destination space assume the scaled resolve buffer.
+  ID3D12RootSignature* resolve_copy_native_root_signature_ = nullptr;
+  ID3D12PipelineState* resolve_copy_native_pipelines_[size_t(
+      draw_util::ResolveCopyShaderIndex::kCount)] = {};
 
   // For host render targets.
 
@@ -662,9 +669,10 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
                               bool draw_resolution_scaled);
 
   // Writes contents of host render targets within rectangles from
-  // ResolveInfo::GetCopyEdramTileSpan to edram_buffer_.
+  // ResolveInfo::GetCopyEdramTileSpan to edram_buffer_ - with the plain 1x1
+  // tile layout if native_layout is set.
   bool DumpRenderTargets(uint32_t dump_base, uint32_t dump_row_length_used, uint32_t dump_rows,
-                         uint32_t dump_pitch);
+                         uint32_t dump_pitch, bool native_layout);
 
   bool use_stencil_reference_output_ = false;
 

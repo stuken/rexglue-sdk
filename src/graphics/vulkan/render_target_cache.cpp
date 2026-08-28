@@ -1287,7 +1287,7 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
 
           // Invalidate textures and mark the range as scaled if needed.
           texture_cache.MarkRangeAsResolved(resolve_info.copy_dest_extent_start,
-                                            resolve_info.copy_dest_extent_length);
+                                            resolve_info.copy_dest_extent_length, true);
           written_address_out = resolve_info.copy_dest_extent_start;
           written_length_out = resolve_info.copy_dest_extent_length;
           copied = true;

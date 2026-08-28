@@ -333,6 +333,21 @@ bool D3D12RenderTargetCache::Initialize() {
     Shutdown();
     return false;
   }
+  if (draw_resolution_scaled) {
+    // Second root signature for fully native resolve copies, full constants
+    // including the dest base, like without scaling.
+    resolve_copy_root_parameters[0].Constants.Num32BitValues =
+        sizeof(draw_util::ResolveCopyShaderConstants) / sizeof(uint32_t);
+    resolve_copy_native_root_signature_ =
+        ui::d3d12::util::CreateRootSignature(provider, resolve_copy_root_signature_desc);
+    if (resolve_copy_native_root_signature_ == nullptr) {
+      REXGPU_ERROR(
+          "D3D12RenderTargetCache: Failed to create the native resolve copy "
+          "root signature");
+      Shutdown();
+      return false;
+    }
+  }
   // Direct resolve currently shares the root signature shape with the resolve
   // copy pass (constants + destination UAV + source SRV) and may diverge later.
   direct_resolve_root_signature_color_ = resolve_copy_root_signature_;
@@ -365,6 +380,21 @@ bool D3D12RenderTargetCache::Initialize() {
         rex::string::to_utf16(resolve_copy_shader_info.debug_name);
     resolve_copy_pipeline->SetName(reinterpret_cast<LPCWSTR>(resolve_copy_pipeline_name.c_str()));
     resolve_copy_pipelines_[i] = resolve_copy_pipeline;
+    if (draw_resolution_scaled) {
+      // Unscaled variant for fully native resolves.
+      ID3D12PipelineState* resolve_copy_native_pipeline = ui::d3d12::util::CreateComputePipeline(
+          device, resolve_copy_shader_code.unscaled, resolve_copy_shader_code.unscaled_size,
+          resolve_copy_native_root_signature_);
+      if (resolve_copy_native_pipeline == nullptr) {
+        REXGPU_ERROR("D3D12RenderTargetCache: Failed to create {} native resolve copy pipeline",
+                     resolve_copy_shader_info.debug_name);
+        Shutdown();
+        return false;
+      }
+      resolve_copy_native_pipeline->SetName(
+          reinterpret_cast<LPCWSTR>(resolve_copy_pipeline_name.c_str()));
+      resolve_copy_native_pipelines_[i] = resolve_copy_native_pipeline;
+    }
   }
 
   // Using the cvar on emulator initialization so used pipelines are consistent
@@ -1026,6 +1056,10 @@ void D3D12RenderTargetCache::Shutdown(bool from_destructor) {
   descriptor_pool_depth_.reset();
   descriptor_pool_color_.reset();
 
+  for (size_t i = 0; i < rex::countof(resolve_copy_native_pipelines_); ++i) {
+    ui::d3d12::util::ReleaseAndNull(resolve_copy_native_pipelines_[i]);
+  }
+  ui::d3d12::util::ReleaseAndNull(resolve_copy_native_root_signature_);
   for (size_t i = 0; i < rex::countof(resolve_copy_pipelines_); ++i) {
     ui::d3d12::util::ReleaseAndNull(resolve_copy_pipelines_[i]);
   }
@@ -1193,17 +1227,40 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
   // Copying.
   bool copied = false;
   if (resolve_info.copy_dest_extent_length) {
+    // If everything owning the source is native, copy at 1x1 into shared
+    // memory.
+    bool copy_native = false;
+    if (GetPath() == Path::kHostRenderTargets) {
+      uint32_t dump_base;
+      uint32_t dump_row_length_used;
+      uint32_t dump_rows;
+      uint32_t dump_pitch;
+      resolve_info.GetCopyEdramTileSpan(dump_base, dump_row_length_used, dump_rows, dump_pitch);
+      copy_native =
+          IsResolveSourceNativeOnly(dump_base, dump_row_length_used, dump_rows, dump_pitch);
+      if (copy_native) {
+        // Redo the resolve info at 1x1 so the scale-dependent fields match
+        // what the unscaled copy shaders expect.
+        if (!draw_util::GetResolveInfo(register_file(), memory, 1, 1,
+                                       fixed_16_truncated_to_minus_1_to_1,
+                                       fixed_16_truncated_to_minus_1_to_1, resolve_info)) {
+          return false;
+        }
+      }
+    }
     draw_util::ResolveCopyShaderConstants copy_shader_constants;
     uint32_t copy_group_count_x, copy_group_count_y;
-    draw_util::ResolveCopyShaderIndex copy_shader =
-        resolve_info.GetCopyShader(draw_resolution_scale_x(), draw_resolution_scale_y(),
-                                   copy_shader_constants, copy_group_count_x, copy_group_count_y);
+    draw_util::ResolveCopyShaderIndex copy_shader = resolve_info.GetCopyShader(
+        copy_native ? 1 : draw_resolution_scale_x(), copy_native ? 1 : draw_resolution_scale_y(),
+        copy_shader_constants, copy_group_count_x, copy_group_count_y);
     assert_true(copy_group_count_x && copy_group_count_y);
     if (copy_shader != draw_util::ResolveCopyShaderIndex::kUnknown) {
       const draw_util::ResolveCopyShaderInfo& copy_shader_info =
           draw_util::resolve_copy_shader_info[size_t(copy_shader)];
+      // Native copies write to shared memory at 1x1 - the direct path targets
+      // the scaled resolve buffer, so only use it for scaled copies.
       bool direct_resolved = false;
-      if (GetPath() == Path::kHostRenderTargets) {
+      if (GetPath() == Path::kHostRenderTargets && !copy_native) {
         if (REXCVAR_GET(direct_host_resolve)) {
           direct_resolved =
               TryResolveCopyDirectly(resolve_info, copy_shader, draw_resolution_scaled);
@@ -1221,16 +1278,20 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
           uint32_t dump_rows;
           uint32_t dump_pitch;
           resolve_info.GetCopyEdramTileSpan(dump_base, dump_row_length_used, dump_rows, dump_pitch);
-          if (!DumpRenderTargets(dump_base, dump_row_length_used, dump_rows, dump_pitch)) {
+          if (!DumpRenderTargets(dump_base, dump_row_length_used, dump_rows, dump_pitch,
+                                 copy_native)) {
             REXGPU_ERROR("D3D12RenderTargetCache: Failed to dump host render targets for resolve");
             return false;
           }
         }
       }
+      // Whether the data goes to the scaled resolve address space rather than
+      // shared memory (native resolves due to a scale threshold don't).
+      bool copy_dest_scaled = draw_resolution_scaled && !copy_native;
 
       // Make sure there is memory to write to.
       bool copy_dest_committed;
-      if (draw_resolution_scaled) {
+      if (copy_dest_scaled) {
         // Committing starting with the beginning of the potentially written
         // extent, but making the buffer containing the base current as the
         // beginning of the bound buffer is the base.
@@ -1255,9 +1316,9 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
         ui::d3d12::util::DescriptorCpuGpuHandlePair descriptor_source;
         ui::d3d12::util::DescriptorCpuGpuHandlePair descriptors[2];
         if (command_processor_.RequestOneUseSingleViewDescriptors(
-                bindless_resources_used_ ? uint32_t(draw_resolution_scaled) : 2, descriptors)) {
+                bindless_resources_used_ ? uint32_t(copy_dest_scaled) : 2, descriptors)) {
           if (bindless_resources_used_) {
-            if (draw_resolution_scaled) {
+            if (copy_dest_scaled) {
               descriptor_dest = descriptors[0];
             } else {
               descriptor_dest = command_processor_.GetSharedMemoryUintPow2BindlessUAVHandlePair(
@@ -1272,7 +1333,7 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
             }
           } else {
             descriptor_dest = descriptors[0];
-            if (!draw_resolution_scaled) {
+            if (!copy_dest_scaled) {
               shared_memory.WriteUintPow2UAVDescriptor(descriptor_dest.first,
                                                        copy_shader_info.dest_bpe_log2);
             }
@@ -1284,7 +1345,7 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
                                               copy_shader_info.source_bpe_log2);
             }
           }
-          if (draw_resolution_scaled) {
+          if (copy_dest_scaled) {
             texture_cache.CreateCurrentScaledResolveRangeUintPow2UAV(
                 descriptor_dest.first, copy_shader_info.dest_bpe_log2);
             texture_cache.TransitionCurrentScaledResolveRange(
@@ -1295,10 +1356,12 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
           TransitionEdramBuffer(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
           // Submit the resolve.
-          command_list.D3DSetComputeRootSignature(resolve_copy_root_signature_);
+          command_list.D3DSetComputeRootSignature(copy_native
+                                                      ? resolve_copy_native_root_signature_
+                                                      : resolve_copy_root_signature_);
           command_list.D3DSetComputeRootDescriptorTable(2, descriptor_source.second);
           command_list.D3DSetComputeRootDescriptorTable(1, descriptor_dest.second);
-          if (draw_resolution_scaled) {
+          if (copy_dest_scaled) {
             command_list.D3DSetComputeRoot32BitConstants(
                 0, sizeof(copy_shader_constants.dest_relative) / sizeof(uint32_t),
                 &copy_shader_constants.dest_relative, 0);
@@ -1306,12 +1369,14 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
             command_list.D3DSetComputeRoot32BitConstants(
                 0, sizeof(copy_shader_constants) / sizeof(uint32_t), &copy_shader_constants, 0);
           }
-          command_processor_.SetExternalPipeline(resolve_copy_pipelines_[size_t(copy_shader)]);
+          command_processor_.SetExternalPipeline(
+              copy_native ? resolve_copy_native_pipelines_[size_t(copy_shader)]
+                          : resolve_copy_pipelines_[size_t(copy_shader)]);
           command_processor_.SubmitBarriers();
           command_list.D3DDispatch(copy_group_count_x, copy_group_count_y, 1);
 
           // Order the resolve with other work using the destination as a UAV.
-          if (draw_resolution_scaled) {
+          if (copy_dest_scaled) {
             texture_cache.MarkCurrentScaledResolveRangeUAVWritesCommitNeeded();
           } else {
             shared_memory.MarkUAVWritesCommitNeeded();
@@ -1319,7 +1384,8 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
 
           // Invalidate textures and mark the range as scaled if needed.
           texture_cache.MarkRangeAsResolved(resolve_info.copy_dest_extent_start,
-                                            resolve_info.copy_dest_extent_length);
+                                            resolve_info.copy_dest_extent_length,
+                                            copy_dest_scaled);
           written_address_out = resolve_info.copy_dest_extent_start;
           written_length_out = resolve_info.copy_dest_extent_length;
           if (copy_dest_info_out) {
@@ -1331,7 +1397,7 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
             *copy_dest_info_out = resolve_info.copy_dest_info;
           }
           if (written_scaled_out) {
-            *written_scaled_out = draw_resolution_scaled;
+            *written_scaled_out = copy_dest_scaled;
           }
           copied = true;
         }
@@ -1582,9 +1648,9 @@ RenderTargetCache::RenderTarget* D3D12RenderTargetCache::CreateRenderTarget(Rend
   D3D12_RESOURCE_DESC resource_desc;
   resource_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
   resource_desc.Alignment = 0;
-  resource_desc.Width = key.GetWidth() * draw_resolution_scale_x();
+  resource_desc.Width = key.GetWidth() * GetKeyScaleX(key);
   resource_desc.Height =
-      GetRenderTargetHeight(key.pitch_tiles_at_32bpp, key.msaa_samples) * draw_resolution_scale_y();
+      GetRenderTargetHeight(key.pitch_tiles_at_32bpp, key.msaa_samples) * GetKeyScaleY(key);
   resource_desc.DepthOrArraySize = 1;
   resource_desc.MipLevels = 1;
   if (key.is_depth) {
@@ -4102,16 +4168,27 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
   bool resolve_clear_needed = render_target_resolve_clear_values && resolve_clear_rectangle;
   D3D12_RECT clear_rect;
   if (resolve_clear_needed) {
+    // All render targets of a clear share the pitch and the scale class.
+    // Take the scale from whichever is there.
+    uint32_t resolve_clear_scale_x = draw_resolution_scale_x();
+    uint32_t resolve_clear_scale_y = draw_resolution_scale_y();
+    for (uint32_t i = 0; i < render_target_count; ++i) {
+      if (render_targets[i]) {
+        resolve_clear_scale_x = GetKeyScaleX(render_targets[i]->key());
+        resolve_clear_scale_y = GetKeyScaleY(render_targets[i]->key());
+        break;
+      }
+    }
     // Assuming the rectangle is already clamped by the setup function from the
     // common render target cache.
-    clear_rect.left = LONG(resolve_clear_rectangle->x_pixels * draw_resolution_scale_x());
-    clear_rect.top = LONG(resolve_clear_rectangle->y_pixels * draw_resolution_scale_y());
+    clear_rect.left = LONG(resolve_clear_rectangle->x_pixels * resolve_clear_scale_x);
+    clear_rect.top = LONG(resolve_clear_rectangle->y_pixels * resolve_clear_scale_y);
     clear_rect.right =
         LONG((resolve_clear_rectangle->x_pixels + resolve_clear_rectangle->width_pixels) *
-             draw_resolution_scale_x());
+             resolve_clear_scale_x);
     clear_rect.bottom =
         LONG((resolve_clear_rectangle->y_pixels + resolve_clear_rectangle->height_pixels) *
-             draw_resolution_scale_y());
+             resolve_clear_scale_y);
   }
 
   // Do host depth storing for the depth destination (assuming there can be only
@@ -4132,6 +4209,7 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
       if (transfer.host_depth_source != dest_rt) {
         continue;
       }
+      assert_false(dest_rt_key.scale_native);
       if (!host_depth_store_set_up) {
         // Bindings.
         // 0 - source.
@@ -4367,8 +4445,6 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
 
   bool transfer_viewport_set = false;
   float pixels_to_ndc_unscaled = 2.0f / float(D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION);
-  float pixels_to_ndc_x = pixels_to_ndc_unscaled * draw_resolution_scale_x();
-  float pixels_to_ndc_y = pixels_to_ndc_unscaled * draw_resolution_scale_y();
 
   TransferRootSignatureIndex last_transfer_root_signature_index =
       TransferRootSignatureIndex::kCount;
@@ -4420,6 +4496,10 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
 
       uint32_t dest_pitch_tiles = dest_rt_key.GetPitchTiles();
       bool dest_is_64bpp = dest_rt_key.Is64bpp();
+      // GetRectangles returns guest pixels.
+      // Scale to the destination.
+      float pixels_to_ndc_x = pixels_to_ndc_unscaled * GetKeyScaleX(dest_rt_key);
+      float pixels_to_ndc_y = pixels_to_ndc_unscaled * GetKeyScaleY(dest_rt_key);
 
       // Gather shader keys and sort to reduce pipeline state and binding
       // switches. Also gather stencil rectangles to clear if needed.
@@ -4431,6 +4511,7 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
       TransferShaderKey new_transfer_shader_key;
       new_transfer_shader_key.dest_msaa_samples = dest_rt_key.msaa_samples;
       new_transfer_shader_key.dest_resource_format = dest_rt_key.resource_format;
+      new_transfer_shader_key.dest_scale_native = dest_rt_key.scale_native;
       uint32_t stencil_clear_rectangle_count = 0;
       for (uint32_t j = 0; j <= uint32_t(need_stencil_bit_draws); ++j) {
         // j == 0 - color or depth.
@@ -4463,6 +4544,9 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
           RenderTargetKey source_rt_key = source_d3d12_rt.key();
           new_transfer_shader_key.source_msaa_samples = source_rt_key.msaa_samples;
           new_transfer_shader_key.source_resource_format = source_rt_key.resource_format;
+          new_transfer_shader_key.source_scale_native = source_rt_key.scale_native;
+          assert_true(!host_depth_source_d3d12_rt ||
+                      host_depth_source_d3d12_rt->key().scale_native == dest_rt_key.scale_native);
           bool host_depth_source_is_copy = host_depth_source_d3d12_rt == &dest_d3d12_rt;
           new_transfer_shader_key.host_depth_source_is_copy = host_depth_source_is_copy;
           // The host depth copy buffer has only raw samples.
@@ -4519,15 +4603,15 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
             const Transfer::Rectangle& stencil_clear_rectangle =
                 transfer_stencil_clear_rectangles[j];
             stencil_clear_rect_write_ptr->left =
-                LONG(stencil_clear_rectangle.x_pixels * draw_resolution_scale_x());
+                LONG(stencil_clear_rectangle.x_pixels * GetKeyScaleX(dest_rt_key));
             stencil_clear_rect_write_ptr->top =
-                LONG(stencil_clear_rectangle.y_pixels * draw_resolution_scale_y());
+                LONG(stencil_clear_rectangle.y_pixels * GetKeyScaleY(dest_rt_key));
             stencil_clear_rect_write_ptr->right =
                 LONG((stencil_clear_rectangle.x_pixels + stencil_clear_rectangle.width_pixels) *
-                     draw_resolution_scale_x());
+                     GetKeyScaleX(dest_rt_key));
             stencil_clear_rect_write_ptr->bottom =
                 LONG((stencil_clear_rectangle.y_pixels + stencil_clear_rectangle.height_pixels) *
-                     draw_resolution_scale_y());
+                     GetKeyScaleY(dest_rt_key));
             ++stencil_clear_rect_write_ptr;
           }
         }
@@ -6008,11 +6092,12 @@ bool D3D12RenderTargetCache::TryResolveCopyDirectly(const draw_util::ResolveInfo
 
   // Dedicated direct resolve dispatches are staged behind the same preflight;
   // keep using the existing dump path until source-image direct shaders land.
-  return DumpRenderTargets(dump_base, dump_row_length_used, dump_rows, dump_pitch);
+  return DumpRenderTargets(dump_base, dump_row_length_used, dump_rows, dump_pitch, false);
 }
 
 bool D3D12RenderTargetCache::DumpRenderTargets(uint32_t dump_base, uint32_t dump_row_length_used,
-                                               uint32_t dump_rows, uint32_t dump_pitch) {
+                                               uint32_t dump_rows, uint32_t dump_pitch,
+                                               bool native_layout) {
   assert_true(GetPath() == Path::kHostRenderTargets);
 
   GetResolveCopyRectanglesToDump(dump_base, dump_row_length_used, dump_rows, dump_pitch,
@@ -6056,10 +6141,14 @@ bool D3D12RenderTargetCache::DumpRenderTargets(uint32_t dump_base, uint32_t dump
       current_temporary_descriptors_cpu_.push_back(d3d12_rt.descriptor_srv_stencil().GetHandle());
     }
     any_sources_32bpp_64bpp[size_t(rt_key.Is64bpp())] = true;
+    // Native layout is only for resolves with ALL native sources.
+    assert_true(!native_layout || rt_key.scale_native);
     DumpPipelineKey pipeline_key;
     pipeline_key.msaa_samples = rt_key.msaa_samples;
     pipeline_key.resource_format = rt_key.resource_format;
     pipeline_key.is_depth = rt_key.is_depth;
+    pipeline_key.source_scale_native = rt_key.scale_native;
+    pipeline_key.native_layout = uint32_t(native_layout);
     dump_invocations_.emplace_back(rectangle, pipeline_key);
   }
   // 32bpp and 64bpp.
@@ -6217,10 +6306,13 @@ bool D3D12RenderTargetCache::DumpRenderTargets(uint32_t dump_base, uint32_t dump
       }
       command_processor_.SubmitBarriers();
       // Processing 40 x 16 x scale samples per dispatch (a 32bpp tile in two
-      // dispatches at 1x1 scale, 64bpp in one dispatch).
-      command_list.D3DDispatch((dispatch.width_tiles * draw_resolution_scale_x())
+      // dispatches at 1x1 scale, 64bpp in one dispatch). The native layout
+      // has a 1x1 footprint.
+      command_list.D3DDispatch((dispatch.width_tiles * (native_layout ? 1 : draw_resolution_scale_x()))
                                    << uint32_t(!format_is_64bpp),
-                               dispatch.height_tiles * draw_resolution_scale_y(), 1);
+                               dispatch.height_tiles *
+                                   (native_layout ? 1 : draw_resolution_scale_y()),
+                               1);
     }
     MarkEdramBufferModified();
   }

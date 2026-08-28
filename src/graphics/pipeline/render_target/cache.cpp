@@ -1050,7 +1050,8 @@ bool RenderTargetCache::PrepareHostRenderTargetsResolveClear(
   }
   uint32_t pitch_pixels =
       pitch_tiles_at_32bpp * (xenos::kEdramTileWidthSamples >> msaa_samples_x_log2);
-  uint32_t pitch_pixels_scaled = pitch_pixels * draw_resolution_scale_x();
+  bool scale_native = IsScaleNativeForPitch(pitch_tiles_at_32bpp, msaa_samples);
+  uint32_t pitch_pixels_scaled = pitch_pixels * (scale_native ? 1 : draw_resolution_scale_x());
   uint32_t max_render_target_width = GetMaxRenderTargetWidth();
   if (pitch_pixels_scaled > max_render_target_width) {
     // TODO(Triang3l): If really needed for some game on some device, clamp the
@@ -1150,6 +1151,7 @@ bool RenderTargetCache::PrepareHostRenderTargetsResolveClear(
     depth_render_target_key.msaa_samples = msaa_samples;
     depth_render_target_key.is_depth = 1;
     depth_render_target_key.resource_format = resolve_info.depth_edram_info.format;
+    depth_render_target_key.scale_native = uint32_t(scale_native);
     depth_render_target = GetOrCreateRenderTarget(depth_render_target_key);
     if (!depth_render_target) {
       // Failed to create the depth render target, don't clear it.
@@ -1166,6 +1168,7 @@ bool RenderTargetCache::PrepareHostRenderTargetsResolveClear(
     color_render_target_key.is_depth = 0;
     color_render_target_key.resource_format = uint32_t(GetColorResourceFormat(
         xenos::ColorRenderTargetFormat(resolve_info.color_edram_info.format)));
+    color_render_target_key.scale_native = uint32_t(scale_native);
     color_render_target = GetOrCreateRenderTarget(color_render_target_key);
     if (!color_render_target) {
       // Failed to create the color render target, don't clear it.
@@ -1320,7 +1323,14 @@ void RenderTargetCache::ChangeOwnership(RenderTargetKey dest, uint32_t start_til
   }
   uint32_t dest_pitch_tiles = dest.GetPitchTiles();
   bool dest_is_64bpp = dest.Is64bpp();
-  bool host_depth_encoding_different = dest.is_depth && GetPath() == Path::kHostRenderTargets &&
+  // Native scale render targets are kept out of host depth tracking entirely
+  // so the host depth buffer region only ever holds data at the global scale
+  // and transfers never read host depth across scale classes. Ranges keep
+  // their old scaled host owners, which is fine. Host depth is only used where
+  // it still round trips to guest depth. Sub threshold depth just loses
+  // float32 precision on round trips anyways.
+  bool host_depth_encoding_different = dest.is_depth && !dest.scale_native &&
+                                       GetPath() == Path::kHostRenderTargets &&
                                        IsHostDepthEncodingDifferent(dest.GetDepthFormat());
   auto change_ownership_in_extent = [&](uint32_t extent_start, uint32_t extent_end) {
     // The map contains consecutive ranges, merged if the adjacent ones are the

@@ -188,6 +188,23 @@ class RenderTargetCache {
   // each.
   uint32_t GetLastUpdateBoundRenderTargets(uint32_t* depth_and_color_formats_out = nullptr) const;
 
+  // Whether surfaces with this pitch render native per the scale threshold.
+  // Compares the tile-aligned width, so it's a pure function of key fields.
+  bool IsScaleNativeForPitch(uint32_t pitch_tiles_at_32bpp,
+                             xenos::MsaaSamples msaa_samples) const;
+  // Same for RB_SURFACE_INFO
+  bool IsDrawScaleNative() const;
+  // Scale of the current draw, the global scale or 1x1 under the threshold.
+  // Everything per-draw must use these so a draw never mixes scales.
+  // Quietly assuming the global scale all but promises a bunch of mixed-
+  // space artifacts (trust me).
+  uint32_t GetDrawScaleX() const {
+    return IsDrawScaleNative() ? 1 : draw_resolution_scale_x();
+  }
+  uint32_t GetDrawScaleY() const {
+    return IsDrawScaleNative() ? 1 : draw_resolution_scale_y();
+  }
+
  protected:
   RenderTargetCache(const RegisterFile& register_file, const memory::Memory& memory,
                     uint32_t draw_resolution_scale_x, uint32_t draw_resolution_scale_y)
@@ -305,23 +322,6 @@ class RenderTargetCache {
   }
   uint32_t GetKeyScaleY(RenderTargetKey key) const {
     return key.scale_native ? 1 : draw_resolution_scale_y();
-  }
-
-  // Whether surfaces with this pitch render native per the scale threshold.
-  // Compares the tile-aligned width, so it's a pure function of key fields.
-  bool IsScaleNativeForPitch(uint32_t pitch_tiles_at_32bpp,
-                             xenos::MsaaSamples msaa_samples) const;
-  // Same for RB_SURFACE_INFO
-  bool IsDrawScaleNative() const;
-  // Scale of the current draw, the global scale or 1x1 under the threshold.
-  // Everything per-draw must use these so a draw never mixes scales.
-  // Quietly assuming the global scale all but promises a bunch of mixed-
-  // space artifacts (trust me).
-  uint32_t GetDrawScaleX() const {
-    return IsDrawScaleNative() ? 1 : draw_resolution_scale_x();
-  }
-  uint32_t GetDrawScaleY() const {
-    return IsDrawScaleNative() ? 1 : draw_resolution_scale_y();
   }
 
   class RenderTarget {

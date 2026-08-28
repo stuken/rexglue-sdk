@@ -2391,9 +2391,14 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     current_external_pipeline_ = nullptr;
   }
 
-  // Get dynamic rasterizer state.
-  uint32_t draw_resolution_scale_x = texture_cache_->draw_resolution_scale_x();
-  uint32_t draw_resolution_scale_y = texture_cache_->draw_resolution_scale_y();
+  // Get dynamic rasterizer state. Using the resolution scale of this draw,
+  // which may be 1x1 because of draw_resolution_scale_threshold.
+  uint32_t draw_resolution_scale_x = render_target_cache_->GetDrawScaleX();
+  uint32_t draw_resolution_scale_y = render_target_cache_->GetDrawScaleY();
+  // ZPD segments can't mix scales. The resolved sample count is divided by
+  // one scale area per segment. Split before the ROV counter index goes
+  // into system constants.
+  UpdateZPDScale(draw_resolution_scale_x * draw_resolution_scale_y);
 
   bool convert_z_to_float24 =
       host_render_targets_used && render_target_cache_->depth_float24_convert_in_pixel_shader();
@@ -2412,6 +2417,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
               sizeof(viewport_key.vport_regs));
   viewport_key.flags = (uint32_t(convert_z_to_float24) << 0) |
                        (uint32_t(host_render_targets_used) << 1) | (uint32_t(ps_writes_depth) << 2);
+  viewport_key.draw_resolution_scale_x = draw_resolution_scale_x;
+  viewport_key.draw_resolution_scale_y = draw_resolution_scale_y;
 
   draw_util::ViewportInfo viewport_info;
   if (viewport_cache_valid_ && viewport_key == previous_viewport_key_) {
@@ -2865,8 +2872,9 @@ bool D3D12CommandProcessor::IssueCopy() {
 bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
   uint32_t written_address, written_length;
   reg::RB_COPY_DEST_INFO copy_dest_info;
+  bool is_scaled;
   if (!render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_, written_address,
-                                     written_length, &copy_dest_info)) {
+                                     written_length, &copy_dest_info, &is_scaled)) {
     return false;
   }
 
@@ -2878,7 +2886,11 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
     return true;
   }
 
-  bool is_scaled = texture_cache_->IsDrawResolutionScaled();
+  // With resolution scaling, the resolve went to the scaled resolve buffer,
+  // and a compute downscale back to 1x is needed before readback. If any
+  // prerequisite fails, skip the readback - that was previously the behavior
+  // for every scaled resolve. If applicable, native resolves due to a scale
+  // threshold went to shared memory and are read back directly.
   uint64_t resolve_key = MakeReadbackResolveKey(written_address, written_length);
   ReadbackBuffer& rb = readback_buffers_[resolve_key];
   rb.last_used_frame = frame_current_;
@@ -3647,13 +3659,10 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
 
   bool edram_rov_used =
       render_target_cache_->GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
-  uint32_t draw_resolution_scale_x = texture_cache_->draw_resolution_scale_x();
-  uint32_t draw_resolution_scale_y = texture_cache_->draw_resolution_scale_y();
-
-  // ZPD segments can't mix scales. The resolved sample count is divided by
-  // one scale area per segment. Split before the ROV counter index goes
-  // into system constants.
-  UpdateZPDScale(draw_resolution_scale_x * draw_resolution_scale_y);
+  // Resolution scale of this draw.
+  // 1x1 with draw_resolution_scale_threshold (RTV only).
+  uint32_t draw_resolution_scale_x = render_target_cache_->GetDrawScaleX();
+  uint32_t draw_resolution_scale_y = render_target_cache_->GetDrawScaleY();
 
   // Get the color info register values for each render target. Also, for ROV,
   // exclude components that don't exist in the format from the write mask.

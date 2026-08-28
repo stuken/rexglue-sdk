@@ -519,6 +519,10 @@ class D3D12CommandProcessor : public CommandProcessor {
     uint32_t normalized_depth_control;
     uint32_t vport_regs[6];  // XSCALE, XOFFSET, YSCALE, YOFFSET, ZSCALE, ZOFFSET
     uint32_t flags;          // packed: convert_z_to_float24, full_float24, ps_writes_depth
+    // Compared since with a scale threshold the scale can differ per draw and
+    // a cached viewport has to match it.
+    uint32_t draw_resolution_scale_x;
+    uint32_t draw_resolution_scale_y;
     bool operator==(const ViewportCacheKey&) const = default;
   };
   ViewportCacheKey previous_viewport_key_{};
