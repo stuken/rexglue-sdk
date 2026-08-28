@@ -111,7 +111,7 @@ class DxbcShaderTranslator : public ShaderTranslator {
     // If anything in this is structure is changed in a way not compatible with
     // the previous layout, invalidate the pipeline storages by increasing this
     // version number (0xYYYYMMDD)!
-    static constexpr uint32_t kVersion = 0x20260803;
+    static constexpr uint32_t kVersion = 0x20260804;
 
     enum class DepthStencilMode : uint32_t {
       kNoModifiers,
