@@ -99,6 +99,12 @@ class PipelineCache {
     return reinterpret_cast<const Pipeline*>(handle)->state.load(std::memory_order_acquire);
   }
 
+  // Waits for any pipeline creation needed by the current draw path to finish
+  // before state is consumed. This was added so strict ZPD query paths stop
+  // racing pipeline compilation and then blocking work on incomplete state.
+  void AwaitPipelineCompletion();
+  ID3D12PipelineState* AwaitD3D12PipelineByHandle(void* handle);
+
  private:
   REXPACKEDSTRUCT(ShaderStoredHeader, {
     uint64_t ucode_data_hash;

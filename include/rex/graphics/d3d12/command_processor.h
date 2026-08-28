@@ -28,6 +28,7 @@
 #include <rex/graphics/d3d12/graphics_system.h>
 #include <rex/graphics/d3d12/pipeline_cache.h>
 #include <rex/graphics/d3d12/primitive_processor.h>
+#include <rex/graphics/d3d12/zpd_query_pool.h>
 #include <rex/graphics/d3d12/render_target_cache.h>
 #include <rex/graphics/d3d12/shared_memory.h>
 #include <rex/graphics/d3d12/texture_cache.h>
@@ -144,6 +145,7 @@ class D3D12CommandProcessor : public CommandProcessor {
     kEdramR32UintUAV,
     kEdramR32G32UintUAV,
     kEdramR32G32B32A32UintUAV,
+    kZpdROVCounterRawUAV,
 
     kGammaRampTableSRV,
     kGammaRampPWLSRV,
@@ -201,8 +203,42 @@ class D3D12CommandProcessor : public CommandProcessor {
 
   void WriteRegister(uint32_t index, uint32_t value) override;
   void WriteRegistersFromMem(uint32_t start_index, uint32_t* base, uint32_t num_registers) override;
-  bool ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* reader, uint32_t packet,
-                                          uint32_t count) override;
+
+  // ZPD occlusion queries backend.
+  // BeginQuery/EndQuery must be in the same command list, segments split at
+  // EndSubmission, resume at BeginSubmission. Discarded queries still need
+  // EndQuery or the heap slot breaks on some drivers. RecordZPDResolveBatch
+  // emits coalesced ResolveQueryData and ROV counter copies at submit.
+  void EnsureZPDQueryResources() override;
+  void ShutdownZPDQueryResources() override {
+    zpd_resolves_in_flight_.clear();
+    zpd_active_query_index_ = UINT32_MAX;
+    zpd_active_query_generation_ = 0;
+    zpd_active_query_is_rov_ = false;
+    zpd_query_pool_needs_rov_counter_ = false;
+    bindful_zpd_rov_counter_buffer_ = nullptr;
+    bindful_zpd_rov_counter_capacity_ = 0;
+    if (!bindless_resources_used_) {
+      draw_view_bindful_heap_index_ =
+          rex::ui::d3d12::D3D12DescriptorHeapPool::kHeapIndexInvalid;
+    }
+    if (zpd_host_query_pool_) {
+      zpd_host_query_pool_->Shutdown();
+    }
+  }
+
+  bool IsZPDQueryPoolReady() const override;
+  bool CanOpenZPDQuery() const override;
+
+  QueryOpenResult OpenZPDQuery(ReportHandle report_handle, bool can_close_submission) override;
+  bool CloseZPDQuery(ReportHandle report_handle, uint64_t& out_submission) override;
+  bool DiscardZPDQuery() override;
+  void PumpQueryResolves() override;
+  bool AwaitQueryResolve(ReportHandle report_handle, uint64_t wait_for_submission) override;
+
+  void PollCompletedSubmission() override;
+
+  void RecordZPDResolveBatch();
 
   void OnGammaRamp256EntryTableValueWritten() override;
   void OnGammaRampPWLValueWritten() override;
@@ -404,23 +440,31 @@ class D3D12CommandProcessor : public CommandProcessor {
     return (uint64_t(first_base_address_dwords) << 32) | uint64_t(total_size);
   }
 
-  bool InitializeOcclusionQueryResources();
-  void ShutdownOcclusionQueryResources();
-  bool BeginGuestOcclusionQuery(uint32_t sample_count_address);
-  bool EndGuestOcclusionQuery(uint32_t sample_count_address,
-                              xenos::xe_gpu_depth_sample_counts* sample_counts);
-  bool AcquireOcclusionQueryIndex(uint32_t& host_index_out);
-  void DisableHostOcclusionQueries();
-  uint64_t NormalizeOcclusionSamples(uint64_t samples) const;
-  void WriteGuestOcclusionResult(xenos::xe_gpu_depth_sample_counts* sample_counts,
-                                 uint64_t samples);
   void InvalidateAllVertexBufferResidency();
   void InvalidateVertexBufferResidency(uint32_t vfetch_index);
   void InvalidateVertexBufferResidencyRange(uint32_t first_vfetch, uint32_t last_vfetch);
 
   void WriteGammaRampSRV(bool is_pwl, D3D12_CPU_DESCRIPTOR_HANDLE handle) const;
+  void WriteZPDROVCounterRawUAVDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle) const;
 
   bool device_removed_ = false;
+
+  struct PendingQueryResolve {
+    uint64_t submission = 0;
+    uint32_t query_index = UINT32_MAX;
+    uint32_t query_generation = 0;
+    uint32_t scale_area = 1;
+    bool uses_rov_counter = false;
+    ReportHandle report_handle = kInvalidReportHandle;
+  };
+  uint32_t zpd_active_query_index_ = UINT32_MAX;
+  uint32_t zpd_active_query_generation_ = 0;
+  bool zpd_active_query_is_rov_ = false;
+  bool zpd_query_pool_needs_rov_counter_ = false;
+  std::deque<PendingQueryResolve> zpd_resolves_in_flight_;
+  ID3D12Resource* bindful_zpd_rov_counter_buffer_ = nullptr;
+  uint32_t bindful_zpd_rov_counter_capacity_ = 0;
+  std::unique_ptr<ZPDQueryPool> zpd_host_query_pool_;
 
   bool cache_clear_requested_ = false;
 
@@ -459,6 +503,7 @@ class D3D12CommandProcessor : public CommandProcessor {
   CommandAllocator* command_allocator_submitted_last_ = nullptr;
   ID3D12GraphicsCommandList* command_list_ = nullptr;
   ID3D12GraphicsCommandList1* command_list_1_ = nullptr;
+  ID3D12GraphicsCommandList2* command_list_2_ = nullptr;
   DeferredCommandList deferred_command_list_;
 
   bool debug_markers_enabled_ = false;
@@ -650,17 +695,6 @@ class D3D12CommandProcessor : public CommandProcessor {
   std::unordered_map<uint64_t, ReadbackBuffer> readback_buffers_;
   std::unordered_map<uint64_t, ReadbackBuffer> memexport_readback_buffers_;
 
-  static constexpr uint32_t kMaxOcclusionQueries = 8192;
-  Microsoft::WRL::ComPtr<ID3D12QueryHeap> occlusion_query_heap_;
-  Microsoft::WRL::ComPtr<ID3D12Resource> occlusion_query_readback_;
-  uint64_t* occlusion_query_readback_mapping_ = nullptr;
-  uint32_t occlusion_query_cursor_ = 0;
-  bool occlusion_query_resources_available_ = false;
-  struct ActiveOcclusionQuery {
-    uint32_t sample_count_address = 0;
-    uint32_t host_index = UINT32_MAX;
-    bool valid = false;
-  } active_occlusion_query_;
   struct VertexBufferState {
     uint32_t address = UINT32_MAX;
     uint32_t size = UINT32_MAX;

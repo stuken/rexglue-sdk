@@ -46,14 +46,14 @@ REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
 REXCVAR_DEFINE_BOOL(occlusion_query_enable, true, "GPU", "Enable host occlusion query handling")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
-REXCVAR_DEFINE_STRING(occlusion_query, "fake", "GPU",
+REXCVAR_DEFINE_STRING(occlusion_query, "fast", "GPU",
                       "Controls hardware occlusion query behavior for EVENT_WRITE_ZPD.\n"
                       "Used for effects like lens flares, object culling, and auto-exposure.\n"
                       " fake: Write a fake result without asking the GPU. Safe for most games,\n"
-                      "       though some effects may look slightly wrong. (default)\n"
+                      "       though some effects may look slightly wrong.\n"
                       " fast: Ask the GPU but don't wait for the answer. Writes a cached\n"
                       "       result immediately and updates it when the GPU catches up.\n"
-                      "       Cached results bias toward visible when guessing.\n"
+                      "       Cached results bias toward visible when guessing. (default)\n"
                       " fast-alt: Variant of fast mode that keeps cached zero results for\n"
                       "           unresolved reports. May improve effects relying on precise\n"
                       "           visibility, but may be less stable for occlusion culling.\n"
@@ -84,11 +84,6 @@ REXCVAR_DEFINE_BOOL(readback_memexport, true, "GPU",
 REXCVAR_DEFINE_BOOL(readback_memexport_fast, true, "GPU",
                     "Use fast double-buffered memexport readback when possible, with "
                     "automatic fallback to full synchronous readback")
-    .lifecycle(rex::cvar::Lifecycle::kHotReload);
-
-REXCVAR_DEFINE_INT32(query_occlusion_fake_sample_count, 1000, "GPU",
-                     "Fake sample count for occlusion queries")
-    .range(1, 100000)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_INT32(occlusion_query_fake_lower_threshold, 80, "GPU",

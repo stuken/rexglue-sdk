@@ -150,73 +150,6 @@ void D3D12CommandProcessor::InitializeShaderStorage(const std::filesystem::path&
   pipeline_cache_->InitializeShaderStorage(cache_root, title_id, blocking);
 }
 
-bool D3D12CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* reader,
-                                                               uint32_t packet, uint32_t count) {
-  if (!REXCVAR_GET(occlusion_query_enable) || !occlusion_query_resources_available_) {
-    return CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(reader, packet, count);
-  }
-
-  const uint32_t kQueryFinished = rex::byte_swap(0xFFFFFEED);
-  assert_true(count == 1);
-  uint32_t initiator = reader->ReadAndSwap<uint32_t>();
-  WriteRegister(XE_GPU_REG_VGT_EVENT_INITIATOR, initiator & 0x3F);
-
-  uint32_t sample_count_addr = register_file_->values[XE_GPU_REG_RB_SAMPLE_COUNT_ADDR];
-  auto* sample_counts =
-      memory_->TranslatePhysical<xenos::xe_gpu_depth_sample_counts*>(sample_count_addr);
-  if (!sample_counts) {
-    DisableHostOcclusionQueries();
-    return true;
-  }
-
-  auto write_fallback_result = [sample_counts, kQueryFinished]() -> bool {
-    auto fake_sample_count = REXCVAR_GET(query_occlusion_fake_sample_count);
-    if (fake_sample_count < 0) {
-      return true;
-    }
-    bool is_end_via_z_pass =
-        sample_counts->ZPass_A == kQueryFinished || sample_counts->ZPass_B == kQueryFinished;
-    bool is_end_via_z_fail =
-        sample_counts->ZFail_A == kQueryFinished || sample_counts->ZFail_B == kQueryFinished;
-    std::memset(sample_counts, 0, sizeof(xenos::xe_gpu_depth_sample_counts));
-    if (is_end_via_z_pass || is_end_via_z_fail) {
-      sample_counts->ZPass_A = fake_sample_count;
-      sample_counts->Total_A = fake_sample_count;
-    }
-    return true;
-  };
-
-  bool is_end_via_z_pass =
-      sample_counts->ZPass_A == kQueryFinished || sample_counts->ZPass_B == kQueryFinished;
-  bool is_end_via_z_fail =
-      sample_counts->ZFail_A == kQueryFinished || sample_counts->ZFail_B == kQueryFinished;
-  bool is_end = is_end_via_z_pass || is_end_via_z_fail;
-
-  if (!is_end) {
-    if (active_occlusion_query_.valid &&
-        active_occlusion_query_.sample_count_address != sample_count_addr) {
-      DisableHostOcclusionQueries();
-      return write_fallback_result();
-    }
-    if (!BeginGuestOcclusionQuery(sample_count_addr)) {
-      return write_fallback_result();
-    }
-    return true;
-  }
-
-  if (!active_occlusion_query_.valid ||
-      active_occlusion_query_.sample_count_address != sample_count_addr) {
-    DisableHostOcclusionQueries();
-    return write_fallback_result();
-  }
-
-  if (!EndGuestOcclusionQuery(sample_count_addr, sample_counts)) {
-    return write_fallback_result();
-  }
-
-  return true;
-}
-
 bool D3D12CommandProcessor::PushTransitionBarrier(ID3D12Resource* resource,
                                                   D3D12_RESOURCE_STATES old_state,
                                                   D3D12_RESOURCE_STATES new_state,
@@ -363,8 +296,8 @@ ID3D12RootSignature* D3D12CommandProcessor::GetRootSignature(const DxbcShader* v
     parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
   }
 
-  // Shared memory and, if ROVs are used, EDRAM.
-  D3D12_DESCRIPTOR_RANGE shared_memory_and_edram_ranges[3];
+  // Shared memory and, if ROVs are used, EDRAM and the ZPD ROV counter.
+  D3D12_DESCRIPTOR_RANGE shared_memory_and_edram_ranges[4];
   {
     auto& parameter = parameters[kRootParameter_Bindful_SharedMemoryAndEdram];
     parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
@@ -392,6 +325,13 @@ ID3D12RootSignature* D3D12CommandProcessor::GetRootSignature(const DxbcShader* v
           UINT(DxbcShaderTranslator::UAVRegister::kEdram);
       shared_memory_and_edram_ranges[2].RegisterSpace = 0;
       shared_memory_and_edram_ranges[2].OffsetInDescriptorsFromTableStart = 2;
+      ++parameter.DescriptorTable.NumDescriptorRanges;
+      shared_memory_and_edram_ranges[3].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+      shared_memory_and_edram_ranges[3].NumDescriptors = 1;
+      shared_memory_and_edram_ranges[3].BaseShaderRegister =
+          UINT(DxbcShaderTranslator::UAVRegister::kZpdRovCounter);
+      shared_memory_and_edram_ranges[3].RegisterSpace = 0;
+      shared_memory_and_edram_ranges[3].OffsetInDescriptorsFromTableStart = 3;
     }
   }
 
@@ -905,6 +845,8 @@ bool D3D12CommandProcessor::SetupContext() {
   command_list_->Close();
   // Optional - added in Creators Update (SDK 10.0.15063.0).
   command_list_->QueryInterface(IID_PPV_ARGS(&command_list_1_));
+  // Optional - added in the 20H2 SDK. Needed for the ZPD ROV counter clear.
+  command_list_->QueryInterface(IID_PPV_ARGS(&command_list_2_));
 
   bindless_resources_used_ = REXCVAR_GET(d3d12_bindless) &&
                              provider.GetResourceBindingTier() >= D3D12_RESOURCE_BINDING_TIER_2;
@@ -940,6 +882,10 @@ bool D3D12CommandProcessor::SetupContext() {
     REXGPU_ERROR("Failed to initialize the render target cache");
     return false;
   }
+
+  // Fallback for query segment normalization when no draw pinned a scale.
+  zpd_draw_resolution_scale_x_ = draw_resolution_scale_x;
+  zpd_draw_resolution_scale_y_ = draw_resolution_scale_y;
 
   // Initialize resource binding.
   constant_buffer_pool_ = std::make_unique<ui::d3d12::D3D12UploadBufferPool>(
@@ -1101,7 +1047,7 @@ bool D3D12CommandProcessor::SetupContext() {
       root_bindless_sampler_range.OffsetInDescriptorsFromTableStart = 0;
     }
     // View heap.
-    D3D12_DESCRIPTOR_RANGE root_bindless_view_ranges[4];
+    D3D12_DESCRIPTOR_RANGE root_bindless_view_ranges[5];
     {
       auto& parameter = root_parameters_bindless[kRootParameter_Bindless_ViewHeap];
       parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
@@ -1119,6 +1065,18 @@ bool D3D12CommandProcessor::SetupContext() {
         range.BaseShaderRegister = UINT(DxbcShaderTranslator::UAVRegister::kEdram);
         range.RegisterSpace = 0;
         range.OffsetInDescriptorsFromTableStart = UINT(SystemBindlessView::kEdramR32UintUAV);
+        // ROV ZPD counter.
+        assert_true(parameter.DescriptorTable.NumDescriptorRanges <
+                    rex::countof(root_bindless_view_ranges));
+        auto& counter_range =
+            root_bindless_view_ranges[parameter.DescriptorTable.NumDescriptorRanges++];
+        counter_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+        counter_range.NumDescriptors = 1;
+        counter_range.BaseShaderRegister =
+            UINT(DxbcShaderTranslator::UAVRegister::kZpdRovCounter);
+        counter_range.RegisterSpace = 0;
+        counter_range.OffsetInDescriptorsFromTableStart =
+            UINT(SystemBindlessView::kZpdROVCounterRawUAV);
       }
       // Used UAV and SRV ranges must not overlap on Nvidia Fermi, so textures
       // have OffsetInDescriptorsFromTableStart after all static descriptors of
@@ -1618,7 +1576,9 @@ bool D3D12CommandProcessor::SetupContext() {
                                             uint32_t(SystemBindlessView::kGammaRampPWLSRV)));
   }
 
-  occlusion_query_resources_available_ = InitializeOcclusionQueryResources();
+  // Initialize the ZPD occlusion query pool and resources.
+  zpd_host_query_pool_ = std::make_unique<ZPDQueryPool>();
+  EnsureZPDQueryResources();
 
   // Just not to expose uninitialized memory.
   std::memset(&system_constants_, 0, sizeof(system_constants_));
@@ -1629,7 +1589,8 @@ bool D3D12CommandProcessor::SetupContext() {
 void D3D12CommandProcessor::ShutdownContext() {
   AwaitAllQueueOperationsCompletion();
   InvalidateAllVertexBufferResidency();
-  ShutdownOcclusionQueryResources();
+  ShutdownZPDQueryResources();
+  zpd_host_query_pool_.reset();
 
   ui::d3d12::util::ReleaseAndNull(readback_buffer_);
   readback_buffer_size_ = 0;
@@ -2257,6 +2218,10 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
 }
 
 void D3D12CommandProcessor::OnPrimaryBufferEnd() {
+  // Pump any completed resolves now since the guest is likely about to poll.
+  PumpQueryResolves();
+  PumpPendingRetire();
+
   if (REXCVAR_GET(d3d12_submit_on_primary_buffer_end) && submission_open_ &&
       CanEndSubmissionImmediately()) {
     EndSubmission(false);
@@ -3203,6 +3168,9 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
   primitive_processor_->CompletedSubmissionUpdated();
 
   texture_cache_->CompletedSubmissionUpdated(submission_completed_);
+
+  // Pull completed query resolves so logical ZPD reports can retire.
+  PumpQueryResolves();
 }
 
 void D3D12CommandProcessor::LogDeviceRemovalDiagnostics(ID3D12Device* device, HRESULT reason) {
@@ -3314,6 +3282,11 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
     // fulfilled).
     deferred_command_list_.Reset();
 
+    // Resume the active query segment.
+    if (GetZPDMode() != ZPDMode::kFake && zpd_active_segment_.logical_active) {
+      OpenQuerySegment(false);
+    }
+
     // Reset cached state of the command list.
     ff_viewport_update_needed_ = true;
     ff_scissor_update_needed_ = true;
@@ -3413,10 +3386,11 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
   if (submission_open_) {
     assert_false(scratch_buffer_used_);
 
-    if (active_occlusion_query_.valid && occlusion_query_heap_) {
-      deferred_command_list_.D3DEndQuery(occlusion_query_heap_.Get(), D3D12_QUERY_TYPE_OCCLUSION,
-                                         active_occlusion_query_.host_index);
-      active_occlusion_query_ = {};
+    // We can't close the command list with an active query - D3D12 requirement.
+    // Close the active segment and emit ResolveQueryData before executing.
+    if (GetZPDMode() != ZPDMode::kFake) {
+      CloseQuerySegment();
+      RecordZPDResolveBatch();
     }
 
     pipeline_cache_->EndSubmission();
@@ -3436,7 +3410,7 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
         command_allocator_writable_first_->command_allocator;
     command_allocator->Reset();
     command_list_->Reset(command_allocator, nullptr);
-    deferred_command_list_.Execute(command_list_, command_list_1_);
+    deferred_command_list_.Execute(command_list_, command_list_1_, command_list_2_);
     command_list_->Close();
     ID3D12CommandList* execute_command_lists[] = {command_list_};
     direct_queue->ExecuteCommandLists(1, execute_command_lists);
@@ -3456,6 +3430,12 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
     direct_queue->Signal(submission_fence_, submission_current_++);
 
     submission_open_ = false;
+
+    // Pump ZPD query process. This drains any resolves that became readable
+    // from completed work and retires reports unblocked by those resolves.
+    // Strict mode may block here before any guest visible progress continues.
+    PumpQueryResolves();
+    PumpPendingRetire();
 
     // Queue operations done directly (like UpdateTileMappings) will be awaited
     // alongside the last submission if needed.
@@ -3669,6 +3649,11 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
       render_target_cache_->GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
   uint32_t draw_resolution_scale_x = texture_cache_->draw_resolution_scale_x();
   uint32_t draw_resolution_scale_y = texture_cache_->draw_resolution_scale_y();
+
+  // ZPD segments can't mix scales. The resolved sample count is divided by
+  // one scale area per segment. Split before the ROV counter index goes
+  // into system constants.
+  UpdateZPDScale(draw_resolution_scale_x * draw_resolution_scale_y);
 
   // Get the color info register values for each render target. Also, for ROV,
   // exclude components that don't exist in the format from the write mask.
@@ -3999,6 +3984,14 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
     uint32_t depth_base_dwords_scaled = rb_depth_info.depth_base * edram_tile_dwords_scaled;
     dirty |= system_constants_.edram_depth_base_dwords_scaled != depth_base_dwords_scaled;
     system_constants_.edram_depth_base_dwords_scaled = depth_base_dwords_scaled;
+
+    uint32_t zpd_rov_counter_index = UINT32_MAX;
+    if (zpd_active_query_is_rov_ && zpd_active_query_index_ != UINT32_MAX &&
+        zpd_host_query_pool_->rov_initialized()) {
+      zpd_rov_counter_index = zpd_active_query_index_;
+    }
+    dirty |= system_constants_.zpd_rov_counter_index != zpd_rov_counter_index;
+    system_constants_.zpd_rov_counter_index = zpd_rov_counter_index;
 
     // For non-polygons, front polygon offset is used, and it's enabled if
     // POLY_OFFSET_PARA_ENABLED is set, for polygons, separate front and back
@@ -4568,9 +4561,9 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
     // textures.
     size_t view_count_full_update = 4 + texture_count_vertex + texture_count_pixel;
     if (edram_rov_used) {
-      // + EDRAM UAV in two tables (with the shared memory SRV and with the
-      // shared memory UAV).
-      view_count_full_update += 2;
+      // + EDRAM UAV and ZPD counter UAV in two tables (with the shared memory
+      // SRV and with the shared memory UAV).
+      view_count_full_update += 4;
     }
     D3D12_CPU_DESCRIPTOR_HANDLE view_cpu_handle;
     D3D12_GPU_DESCRIPTOR_HANDLE view_gpu_handle;
@@ -4610,8 +4603,8 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
       bindful_textures_written_vertex_ = false;
       bindful_textures_written_pixel_ = false;
       // If updating fully, write the shared memory SRV and UAV descriptors and,
-      // if needed, the EDRAM descriptor.
-      // SRV + null UAV + EDRAM.
+      // if needed, the EDRAM and ZPD counter descriptors.
+      // SRV + null UAV + EDRAM + ZPD counter.
       gpu_handle_shared_memory_srv_and_edram_ = view_gpu_handle;
       shared_memory_->WriteRawSRVDescriptor(view_cpu_handle);
       view_cpu_handle.ptr += descriptor_size_view;
@@ -4623,8 +4616,11 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
         render_target_cache_->WriteEdramUintPow2UAVDescriptor(view_cpu_handle, 2);
         view_cpu_handle.ptr += descriptor_size_view;
         view_gpu_handle.ptr += descriptor_size_view;
+        WriteZPDROVCounterRawUAVDescriptor(view_cpu_handle);
+        view_cpu_handle.ptr += descriptor_size_view;
+        view_gpu_handle.ptr += descriptor_size_view;
       }
-      // Null SRV + UAV + EDRAM.
+      // Null SRV + UAV + EDRAM + ZPD counter.
       gpu_handle_shared_memory_uav_and_edram_ = view_gpu_handle;
       ui::d3d12::util::CreateBufferRawSRV(device, view_cpu_handle, nullptr, 0);
       view_cpu_handle.ptr += descriptor_size_view;
@@ -4634,6 +4630,9 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
       view_gpu_handle.ptr += descriptor_size_view;
       if (edram_rov_used) {
         render_target_cache_->WriteEdramUintPow2UAVDescriptor(view_cpu_handle, 2);
+        view_cpu_handle.ptr += descriptor_size_view;
+        view_gpu_handle.ptr += descriptor_size_view;
+        WriteZPDROVCounterRawUAVDescriptor(view_cpu_handle);
         view_cpu_handle.ptr += descriptor_size_view;
         view_gpu_handle.ptr += descriptor_size_view;
       }
@@ -4884,189 +4883,275 @@ ID3D12Resource* D3D12CommandProcessor::RequestReadbackBuffer(uint32_t size) {
   return readback_buffer_;
 }
 
-bool D3D12CommandProcessor::InitializeOcclusionQueryResources() {
-  active_occlusion_query_ = {};
-  occlusion_query_cursor_ = 0;
-  occlusion_query_resources_available_ = false;
-  occlusion_query_heap_.Reset();
-  occlusion_query_readback_.Reset();
-  occlusion_query_readback_mapping_ = nullptr;
-
-  ID3D12Device* device = GetD3D12Provider().GetDevice();
-  if (!device) {
-    return false;
+void D3D12CommandProcessor::EnsureZPDQueryResources() {
+  if (GetZPDMode() == ZPDMode::kFake || !REXCVAR_GET(occlusion_query_enable) ||
+      !zpd_host_query_pool_) {
+    return;
   }
 
-  D3D12_QUERY_HEAP_DESC heap_desc;
-  heap_desc.Type = D3D12_QUERY_HEAP_TYPE_OCCLUSION;
-  heap_desc.Count = kMaxOcclusionQueries;
-  heap_desc.NodeMask = 0;
-  if (FAILED(device->CreateQueryHeap(&heap_desc, IID_PPV_ARGS(&occlusion_query_heap_)))) {
-    REXGPU_WARN(
-        "D3D12CommandProcessor: Failed to create occlusion query heap, using fake sample counts");
-    return false;
+  bool can_recreate = !zpd_active_segment_.logical_active &&
+                      !zpd_active_segment_.segment_active &&
+                      zpd_active_query_index_ == UINT32_MAX && !zpd_active_query_is_rov_ &&
+                      !zpd_host_query_pool_->has_pending_resolve_batch() &&
+                      zpd_resolves_in_flight_.empty();
+  bool needs_rov_counter =
+      render_target_cache_ &&
+      render_target_cache_->GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
+  zpd_query_pool_needs_rov_counter_ = needs_rov_counter;
+  // The ROV counter clear uses WriteBufferImmediate, so only initialize when
+  // CommandList2 is available.
+  bool can_initialize_rov_counter = needs_rov_counter && command_list_2_;
+
+  bool resources_initialized = zpd_host_query_pool_->EnsureInitialized(
+      GetD3D12Provider(), kZPDQueryPoolCapacity, can_recreate, can_initialize_rov_counter);
+  ID3D12Resource* rov_counter_buffer = nullptr;
+  uint32_t rov_counter_capacity = 0;
+  if (resources_initialized && zpd_host_query_pool_->rov_initialized()) {
+    rov_counter_buffer = zpd_host_query_pool_->rov_counter_buffer();
+    rov_counter_capacity = zpd_host_query_pool_->capacity();
   }
-
-  D3D12_RESOURCE_DESC buffer_desc;
-  ui::d3d12::util::FillBufferResourceDesc(buffer_desc, sizeof(uint64_t) * kMaxOcclusionQueries,
-                                          D3D12_RESOURCE_FLAG_NONE);
-  if (FAILED(device->CreateCommittedResource(&ui::d3d12::util::kHeapPropertiesReadback,
-                                             GetD3D12Provider().GetHeapFlagCreateNotZeroed(),
-                                             &buffer_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-                                             IID_PPV_ARGS(&occlusion_query_readback_)))) {
-    REXGPU_WARN(
-        "D3D12CommandProcessor: Failed to allocate occlusion query readback buffer, using fake "
-        "sample counts");
-    occlusion_query_heap_.Reset();
-    return false;
+  if (bindless_resources_used_) {
+    WriteZPDROVCounterRawUAVDescriptor(GetD3D12Provider().OffsetViewDescriptor(
+        view_bindless_heap_cpu_start_, uint32_t(SystemBindlessView::kZpdROVCounterRawUAV)));
+  } else if (bindful_zpd_rov_counter_buffer_ != rov_counter_buffer ||
+             bindful_zpd_rov_counter_capacity_ != rov_counter_capacity) {
+    // If the ROV counter appears or changes after a bindful page was built,
+    // then an old page can end up counting into a null/stale UAV. So invalidate
+    // it and let the normal bindful rebuild pick up the current counter.
+    bindful_zpd_rov_counter_buffer_ = rov_counter_buffer;
+    bindful_zpd_rov_counter_capacity_ = rov_counter_capacity;
+    draw_view_bindful_heap_index_ = ui::d3d12::D3D12DescriptorHeapPool::kHeapIndexInvalid;
   }
-
-  D3D12_RANGE read_range = {0, sizeof(uint64_t) * kMaxOcclusionQueries};
-  void* mapping = nullptr;
-  if (FAILED(occlusion_query_readback_->Map(0, &read_range, &mapping))) {
-    REXGPU_WARN(
-        "D3D12CommandProcessor: Failed to map occlusion query readback buffer, using fake sample "
-        "counts");
-    occlusion_query_readback_.Reset();
-    occlusion_query_heap_.Reset();
-    return false;
-  }
-
-  occlusion_query_readback_mapping_ = reinterpret_cast<uint64_t*>(mapping);
-  occlusion_query_resources_available_ = true;
-  return true;
-}
-
-void D3D12CommandProcessor::ShutdownOcclusionQueryResources() {
-  DisableHostOcclusionQueries();
-
-  if (occlusion_query_readback_ && occlusion_query_readback_mapping_) {
-    occlusion_query_readback_->Unmap(0, nullptr);
-  }
-  occlusion_query_readback_mapping_ = nullptr;
-  occlusion_query_readback_.Reset();
-  occlusion_query_heap_.Reset();
-}
-
-bool D3D12CommandProcessor::AcquireOcclusionQueryIndex(uint32_t& host_index_out) {
-  if (occlusion_query_cursor_ >= kMaxOcclusionQueries) {
-    occlusion_query_cursor_ = 0;
-  }
-  host_index_out = occlusion_query_cursor_++;
-  return true;
-}
-
-void D3D12CommandProcessor::DisableHostOcclusionQueries() {
-  if (active_occlusion_query_.valid && occlusion_query_heap_) {
-    uint32_t host_index = active_occlusion_query_.host_index;
-    // Clear before EndSubmission to prevent the EndSubmission safety net from issuing a second
-    // EndQuery for the same index.
-    active_occlusion_query_ = {};
-    if (BeginSubmission(true)) {
-      deferred_command_list_.D3DEndQuery(occlusion_query_heap_.Get(), D3D12_QUERY_TYPE_OCCLUSION,
-                                         host_index);
-      EndSubmission(false);
+  if (zpd_query_pool_needs_rov_counter_ && !IsZPDQueryPoolReady()) {
+    if (!command_list_2_) {
+      REXGPU_WARN(
+          "ZPD/D3D12: ROV counter unavailable because CommandList2 is not "
+          "available; keeping counter index sentinel active");
+    } else {
+      REXGPU_WARN(
+          "ZPD/D3D12: ROV counter resources unavailable; keeping counter index "
+          "sentinel active");
     }
-  } else {
-    active_occlusion_query_ = {};
   }
-  occlusion_query_cursor_ = 0;
-  occlusion_query_resources_available_ = false;
 }
 
-bool D3D12CommandProcessor::BeginGuestOcclusionQuery(uint32_t sample_count_address) {
-  if (!REXCVAR_GET(occlusion_query_enable) || !occlusion_query_resources_available_) {
+bool D3D12CommandProcessor::IsZPDQueryPoolReady() const {
+  if (!zpd_host_query_pool_ || !zpd_host_query_pool_->rtv_initialized()) {
     return false;
   }
-  if (active_occlusion_query_.valid) {
-    REXGPU_WARN(
-        "D3D12CommandProcessor: Occlusion query begin issued while another query is active");
-    DisableHostOcclusionQueries();
-    return false;
+  if (!zpd_query_pool_needs_rov_counter_) {
+    return true;
+  }
+  return zpd_host_query_pool_->rov_initialized();
+}
+
+bool D3D12CommandProcessor::CanOpenZPDQuery() const { return submission_open_; }
+
+CommandProcessor::QueryOpenResult D3D12CommandProcessor::OpenZPDQuery(
+    ReportHandle report_handle, bool can_close_submission) {
+  bool use_rov_counter_path =
+      zpd_query_pool_needs_rov_counter_ && zpd_host_query_pool_->rov_initialized();
+  bool is_pool_exhausted = !zpd_host_query_pool_->has_free_indices();
+
+  if (is_pool_exhausted) {
+    PumpQueryResolves();
+    is_pool_exhausted = !zpd_host_query_pool_->has_free_indices();
   }
 
-  uint32_t host_index = 0;
-  if (!AcquireOcclusionQueryIndex(host_index)) {
-    return false;
-  }
-  if (!BeginSubmission(true)) {
-    return false;
+  bool waited_for_submission = false;
+
+  if (is_pool_exhausted) {
+    if (GetZPDMode() == ZPDMode::kFast || GetZPDMode() == ZPDMode::kFastAlt) {
+      return QueryOpenResult::kPoolExhausted;
+    }
+
+    uint64_t wait_for = 0;
+    if (!zpd_resolves_in_flight_.empty()) {
+      wait_for = zpd_resolves_in_flight_.front().submission;
+    }
+
+    uint64_t completed_submission = GetCompletedSubmission();
+    if (wait_for > completed_submission) {
+      if (wait_for >= GetCurrentSubmission()) {
+        if (can_close_submission) {
+          if (!EndSubmission(false)) {
+            return QueryOpenResult::kFailed;
+          }
+        }
+        return QueryOpenResult::kDeferred;
+      }
+
+      CheckSubmissionFence(wait_for);
+      waited_for_submission = true;
+      PumpQueryResolves();
+      is_pool_exhausted = !zpd_host_query_pool_->has_free_indices();
+    }
   }
 
-  deferred_command_list_.D3DBeginQuery(occlusion_query_heap_.Get(), D3D12_QUERY_TYPE_OCCLUSION,
-                                       host_index);
-  active_occlusion_query_.sample_count_address = sample_count_address;
-  active_occlusion_query_.host_index = host_index;
-  active_occlusion_query_.valid = true;
+  if (is_pool_exhausted) {
+    return waited_for_submission ? QueryOpenResult::kPoolExhausted : QueryOpenResult::kDeferred;
+  }
+
+  if (!zpd_host_query_pool_->AcquireQueryIndex(zpd_active_query_index_,
+                                               zpd_active_query_generation_)) {
+    return QueryOpenResult::kFailed;
+  }
+
+  zpd_active_query_is_rov_ = use_rov_counter_path;
+
+  // ROV queries don't use D3D12 occlusion queries at all.
+  // While the segment is open, the translated pixel shader accumulates passed
+  // MSAA samples into one counter slot selected via zpd_rov_counter_index.
+  // Clear the slot here so a recycled index never inherits old counts.
+  if (zpd_active_query_is_rov_) {
+    zpd_host_query_pool_->ClearROVCounter(deferred_command_list_, zpd_active_query_index_);
+    return QueryOpenResult::kOpened;
+  }
+
+  zpd_host_query_pool_->BeginQuery(deferred_command_list_, zpd_active_query_index_);
+  return QueryOpenResult::kOpened;
+}
+
+bool D3D12CommandProcessor::CloseZPDQuery(ReportHandle report_handle,
+                                          uint64_t& out_submission) {
+  if (zpd_active_query_is_rov_) {
+    zpd_host_query_pool_->QueueQueryResolve(zpd_active_query_index_, true);
+  } else {
+    zpd_host_query_pool_->EndQuery(deferred_command_list_, zpd_active_query_index_);
+    zpd_host_query_pool_->QueueQueryResolve(zpd_active_query_index_, false);
+  }
+
+  PendingQueryResolve resolve;
+  resolve.submission = GetCurrentSubmission();
+  resolve.query_index = zpd_active_query_index_;
+  resolve.query_generation = zpd_active_query_generation_;
+  resolve.scale_area = GetZPDScaleArea();
+  resolve.uses_rov_counter = zpd_active_query_is_rov_;
+  resolve.report_handle = report_handle;
+  zpd_resolves_in_flight_.push_back(resolve);
+
+  out_submission = resolve.submission;
+
+  zpd_active_query_index_ = UINT32_MAX;
+  zpd_active_query_generation_ = 0;
+  zpd_active_query_is_rov_ = false;
   return true;
 }
 
-bool D3D12CommandProcessor::EndGuestOcclusionQuery(
-    uint32_t sample_count_address, xenos::xe_gpu_depth_sample_counts* sample_counts) {
-  if (!REXCVAR_GET(occlusion_query_enable) || !occlusion_query_resources_available_ ||
-      !active_occlusion_query_.valid || !occlusion_query_heap_ || !occlusion_query_readback_) {
-    return false;
+bool D3D12CommandProcessor::DiscardZPDQuery() {
+  if (zpd_active_query_is_rov_) {
+    // The slot counter may be dirty if draws ran between OpenZPDQuery and here,
+    // but the next OpenZPDQuery will zero it before any new shader accumulates.
+    zpd_host_query_pool_->ReleaseQueryIndex(zpd_active_query_index_, zpd_active_query_generation_);
+    zpd_active_query_index_ = UINT32_MAX;
+    zpd_active_query_generation_ = 0;
+    zpd_active_query_is_rov_ = false;
+    return true;
   }
 
-  uint32_t host_index = active_occlusion_query_.host_index;
-  active_occlusion_query_ = {};
-
-  if (!BeginSubmission(true)) {
-    return false;
-  }
-
-  deferred_command_list_.D3DEndQuery(occlusion_query_heap_.Get(), D3D12_QUERY_TYPE_OCCLUSION,
-                                     host_index);
-  deferred_command_list_.D3DResolveQueryData(
-      occlusion_query_heap_.Get(), D3D12_QUERY_TYPE_OCCLUSION, host_index, 1,
-      occlusion_query_readback_.Get(), sizeof(uint64_t) * host_index);
-
+  // D3D12 requires a paired EndQuery before the slot can be released.
+  // EndSubmission flushes it so the slot can be freed without a resolve.
+  zpd_host_query_pool_->EndQuery(deferred_command_list_, zpd_active_query_index_);
   if (!EndSubmission(false)) {
     return false;
   }
-
-  uint64_t query_submission = submission_current_ ? submission_current_ - 1 : 0;
-  CheckSubmissionFence(query_submission);
-  if (submission_completed_ < query_submission) {
-    return false;
-  }
-  if (!occlusion_query_readback_mapping_) {
-    return false;
-  }
-
-  uint64_t samples = occlusion_query_readback_mapping_[host_index];
-  samples = NormalizeOcclusionSamples(samples);
-  WriteGuestOcclusionResult(sample_counts, samples);
+  zpd_host_query_pool_->ReleaseQueryIndex(zpd_active_query_index_, zpd_active_query_generation_);
+  zpd_active_query_index_ = UINT32_MAX;
+  zpd_active_query_generation_ = 0;
+  zpd_active_query_is_rov_ = false;
   return true;
 }
 
-uint64_t D3D12CommandProcessor::NormalizeOcclusionSamples(uint64_t samples) const {
-  if (samples == 0 || !texture_cache_) {
-    return samples;
-  }
-  uint64_t scale_x = texture_cache_->draw_resolution_scale_x();
-  uint64_t scale_y = texture_cache_->draw_resolution_scale_y();
-  uint64_t scale = scale_x * scale_y;
-  if (scale <= 1) {
-    return samples;
-  }
-  return (samples + (scale >> 1)) / scale;
-}
-
-void D3D12CommandProcessor::WriteGuestOcclusionResult(
-    xenos::xe_gpu_depth_sample_counts* sample_counts, uint64_t samples) {
-  if (!sample_counts) {
+void D3D12CommandProcessor::PumpQueryResolves() {
+  if (GetZPDMode() == ZPDMode::kFake || !zpd_host_query_pool_) {
     return;
   }
-  uint32_t clamped = samples > uint64_t(UINT32_MAX) ? UINT32_MAX : uint32_t(samples);
-  sample_counts->Total_A = clamped;
-  sample_counts->Total_B = 0;
-  sample_counts->ZPass_A = clamped;
-  sample_counts->ZPass_B = 0;
-  sample_counts->ZFail_A = 0;
-  sample_counts->ZFail_B = 0;
-  sample_counts->StencilFail_A = 0;
-  sample_counts->StencilFail_B = 0;
+
+  uint64_t completed = GetCompletedSubmission();
+  if (completed == 0) {
+    return;
+  }
+
+  while (!zpd_resolves_in_flight_.empty()) {
+    if (zpd_resolves_in_flight_.front().submission > completed) {
+      break;
+    }
+    PendingQueryResolve resolve = zpd_resolves_in_flight_.front();
+    zpd_resolves_in_flight_.pop_front();
+
+    if (zpd_host_query_pool_->GenerationMatches(resolve.query_index, resolve.query_generation)) {
+      uint64_t raw_samples = zpd_host_query_pool_->GetQueryReadbackValue(resolve.query_index,
+                                                                         resolve.uses_rov_counter);
+      zpd_host_query_pool_->ReleaseQueryIndex(resolve.query_index, resolve.query_generation);
+      OnZPDQueryResolved(resolve.report_handle, raw_samples, resolve.scale_area);
+    }
+  }
+}
+
+bool D3D12CommandProcessor::AwaitQueryResolve(ReportHandle report_handle,
+                                              uint64_t wait_for_submission) {
+  if (GetZPDMode() == ZPDMode::kFake) {
+    return false;
+  }
+
+  PumpQueryResolves();
+
+  auto it = logical_zpd_reports_.find(report_handle);
+  if (it == logical_zpd_reports_.end()) {
+    return true;
+  }
+  if (it->second.pending_segments == 0 && it->second.ended) {
+    return true;
+  }
+  if (wait_for_submission == 0) {
+    return false;
+  }
+
+  // Ensure the submission is flushed.
+  if (wait_for_submission >= GetCurrentSubmission()) {
+    if (!submission_open_) {
+      return false;
+    }
+    if (!CanEndSubmissionImmediately()) {
+      pipeline_cache_->AwaitPipelineCompletion();
+    }
+    if (!CanEndSubmissionImmediately() || !EndSubmission(false)) {
+      return false;
+    }
+  }
+
+  if (wait_for_submission > GetCompletedSubmission()) {
+    CheckSubmissionFence(wait_for_submission);
+  }
+
+  PumpQueryResolves();
+
+  it = logical_zpd_reports_.find(report_handle);
+  return it == logical_zpd_reports_.end() ||
+         (it->second.pending_segments == 0 && it->second.ended);
+}
+
+void D3D12CommandProcessor::RecordZPDResolveBatch() {
+  zpd_host_query_pool_->FlushResolveBatch(deferred_command_list_, submission_open_);
+}
+
+void D3D12CommandProcessor::PollCompletedSubmission() {
+  // Strict ZPD just needs the completion timeline updated and any ready query
+  // resolves drained here.
+  CheckSubmissionFence(0);
+  PumpQueryResolves();
+}
+
+void D3D12CommandProcessor::WriteZPDROVCounterRawUAVDescriptor(
+    D3D12_CPU_DESCRIPTOR_HANDLE handle) const {
+  ID3D12Device* device = GetD3D12Provider().GetDevice();
+  if (zpd_host_query_pool_ && zpd_host_query_pool_->rov_initialized()) {
+    ui::d3d12::util::CreateBufferRawUAV(
+        device, handle, zpd_host_query_pool_->rov_counter_buffer(),
+        sizeof(uint32_t) * zpd_host_query_pool_->capacity());
+  } else {
+    ui::d3d12::util::CreateBufferRawUAV(device, handle, nullptr, 0);
+  }
 }
 
 void D3D12CommandProcessor::WriteGammaRampSRV(bool is_pwl,

@@ -331,7 +331,9 @@ class DxbcShaderTranslator : public ShaderTranslator {
     uint32_t alpha_to_mask;
     uint32_t edram_32bpp_tile_pitch_dwords_scaled;
     uint32_t edram_depth_base_dwords_scaled;
-    uint32_t padding_edram_depth_base_dwords_scaled;
+    // UINT32_MAX when this draw is outside an active ZPD segment. The shader
+    // helper should treat that as a skip sentinel.
+    uint32_t zpd_rov_counter_index;
 
     float color_exp_bias[4];
 
@@ -441,6 +443,7 @@ class DxbcShaderTranslator : public ShaderTranslator {
       kAlphaToMask,
       kEdram32bppTilePitchDwordsScaled,
       kEdramDepthBaseDwordsScaled,
+      kZpdRovCounterIndex,
 
       kColorExpBias,
 
@@ -525,6 +528,7 @@ class DxbcShaderTranslator : public ShaderTranslator {
   enum class UAVRegister {
     kSharedMemory,
     kEdram,
+    kZpdRovCounter,
   };
 
   uint64_t GetDefaultVertexShaderModification(
@@ -836,6 +840,7 @@ class DxbcShaderTranslator : public ShaderTranslator {
   void CompletePixelShader_AlphaToMask();
   void CompletePixelShader_WriteToRTVs();
   void CompletePixelShader_DSV_DepthTo24Bit();
+  void ROV_AddPassedMSAASamplesToZPD();
   void CompletePixelShader_WriteToROV();
   void CompletePixelShader();
 
@@ -1208,6 +1213,7 @@ class DxbcShaderTranslator : public ShaderTranslator {
   uint32_t uav_count_;
   uint32_t uav_index_shared_memory_;
   uint32_t uav_index_edram_;
+  uint32_t uav_index_zpd_rov_counter_;
 
   std::vector<SamplerBinding> sampler_bindings_;
 };

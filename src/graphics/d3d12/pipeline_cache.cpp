@@ -784,6 +784,36 @@ void PipelineCache::EndSubmission() {
   }
 }
 
+void PipelineCache::AwaitPipelineCompletion() {
+  if (creation_threads_.empty()) {
+    return;
+  }
+
+  bool await_creation_completion_event;
+  {
+    std::lock_guard<std::mutex> lock(creation_request_lock_);
+    await_creation_completion_event = !creation_queue_.empty() || creation_threads_busy_ != 0;
+    if (await_creation_completion_event) {
+      creation_completion_event_->Reset();
+      creation_completion_set_event_ = true;
+    }
+  }
+
+  if (await_creation_completion_event) {
+    creation_request_cond_.notify_one();
+    rex::thread::Wait(creation_completion_event_.get(), false);
+  }
+}
+
+ID3D12PipelineState* PipelineCache::AwaitD3D12PipelineByHandle(void* handle) {
+  ID3D12PipelineState* pipeline = GetD3D12PipelineByHandle(handle);
+  if (pipeline != nullptr) {
+    return pipeline;
+  }
+  AwaitPipelineCompletion();
+  return GetD3D12PipelineByHandle(handle);
+}
+
 bool PipelineCache::IsCreatingPipelines() {
   if (creation_threads_.empty()) {
     return false;

@@ -40,7 +40,6 @@ REXCVAR_DECLARE(int32_t, occlusion_query_fake_lower_threshold);
 REXCVAR_DECLARE(int32_t, occlusion_query_fake_upper_threshold);
 REXCVAR_DECLARE(int32_t, occlusion_query_querybatch_range);
 REXCVAR_DECLARE(double, occlusion_query_saturation);
-REXCVAR_DECLARE(int32_t, query_occlusion_fake_sample_count);
 
 // GPU Depth / Render Target Behavior
 REXCVAR_DECLARE(bool, depth_float24_round);

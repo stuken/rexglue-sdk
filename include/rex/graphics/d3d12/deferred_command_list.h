@@ -33,7 +33,8 @@ class DeferredCommandList {
                       size_t initial_size_bytes = 1_MiB);
 
   void Reset();
-  void Execute(ID3D12GraphicsCommandList* command_list, ID3D12GraphicsCommandList1* command_list_1);
+  void Execute(ID3D12GraphicsCommandList* command_list, ID3D12GraphicsCommandList1* command_list_1,
+               ID3D12GraphicsCommandList2* command_list_2);
 
   D3D12_RECT* ClearDepthStencilViewAllocatedRects(D3D12_CPU_DESCRIPTOR_HANDLE depth_stencil_view,
                                                   D3D12_CLEAR_FLAGS clear_flags, FLOAT depth,
@@ -431,6 +432,13 @@ class DeferredCommandList {
         std::min(num_samples_per_pixel * num_pixels, UINT(16)) * sizeof(D3D12_SAMPLE_POSITION));
   }
 
+  void D3DWriteBufferImmediate(D3D12_GPU_VIRTUAL_ADDRESS dest, UINT value) {
+    auto& args = *reinterpret_cast<D3DWriteBufferImmediateArguments*>(
+        WriteCommand(Command::kD3DWriteBufferImmediate, sizeof(D3DWriteBufferImmediateArguments)));
+    args.dest = dest;
+    args.value = value;
+  }
+
   void BeginDebugMarker(const char* label_name) {
     size_t label_len = std::strlen(label_name);
     uint8_t* args_ptr = reinterpret_cast<uint8_t*>(
@@ -491,6 +499,7 @@ class DeferredCommandList {
     kD3DSetPipelineState,
     kSetPipelineStateHandle,
     kD3DSetSamplePositions,
+    kD3DWriteBufferImmediate,
     kBeginDebugMarker,
     kEndDebugMarker,
     kInsertDebugMarker,
@@ -631,6 +640,11 @@ class DeferredCommandList {
     UINT num_samples_per_pixel;
     UINT num_pixels;
     D3D12_SAMPLE_POSITION sample_positions[16];
+  };
+
+  struct D3DWriteBufferImmediateArguments {
+    D3D12_GPU_VIRTUAL_ADDRESS dest;
+    UINT value;
   };
 
   struct DebugMarkerHeader {
