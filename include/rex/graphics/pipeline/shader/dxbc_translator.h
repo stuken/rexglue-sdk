@@ -763,6 +763,15 @@ class DxbcShaderTranslator : public ShaderTranslator {
   // unchanged or known that it's safe not to await kills/alphatest/AtoC),
   // returns from the shader.
   void ROV_DepthStencilTest();
+  // Converts the float32 components of the register to extended-range float16
+  // in their low 16 bits. Exponent 31 holds finite values up to 131008 of
+  // either sign on the Xbox 360 instead of Inf or NaN, and NaN maps to 0.
+  // Pushes and pops its own temporary registers.
+  void Float32ToF16ExtendedRange(uint32_t reg, uint32_t components);
+  // Converts extended-range float16 in the low 16 bits of the components of
+  // the register, with zeros above, back to float32. Pushes and pops its own
+  // temporary registers.
+  void Float16ExtendedRangeTo32(uint32_t reg, uint32_t components);
   // Unpacks a 32bpp or a 64bpp color in packed_temp.packed_temp_components to
   // color_temp, using 2 temporary VGPRs.
   void ROV_UnpackColor(uint32_t rt_index, uint32_t packed_temp, uint32_t packed_temp_components,
