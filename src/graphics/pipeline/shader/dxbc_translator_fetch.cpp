@@ -697,6 +697,11 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
   }
 
   uint32_t tfetch_index = instr.operands[1].storage_index;
+  xenos::FetchOpDimension coordinate_dimension =
+      instr.dimension == xenos::FetchOpDimension::k1D &&
+              instr.operands[0].component_count > 1
+          ? xenos::FetchOpDimension::k2D
+          : instr.dimension;
 
   // Whether to use gradients (implicit or explicit) for LOD calculation.
   bool use_computed_lod = instr.attributes.use_computed_lod &&
@@ -737,7 +742,7 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
     // be floored as expected, but the left/upper pixel is still sampled
     // instead.
     const float rounding_offset = 1.5f / 1024.0f;
-    switch (instr.dimension) {
+    switch (coordinate_dimension) {
       case xenos::FetchOpDimension::k1D:
         offsets[0] = instr.attributes.offset_x + rounding_offset;
         if (instr.opcode == FetchOpcode::kGetTextureWeights) {
@@ -805,7 +810,7 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
     // calculation with normalized coordinates (or, if a texture filled with LOD
     // indices is used, coordinates will need to be normalized as normally).
     if (!instr.attributes.unnormalized_coordinates) {
-      switch (instr.dimension) {
+      switch (coordinate_dimension) {
         case xenos::FetchOpDimension::k1D:
           // Always need size for 1D textures to support wide 1D textures.
           size_needed_components |= 0b0001;
@@ -823,7 +828,7 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
     // Size needed for normalization (or, for stacked texture layers,
     // denormalization) and for offsets.
     size_needed_components |= offsets_not_zero;
-    switch (instr.dimension) {
+    switch (coordinate_dimension) {
       case xenos::FetchOpDimension::k1D:
         if (instr.attributes.unnormalized_coordinates) {
           size_needed_components |= 0b0001;
@@ -862,7 +867,7 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
   }
   uint32_t size_and_is_3d_temp = size_needed_components ? PushSystemTemp() : UINT32_MAX;
   if (size_needed_components) {
-    switch (instr.dimension) {
+    switch (coordinate_dimension) {
       case xenos::FetchOpDimension::k1D:
         a_.OpUBFE(dxbc::Dest::R(size_and_is_3d_temp, 0b0001), dxbc::Src::LU(24), dxbc::Src::LU(0),
                   RequestTextureFetchConstantWord(tfetch_index, 2));
@@ -1059,10 +1064,11 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
     // coordinates need to be transformed back into the cube space.
     bool coord_operand_temp_pushed = false;
     dxbc::Src coord_operand = LoadOperand(
-        instr.operands[0], (1 << xenos::GetFetchOpDimensionComponentCount(instr.dimension)) - 1,
+        instr.operands[0], (1 << xenos::GetFetchOpDimensionComponentCount(coordinate_dimension)) -
+            1,
         coord_operand_temp_pushed);
     uint32_t normalized_components = 0b0000;
-    switch (instr.dimension) {
+    switch (coordinate_dimension) {
       case xenos::FetchOpDimension::k1D:
         normalized_components = 0b0001;
         break;
@@ -1202,7 +1208,7 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
         }
       }
     }
-    switch (instr.dimension) {
+    switch (coordinate_dimension) {
       case xenos::FetchOpDimension::k1D:
         // Pad to 2D array coordinates.
         a_.OpMov(dxbc::Dest::R(coord_and_sampler_temp, 0b0110), dxbc::Src::LF(0.0f));
@@ -1485,7 +1491,7 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
         }
         if (use_computed_lod) {
           grad_v_temp = PushSystemTemp();
-          switch (instr.dimension) {
+          switch (coordinate_dimension) {
             case xenos::FetchOpDimension::k1D:
               grad_component_count = 1;
               break;
@@ -1561,7 +1567,7 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
                      dxbc::Src::R(grad_v_temp),
                      dxbc::Src::R(grad_v_temp, dxbc::Src::kWWWW));
           }
-          if (instr.dimension == xenos::FetchOpDimension::k1D) {
+          if (coordinate_dimension == xenos::FetchOpDimension::k1D) {
             // Pad the gradients to 2D because 1D textures are fetched as 2D
             // arrays.
             a_.OpMov(dxbc::Dest::R(grad_h_lod_temp, 0b0010), dxbc::Src::LF(0.0f));
