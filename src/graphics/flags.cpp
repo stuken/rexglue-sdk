@@ -21,22 +21,6 @@ REXCVAR_DEFINE_BOOL(
     "scalability testing on host GPU APIs where 2x is not mandatory. MSAA will "
     "be of a similar or worse quality and use more memory.");
 REXCVAR_DEFINE_BOOL(depth_float24_round, false, "GPU", "Round float24 depth values");
-REXCVAR_DEFINE_BOOL(
-    resolve_check_number_format, true, "GPU",
-    "Require the destination number format to match before using fast color "
-    "resolves.\n"
-    "Fast resolves copy the exact EDRAM bits. If a title resolves unsigned "
-    "color data to a signed or integer destination, enabling this forces full "
-    "resolves in the shader so the destination gets repacked instead.");
-REXCVAR_DEFINE_BOOL(
-    gamma_decode_pwl_resolve, true, "GPU",
-    "During 8_8_8_8_GAMMA MSAA color resolves, average the samples in linear "
-    "space instead of averaging the encoded PWL gamma values directly.\n"
-    "This is separate from gamma_render_target_as_unorm16. It only applies "
-    "when a full shader resolve reads an 8_8_8_8_GAMMA EDRAM color source. "
-    "Compatible 8_8_8_8 destinations are written back as PWL gamma.\n"
-    "Leave enabled for games that otherwise look overexposed after gamma "
-    "MSAA resolves. Disable only if it causes a title-specific regression.");
 REXCVAR_DEFINE_BOOL(depth_float24_convert_in_pixel_shader, false, "GPU",
                     "Convert float24 depth in pixel shader");
 REXCVAR_DEFINE_BOOL(depth_transfer_not_equal_test, true, "GPU",

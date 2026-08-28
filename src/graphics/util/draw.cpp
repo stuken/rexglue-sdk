@@ -1123,8 +1123,7 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
     color_edram_info.format = uint32_t(color_info.color_format);
     color_edram_info.format_is_64bpp = is_64bpp;
     color_edram_info.fill_half_pixel_offset = uint32_t(fill_half_pixel_offset);
-    color_edram_info.decode_pwl_gamma =
-        REXCVAR_GET(gamma_decode_pwl_resolve) ? 1u : 0u;
+    color_edram_info.decode_pwl_gamma = 1;
     if ((fixed_rg16_truncated_to_minus_1_to_1 &&
          color_info.color_format == xenos::ColorRenderTargetFormat::k_16_16) ||
         (fixed_rgba16_truncated_to_minus_1_to_1 &&
@@ -1206,19 +1205,17 @@ ResolveCopyShaderIndex ResolveInfo::GetCopyShader(uint32_t draw_resolution_scale
   // encoding will re-alias as 8_8_8_8 before resolving, so any gamma source is
   // always being decoded.
   bool gamma_decoded_source =
-      !is_depth && color_edram_info.decode_pwl_gamma &&
-      xenos::ColorRenderTargetFormat(color_edram_info.format) ==
-          xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA;
+      !is_depth && xenos::ColorRenderTargetFormat(color_edram_info.format) ==
+                       xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA;
   if (is_depth ||
       (!gamma_decoded_source && !copy_dest_info.copy_dest_exp_bias &&
        xenos::IsSingleCopySampleSelected(copy_dest_coordinate_info.copy_sample_select) &&
        xenos::IsColorResolveFormatBitwiseEquivalent(
            xenos::ColorRenderTargetFormat(color_edram_info.format),
            xenos::ColorFormat(copy_dest_info.copy_dest_format)) &&
-       (!REXCVAR_GET(resolve_check_number_format) ||
-        ColorResolveNumberFormatMatches(
-            xenos::ColorFormat(copy_dest_info.copy_dest_format),
-            copy_dest_info.copy_dest_number)))) {
+       ColorResolveNumberFormatMatches(
+           xenos::ColorFormat(copy_dest_info.copy_dest_format),
+           copy_dest_info.copy_dest_number))) {
     if (edram_info.msaa_samples >= xenos::MsaaSamples::k4X) {
       shader = source_is_64bpp ? ResolveCopyShaderIndex::kFast64bpp4xMSAA
                                : ResolveCopyShaderIndex::kFast32bpp4xMSAA;
