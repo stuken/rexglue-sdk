@@ -49,6 +49,10 @@ REXCVAR_DEFINE_BOOL(
     "This fixes(hide) issues with black ground in AC6. Use only in AC6. "
     "Might cause issues in other titles.");
 REXCVAR_DEFINE_BOOL(
+    no_discard_stencil_in_transfer_pipelines, false, "GPU.Debug",
+    "Skip stencil bit discard in render target transfer pipelines. "
+    "May improve performance on some GPUs.");
+REXCVAR_DEFINE_BOOL(
     force_depth_clamp, false, "GPU",
     "Use host depth clamping instead of near and far plane clipping when "
     "guest clipping is enabled. X/Y/W clipping is unaffected. On Vulkan, "

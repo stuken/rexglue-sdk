@@ -1759,8 +1759,164 @@ void D3D12RenderTargetCache::CommitEdramBufferUAVWrites(
   PixelShaderInterlockFullEdramBarrierPlaced();
 }
 
-ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines(
-    TransferShaderKey key) {
+// Indices of host samples that transfer sample remap helpers use:
+// - First sample bit of 4x in Direct3D 10.1+ - horizontal sample.
+// - Second sample bit of 4x in Direct3D 10.1+ - vertical sample.
+// - 2x:
+//   - Native 2x - top sample is 1 in Direct3D 10.1+, bottom sample is 0.
+//   - 2x as 4x - top sample is 0, bottom sample is 3.
+
+// Converts the view pixel coordinates in r0.xy and host sample index to
+// canonical guest sample coordinates, u into r1.x and v into r1.y for a
+// multisampled or resolution scaled view. The guest pixel goes through r1.xy
+// and the subpixel offset via r2.xy in case of scaling, with r2.zw being
+// scratch. r0.w and r1.zw remain untouched.
+static void CanonicalizeSample(dxbc::Assembler& a,
+                               xenos::MsaaSamples msaa_samples,
+                               dxbc::Src host_sample, bool msaa_2x_supported,
+                               uint32_t scale_x, uint32_t scale_y,
+                               dxbc::Src& u_out, dxbc::Src& v_out,
+                               bool& scaled_out) {
+  bool scaled = scale_x > 1 || scale_y > 1;
+  scaled_out = scaled;
+  dxbc::Src guest_x(dxbc::Src::R(0, dxbc::Src::kXXXX));
+  dxbc::Src guest_y(dxbc::Src::R(0, dxbc::Src::kYYYY));
+  if (scaled) {
+    // r1.xy = guest pixel, r2.xy = host subpixel offset
+    a.OpUDiv(dxbc::Dest::R(1, 0b0011), dxbc::Dest::R(2, 0b0011),
+             dxbc::Src::R(0, dxbc::Src::kXYXY),
+             dxbc::Src::LU(scale_x, scale_y, scale_x, scale_y));
+    guest_x = dxbc::Src::R(1, dxbc::Src::kXXXX);
+    guest_y = dxbc::Src::R(1, dxbc::Src::kYYYY);
+  }
+  u_out = guest_x;
+  v_out = guest_y;
+  if (msaa_samples >= xenos::MsaaSamples::k4X) {
+    // The guest sample index is the host sample index, bit 0 horizontal
+    // and bit 1 vertical for both.
+    // r2.z = x with bit 1 = sample bit 0
+    a.OpBFI(dxbc::Dest::R(2, 0b0100), dxbc::Src::LU(1), dxbc::Src::LU(1),
+            host_sample, guest_x);
+    // r2.w = x >> 1
+    a.OpUShR(dxbc::Dest::R(2, 0b1000), guest_x, dxbc::Src::LU(1));
+    // r1.x = u = ((x >> 1) << 2) | ((sample & 1) << 1) | (x & 1)
+    a.OpBFI(dxbc::Dest::R(1, 0b0001), dxbc::Src::LU(30), dxbc::Src::LU(2),
+            dxbc::Src::R(2, dxbc::Src::kWWWW),
+            dxbc::Src::R(2, dxbc::Src::kZZZZ));
+    // r2.z = sample >> 1
+    a.OpUShR(dxbc::Dest::R(2, 0b0100), host_sample, dxbc::Src::LU(1));
+    // r2.z = y with bit 1 = sample bit 1
+    a.OpBFI(dxbc::Dest::R(2, 0b0100), dxbc::Src::LU(1), dxbc::Src::LU(1),
+            dxbc::Src::R(2, dxbc::Src::kZZZZ), guest_y);
+    // r2.w = y >> 1
+    a.OpUShR(dxbc::Dest::R(2, 0b1000), guest_y, dxbc::Src::LU(1));
+    // r1.y = v = ((y >> 1) << 2) | ((sample >> 1) << 1) | (y & 1)
+    a.OpBFI(dxbc::Dest::R(1, 0b0010), dxbc::Src::LU(30), dxbc::Src::LU(2),
+            dxbc::Src::R(2, dxbc::Src::kWWWW),
+            dxbc::Src::R(2, dxbc::Src::kZZZZ));
+    u_out = dxbc::Src::R(1, dxbc::Src::kXXXX);
+    v_out = dxbc::Src::R(1, dxbc::Src::kYYYY);
+  } else if (msaa_samples == xenos::MsaaSamples::k2X) {
+    // r2.z = guest sample index (0 = top, 1 = bottom)
+    if (msaa_2x_supported) {
+      a.OpXOr(dxbc::Dest::R(2, 0b0100), host_sample, dxbc::Src::LU(1));
+    } else {
+      a.OpUShR(dxbc::Dest::R(2, 0b0100), host_sample, dxbc::Src::LU(1));
+    }
+    // r2.w = x >> 1
+    a.OpUShR(dxbc::Dest::R(2, 0b1000), guest_x, dxbc::Src::LU(1));
+    // r2.w = y with bit 1 = x bit 1
+    a.OpBFI(dxbc::Dest::R(2, 0b1000), dxbc::Src::LU(1), dxbc::Src::LU(1),
+            dxbc::Src::R(2, dxbc::Src::kWWWW), guest_y);
+    // r1.x = u = (x & ~2) | (sample << 1)
+    a.OpBFI(dxbc::Dest::R(1, 0b0001), dxbc::Src::LU(1), dxbc::Src::LU(1),
+            dxbc::Src::R(2, dxbc::Src::kZZZZ), guest_x);
+    // r2.z = y >> 1
+    a.OpUShR(dxbc::Dest::R(2, 0b0100), guest_y, dxbc::Src::LU(1));
+    // r1.y = v = ((y >> 1) << 2) | (x & 2) | (y & 1)
+    a.OpBFI(dxbc::Dest::R(1, 0b0010), dxbc::Src::LU(30), dxbc::Src::LU(2),
+            dxbc::Src::R(2, dxbc::Src::kZZZZ),
+            dxbc::Src::R(2, dxbc::Src::kWWWW));
+    u_out = dxbc::Src::R(1, dxbc::Src::kXXXX);
+    v_out = dxbc::Src::R(1, dxbc::Src::kYYYY);
+  }
+}
+
+// Converts the canonical guest sample coordinates back to view pixels,
+// r1.xy for a multisampled or resolution scaled view and scaled by the subpixel
+// offset in r2.xy, along with host sample index in r1.z. sample_out is
+// unaffected for a single sampled view.
+// Uses r2.zw as scratch and leaves r0.w and r1.w unchanged.
+static void DecanonicalizeSample(dxbc::Assembler& a,
+                                 xenos::MsaaSamples msaa_samples, dxbc::Src u,
+                                 dxbc::Src v, bool scaled,
+                                 bool msaa_2x_supported, uint32_t scale_x,
+                                 uint32_t scale_y, dxbc::Src& x_out,
+                                 dxbc::Src& y_out, dxbc::Src& sample_out) {
+  x_out = u;
+  y_out = v;
+  if (msaa_samples >= xenos::MsaaSamples::k4X) {
+    // The host sample index is the guest sample index.
+    // r2.z = (u >> 1) & 1
+    a.OpUBFE(dxbc::Dest::R(2, 0b0100), dxbc::Src::LU(1), dxbc::Src::LU(1), u);
+    // r2.w = v & 2
+    a.OpAnd(dxbc::Dest::R(2, 0b1000), v, dxbc::Src::LU(2));
+    // r1.z = sample = ((u >> 1) & 1) | (v & 2)
+    a.OpOr(dxbc::Dest::R(1, 0b0100), dxbc::Src::R(2, dxbc::Src::kZZZZ),
+           dxbc::Src::R(2, dxbc::Src::kWWWW));
+    sample_out = dxbc::Src::R(1, dxbc::Src::kZZZZ);
+    // r2.z = u >> 2
+    a.OpUShR(dxbc::Dest::R(2, 0b0100), u, dxbc::Src::LU(2));
+    // r1.x = x = ((u >> 2) << 1) | (u & 1)
+    a.OpBFI(dxbc::Dest::R(1, 0b0001), dxbc::Src::LU(31), dxbc::Src::LU(1),
+            dxbc::Src::R(2, dxbc::Src::kZZZZ), u);
+    // r2.w = v >> 2
+    a.OpUShR(dxbc::Dest::R(2, 0b1000), v, dxbc::Src::LU(2));
+    // r1.y = y = ((v >> 2) << 1) | (v & 1)
+    a.OpBFI(dxbc::Dest::R(1, 0b0010), dxbc::Src::LU(31), dxbc::Src::LU(1),
+            dxbc::Src::R(2, dxbc::Src::kWWWW), v);
+    x_out = dxbc::Src::R(1, dxbc::Src::kXXXX);
+    y_out = dxbc::Src::R(1, dxbc::Src::kYYYY);
+  } else if (msaa_samples == xenos::MsaaSamples::k2X) {
+    // r2.z = guest sample = (u >> 1) & 1 (0 = top, 1 = bottom)
+    a.OpUBFE(dxbc::Dest::R(2, 0b0100), dxbc::Src::LU(1), dxbc::Src::LU(1), u);
+    // r1.z = host sample index
+    if (msaa_2x_supported) {
+      a.OpXOr(dxbc::Dest::R(1, 0b0100), dxbc::Src::R(2, dxbc::Src::kZZZZ),
+              dxbc::Src::LU(1));
+    } else {
+      // The guest sample 1 is the host sample 3 when 2x is emulated as
+      // 4x.
+      a.OpBFI(dxbc::Dest::R(1, 0b0100), dxbc::Src::LU(1), dxbc::Src::LU(1),
+              dxbc::Src::R(2, dxbc::Src::kZZZZ),
+              dxbc::Src::R(2, dxbc::Src::kZZZZ));
+    }
+    sample_out = dxbc::Src::R(1, dxbc::Src::kZZZZ);
+    // r2.w = v >> 1
+    a.OpUShR(dxbc::Dest::R(2, 0b1000), v, dxbc::Src::LU(1));
+    // r1.x = x = (u & ~3) | (v & 2) | (u & 1)
+    a.OpBFI(dxbc::Dest::R(1, 0b0001), dxbc::Src::LU(1), dxbc::Src::LU(1),
+            dxbc::Src::R(2, dxbc::Src::kWWWW), u);
+    // r2.w = v >> 2
+    a.OpUShR(dxbc::Dest::R(2, 0b1000), v, dxbc::Src::LU(2));
+    // r1.y = y = ((v >> 2) << 1) | (v & 1)
+    a.OpBFI(dxbc::Dest::R(1, 0b0010), dxbc::Src::LU(31), dxbc::Src::LU(1),
+            dxbc::Src::R(2, dxbc::Src::kWWWW), v);
+    x_out = dxbc::Src::R(1, dxbc::Src::kXXXX);
+    y_out = dxbc::Src::R(1, dxbc::Src::kYYYY);
+  }
+  if (scaled) {
+    // Every scaled composition has the guest pixel in r1.xy at this point.
+    // Restore the host pixel from it and the subpixel offset.
+    a.OpUMAd(dxbc::Dest::R(1, 0b0011), dxbc::Src::R(1),
+             dxbc::Src::LU(scale_x, scale_y, 1, 1), dxbc::Src::R(2));
+    x_out = dxbc::Src::R(1, dxbc::Src::kXXXX);
+    y_out = dxbc::Src::R(1, dxbc::Src::kYYYY);
+  }
+}
+
+ID3D12PipelineState* const*
+D3D12RenderTargetCache::GetOrCreateTransferPipelines(TransferShaderKey key) {
   const TransferModeInfo& mode = kTransferModes[size_t(key.mode)];
   bool dest_is_stencil_bit = (mode.output == TransferOutput::kStencilBit);
 
@@ -1776,9 +1932,9 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
     }
   }
 
-  uint32_t rs = kTransferUsedRootParameters[size_t(use_stencil_reference_output_
-                                                       ? mode.root_signature_with_stencil_ref
-                                                       : mode.root_signature_no_stencil_ref)];
+  uint32_t rs = kTransferUsedRootParameters[size_t(
+      use_stencil_reference_output_ ? mode.root_signature_with_stencil_ref
+                                    : mode.root_signature_no_stencil_ref)];
 
   // If not dest_is_color, it's depth, or stencil bit - 40-sample columns are
   // swapped as opposed to color source.
@@ -1788,7 +1944,8 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
       xenos::ColorRenderTargetFormat(key.dest_resource_format);
   xenos::DepthRenderTargetFormat dest_depth_format =
       xenos::DepthRenderTargetFormat(key.dest_resource_format);
-  bool dest_is_64bpp = dest_is_color && xenos::IsColorRenderTargetFormat64bpp(dest_color_format);
+  bool dest_is_64bpp =
+      dest_is_color && xenos::IsColorRenderTargetFormat64bpp(dest_color_format);
   // Whether dest is gamma stored as R16G16B16A16_UNORM (64bpp host storage but
   // 32bpp coordinate addressing).
   bool dest_is_gamma_unorm16 =
@@ -1810,22 +1967,26 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
   if (source_is_color) {
     assert_zero(rs & kTransferUsedRootParameterDepthSRVBit);
     assert_zero(rs & kTransferUsedRootParameterStencilSRVBit);
-    source_is_64bpp = xenos::IsColorRenderTargetFormat64bpp(source_color_format);
+    source_is_64bpp =
+        xenos::IsColorRenderTargetFormat64bpp(source_color_format);
     source_color_format_component_count =
         xenos::GetColorRenderTargetFormatComponentCount(source_color_format);
     if (dest_is_stencil_bit) {
       if (source_is_64bpp && !dest_is_64bpp) {
         // Need one component, but choosing from the two 32bpp halves of the
         // 64bpp sample.
-        source_color_srv_component_mask = 0b1 | (0b1 << (source_color_format_component_count >> 1));
+        source_color_srv_component_mask =
+            0b1 | (0b1 << (source_color_format_component_count >> 1));
       } else {
         // Red is at least 8 bits per component in all formats.
         source_color_srv_component_mask = 0b1;
       }
     } else {
-      source_color_srv_component_mask = (uint32_t(1) << source_color_format_component_count) - 1;
+      source_color_srv_component_mask =
+          (uint32_t(1) << source_color_format_component_count) - 1;
     }
-    GetColorOwnershipTransferDXGIFormat(source_color_format, &source_color_is_uint);
+    GetColorOwnershipTransferDXGIFormat(source_color_format,
+                                        &source_color_is_uint);
   } else {
     source_is_64bpp = false;
     source_color_format_component_count = 0;
@@ -1845,10 +2006,13 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
   uint32_t blob_count = 5 + uint32_t(shader_uses_stencil_reference_output);
 
   // Allocate space for the container header and the blob offsets.
-  built_shader_.resize(sizeof(dxbc::ContainerHeader) / sizeof(uint32_t) + blob_count);
-  uint32_t blob_offset_position_dwords = sizeof(dxbc::ContainerHeader) / sizeof(uint32_t);
+  built_shader_.resize(sizeof(dxbc::ContainerHeader) / sizeof(uint32_t) +
+                       blob_count);
+  uint32_t blob_offset_position_dwords =
+      sizeof(dxbc::ContainerHeader) / sizeof(uint32_t);
   uint32_t blob_position_dwords = uint32_t(built_shader_.size());
-  constexpr uint32_t kBlobHeaderSizeDwords = sizeof(dxbc::BlobHeader) / sizeof(uint32_t);
+  constexpr uint32_t kBlobHeaderSizeDwords =
+      sizeof(dxbc::BlobHeader) / sizeof(uint32_t);
 
   uint32_t name_ptr;
 
@@ -1856,30 +2020,35 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
   // Resource definition
   // ***************************************************************************
 
-  built_shader_[blob_offset_position_dwords] = uint32_t(blob_position_dwords * sizeof(uint32_t));
+  built_shader_[blob_offset_position_dwords] =
+      uint32_t(blob_position_dwords * sizeof(uint32_t));
   uint32_t rdef_position_dwords = blob_position_dwords + kBlobHeaderSizeDwords;
   // Not needed, as the next operation done is resize, to allocate the space for
   // both the blob header and the resource definition header.
   // built_shader_.resize(rdef_position_dwords);
 
   // Allocate space for the RDEF header.
-  built_shader_.resize(rdef_position_dwords + sizeof(dxbc::RdefHeader) / sizeof(uint32_t));
+  built_shader_.resize(rdef_position_dwords +
+                       sizeof(dxbc::RdefHeader) / sizeof(uint32_t));
   // Generator name.
   dxbc::AppendAlignedString(built_shader_, "Xenia");
 
   // Constant types - uint (aka "dword" when it's scalar) only.
   // Names.
-  name_ptr = uint32_t((built_shader_.size() - rdef_position_dwords) * sizeof(uint32_t));
+  name_ptr = uint32_t((built_shader_.size() - rdef_position_dwords) *
+                      sizeof(uint32_t));
   uint32_t rdef_dword_name_ptr = name_ptr;
   name_ptr += dxbc::AppendAlignedString(built_shader_, "dword");
   // Types.
   uint32_t rdef_type_uint_position_dwords = uint32_t(built_shader_.size());
   uint32_t rdef_type_uint_ptr =
-      uint32_t((rdef_type_uint_position_dwords - rdef_position_dwords) * sizeof(uint32_t));
-  built_shader_.resize(rdef_type_uint_position_dwords + sizeof(dxbc::RdefType) / sizeof(uint32_t));
+      uint32_t((rdef_type_uint_position_dwords - rdef_position_dwords) *
+               sizeof(uint32_t));
+  built_shader_.resize(rdef_type_uint_position_dwords +
+                       sizeof(dxbc::RdefType) / sizeof(uint32_t));
   {
-    auto& rdef_type_uint =
-        *reinterpret_cast<dxbc::RdefType*>(built_shader_.data() + rdef_type_uint_position_dwords);
+    auto& rdef_type_uint = *reinterpret_cast<dxbc::RdefType*>(
+        built_shader_.data() + rdef_type_uint_position_dwords);
     rdef_type_uint.variable_class = dxbc::RdefVariableClass::kScalar;
     rdef_type_uint.variable_type = dxbc::RdefVariableType::kUInt;
     rdef_type_uint.row_count = 1;
@@ -1893,19 +2062,27 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
   // - uint xe_transfer_host_depth_address
   uint32_t rdef_constant_count = 0;
   uint32_t rdef_constant_index_stencil_mask =
-      (rs & kTransferUsedRootParameterStencilMaskConstantBit) ? rdef_constant_count++ : UINT32_MAX;
-  assert_false(dest_is_stencil_bit && rdef_constant_index_stencil_mask == UINT32_MAX);
+      (rs & kTransferUsedRootParameterStencilMaskConstantBit)
+          ? rdef_constant_count++
+          : UINT32_MAX;
+  assert_false(dest_is_stencil_bit &&
+               rdef_constant_index_stencil_mask == UINT32_MAX);
   uint32_t rdef_constant_index_address =
-      (rs & kTransferUsedRootParameterAddressConstantBit) ? rdef_constant_count++ : UINT32_MAX;
+      (rs & kTransferUsedRootParameterAddressConstantBit)
+          ? rdef_constant_count++
+          : UINT32_MAX;
   assert_true(rdef_constant_index_address != UINT32_MAX);
   uint32_t rdef_constant_index_host_depth_address =
-      (rs & kTransferUsedRootParameterHostDepthAddressConstantBit) ? rdef_constant_count++
-                                                                   : UINT32_MAX;
+      (rs & kTransferUsedRootParameterHostDepthAddressConstantBit)
+          ? rdef_constant_count++
+          : UINT32_MAX;
   // Names.
-  name_ptr = uint32_t((built_shader_.size() - rdef_position_dwords) * sizeof(uint32_t));
+  name_ptr = uint32_t((built_shader_.size() - rdef_position_dwords) *
+                      sizeof(uint32_t));
   uint32_t rdef_xe_transfer_stencil_mask_name_ptr = name_ptr;
   if (rdef_constant_index_stencil_mask != UINT32_MAX) {
-    name_ptr += dxbc::AppendAlignedString(built_shader_, "xe_transfer_stencil_mask");
+    name_ptr +=
+        dxbc::AppendAlignedString(built_shader_, "xe_transfer_stencil_mask");
   }
   uint32_t rdef_xe_transfer_address_name_ptr = name_ptr;
   if (rdef_constant_index_address != UINT32_MAX) {
@@ -1913,22 +2090,26 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
   }
   uint32_t rdef_xe_transfer_host_depth_address_name_ptr = name_ptr;
   if (rdef_constant_index_host_depth_address != UINT32_MAX) {
-    name_ptr += dxbc::AppendAlignedString(built_shader_, "xe_transfer_host_depth_address");
+    name_ptr += dxbc::AppendAlignedString(built_shader_,
+                                          "xe_transfer_host_depth_address");
   }
   // Constants.
   uint32_t rdef_constants_position_dwords = uint32_t(built_shader_.size());
   uint32_t rdef_constants_ptr =
-      uint32_t((rdef_constants_position_dwords - rdef_position_dwords) * sizeof(uint32_t));
+      uint32_t((rdef_constants_position_dwords - rdef_position_dwords) *
+               sizeof(uint32_t));
   built_shader_.resize(rdef_constants_position_dwords +
-                       sizeof(dxbc::RdefVariable) / sizeof(uint32_t) * rdef_constant_count);
+                       sizeof(dxbc::RdefVariable) / sizeof(uint32_t) *
+                           rdef_constant_count);
   {
-    auto rdef_constants = reinterpret_cast<dxbc::RdefVariable*>(built_shader_.data() +
-                                                                rdef_constants_position_dwords);
+    auto rdef_constants = reinterpret_cast<dxbc::RdefVariable*>(
+        built_shader_.data() + rdef_constants_position_dwords);
     // uint xe_transfer_stencil_mask
     if (rdef_constant_index_stencil_mask != UINT32_MAX) {
       dxbc::RdefVariable& rdef_constant_stencil_mask =
           rdef_constants[rdef_constant_index_stencil_mask];
-      rdef_constant_stencil_mask.name_ptr = rdef_xe_transfer_stencil_mask_name_ptr;
+      rdef_constant_stencil_mask.name_ptr =
+          rdef_xe_transfer_stencil_mask_name_ptr;
       rdef_constant_stencil_mask.size_bytes = sizeof(uint32_t);
       rdef_constant_stencil_mask.flags = dxbc::kRdefVariableFlagUsed;
       rdef_constant_stencil_mask.type_ptr = rdef_type_uint_ptr;
@@ -1937,7 +2118,8 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
     }
     // uint xe_transfer_address
     if (rdef_constant_index_address != UINT32_MAX) {
-      dxbc::RdefVariable& rdef_constant_address = rdef_constants[rdef_constant_index_address];
+      dxbc::RdefVariable& rdef_constant_address =
+          rdef_constants[rdef_constant_index_address];
       rdef_constant_address.name_ptr = rdef_xe_transfer_address_name_ptr;
       rdef_constant_address.size_bytes = sizeof(uint32_t);
       rdef_constant_address.flags = dxbc::kRdefVariableFlagUsed;
@@ -1949,7 +2131,8 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
     if (rdef_constant_index_host_depth_address != UINT32_MAX) {
       dxbc::RdefVariable& rdef_constant_host_depth_address =
           rdef_constants[rdef_constant_index_host_depth_address];
-      rdef_constant_host_depth_address.name_ptr = rdef_xe_transfer_host_depth_address_name_ptr;
+      rdef_constant_host_depth_address.name_ptr =
+          rdef_xe_transfer_host_depth_address_name_ptr;
       rdef_constant_host_depth_address.size_bytes = sizeof(uint32_t);
       rdef_constant_host_depth_address.flags = dxbc::kRdefVariableFlagUsed;
       rdef_constant_host_depth_address.type_ptr = rdef_type_uint_ptr;
@@ -1965,44 +2148,58 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
   // Reusing the constant names for constant buffers.
   uint32_t rdef_cbuffer_count = 0;
   uint32_t cbuffer_index_stencil_mask =
-      rdef_constant_index_stencil_mask != UINT32_MAX ? rdef_cbuffer_count++ : UINT32_MAX;
-  uint32_t cbuffer_index_address =
-      rdef_constant_index_address != UINT32_MAX ? rdef_cbuffer_count++ : UINT32_MAX;
+      rdef_constant_index_stencil_mask != UINT32_MAX ? rdef_cbuffer_count++
+                                                     : UINT32_MAX;
+  uint32_t cbuffer_index_address = rdef_constant_index_address != UINT32_MAX
+                                       ? rdef_cbuffer_count++
+                                       : UINT32_MAX;
   uint32_t cbuffer_index_host_depth_address =
-      rdef_constant_index_host_depth_address != UINT32_MAX ? rdef_cbuffer_count++ : UINT32_MAX;
+      rdef_constant_index_host_depth_address != UINT32_MAX
+          ? rdef_cbuffer_count++
+          : UINT32_MAX;
   uint32_t rdef_cbuffer_position_dwords = uint32_t(built_shader_.size());
   built_shader_.resize(rdef_cbuffer_position_dwords +
-                       sizeof(dxbc::RdefCbuffer) / sizeof(uint32_t) * rdef_cbuffer_count);
+                       sizeof(dxbc::RdefCbuffer) / sizeof(uint32_t) *
+                           rdef_cbuffer_count);
   {
-    auto rdef_cbuffers =
-        reinterpret_cast<dxbc::RdefCbuffer*>(built_shader_.data() + rdef_cbuffer_position_dwords);
+    auto rdef_cbuffers = reinterpret_cast<dxbc::RdefCbuffer*>(
+        built_shader_.data() + rdef_cbuffer_position_dwords);
     // xe_transfer_stencil_mask
     if (cbuffer_index_stencil_mask != UINT32_MAX) {
-      dxbc::RdefCbuffer& rdef_cbuffer_stencil_mask = rdef_cbuffers[cbuffer_index_stencil_mask];
-      rdef_cbuffer_stencil_mask.name_ptr = rdef_xe_transfer_stencil_mask_name_ptr;
+      dxbc::RdefCbuffer& rdef_cbuffer_stencil_mask =
+          rdef_cbuffers[cbuffer_index_stencil_mask];
+      rdef_cbuffer_stencil_mask.name_ptr =
+          rdef_xe_transfer_stencil_mask_name_ptr;
       rdef_cbuffer_stencil_mask.variable_count = 1;
-      rdef_cbuffer_stencil_mask.variables_ptr = uint32_t(
-          rdef_constants_ptr + sizeof(dxbc::RdefVariable) * rdef_constant_index_stencil_mask);
-      rdef_cbuffer_stencil_mask.size_vector_aligned_bytes = sizeof(uint32_t) * 4;
+      rdef_cbuffer_stencil_mask.variables_ptr =
+          uint32_t(rdef_constants_ptr + sizeof(dxbc::RdefVariable) *
+                                            rdef_constant_index_stencil_mask);
+      rdef_cbuffer_stencil_mask.size_vector_aligned_bytes =
+          sizeof(uint32_t) * 4;
     }
     // xe_transfer_address
     if (cbuffer_index_address != UINT32_MAX) {
-      dxbc::RdefCbuffer& rdef_cbuffer_address = rdef_cbuffers[cbuffer_index_address];
+      dxbc::RdefCbuffer& rdef_cbuffer_address =
+          rdef_cbuffers[cbuffer_index_address];
       rdef_cbuffer_address.name_ptr = rdef_xe_transfer_address_name_ptr;
       rdef_cbuffer_address.variable_count = 1;
       rdef_cbuffer_address.variables_ptr =
-          uint32_t(rdef_constants_ptr + sizeof(dxbc::RdefVariable) * rdef_constant_index_address);
+          uint32_t(rdef_constants_ptr +
+                   sizeof(dxbc::RdefVariable) * rdef_constant_index_address);
       rdef_cbuffer_address.size_vector_aligned_bytes = sizeof(uint32_t) * 4;
     }
     // xe_transfer_host_depth_address
     if (cbuffer_index_host_depth_address != UINT32_MAX) {
       dxbc::RdefCbuffer& rdef_cbuffer_host_depth_address =
           rdef_cbuffers[cbuffer_index_host_depth_address];
-      rdef_cbuffer_host_depth_address.name_ptr = rdef_xe_transfer_host_depth_address_name_ptr;
+      rdef_cbuffer_host_depth_address.name_ptr =
+          rdef_xe_transfer_host_depth_address_name_ptr;
       rdef_cbuffer_host_depth_address.variable_count = 1;
       rdef_cbuffer_host_depth_address.variables_ptr = uint32_t(
-          rdef_constants_ptr + sizeof(dxbc::RdefVariable) * rdef_constant_index_host_depth_address);
-      rdef_cbuffer_host_depth_address.size_vector_aligned_bytes = sizeof(uint32_t) * 4;
+          rdef_constants_ptr +
+          sizeof(dxbc::RdefVariable) * rdef_constant_index_host_depth_address);
+      rdef_cbuffer_host_depth_address.size_vector_aligned_bytes =
+          sizeof(uint32_t) * 4;
     }
   }
 
@@ -2013,17 +2210,22 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
   // - Texture2D<float>/Texture2DMS<float>/Buffer<uint> xe_transfer_host_depth
   // - Constant buffers
   uint32_t rdef_srv_count = 0;
-  uint32_t srv_index_color =
-      (rs & kTransferUsedRootParameterColorSRVBit) ? rdef_srv_count++ : UINT32_MAX;
-  uint32_t srv_index_depth =
-      (rs & kTransferUsedRootParameterDepthSRVBit) ? rdef_srv_count++ : UINT32_MAX;
-  uint32_t srv_index_stencil =
-      (rs & kTransferUsedRootParameterStencilSRVBit) ? rdef_srv_count++ : UINT32_MAX;
+  uint32_t srv_index_color = (rs & kTransferUsedRootParameterColorSRVBit)
+                                 ? rdef_srv_count++
+                                 : UINT32_MAX;
+  uint32_t srv_index_depth = (rs & kTransferUsedRootParameterDepthSRVBit)
+                                 ? rdef_srv_count++
+                                 : UINT32_MAX;
+  uint32_t srv_index_stencil = (rs & kTransferUsedRootParameterStencilSRVBit)
+                                   ? rdef_srv_count++
+                                   : UINT32_MAX;
   uint32_t srv_index_host_depth =
-      (rs & kTransferUsedRootParameterHostDepthSRVBit) ? rdef_srv_count++ : UINT32_MAX;
+      (rs & kTransferUsedRootParameterHostDepthSRVBit) ? rdef_srv_count++
+                                                       : UINT32_MAX;
   uint32_t rdef_binding_count = rdef_srv_count + rdef_cbuffer_count;
   // Names.
-  name_ptr = uint32_t((built_shader_.size() - rdef_position_dwords) * sizeof(uint32_t));
+  name_ptr = uint32_t((built_shader_.size() - rdef_position_dwords) *
+                      sizeof(uint32_t));
   uint32_t rdef_xe_transfer_color_name_ptr = name_ptr;
   if (srv_index_color != UINT32_MAX) {
     name_ptr += dxbc::AppendAlignedString(built_shader_, "xe_transfer_color");
@@ -2038,23 +2240,27 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
   }
   uint32_t rdef_xe_transfer_host_depth_name_ptr = name_ptr;
   if (srv_index_host_depth != UINT32_MAX) {
-    name_ptr += dxbc::AppendAlignedString(built_shader_, "xe_transfer_host_depth");
+    name_ptr +=
+        dxbc::AppendAlignedString(built_shader_, "xe_transfer_host_depth");
   }
   // Bindings.
   uint32_t rdef_binding_position_dwords = uint32_t(built_shader_.size());
   built_shader_.resize(rdef_binding_position_dwords +
-                       sizeof(dxbc::RdefInputBind) / sizeof(uint32_t) * rdef_binding_count);
+                       sizeof(dxbc::RdefInputBind) / sizeof(uint32_t) *
+                           rdef_binding_count);
   {
-    auto rdef_bindings =
-        reinterpret_cast<dxbc::RdefInputBind*>(built_shader_.data() + rdef_binding_position_dwords);
+    auto rdef_bindings = reinterpret_cast<dxbc::RdefInputBind*>(
+        built_shader_.data() + rdef_binding_position_dwords);
     uint32_t rdef_binding_index = 0;
     // xe_transfer_color
     if (srv_index_color != UINT32_MAX) {
-      dxbc::RdefInputBind& rdef_binding_color = rdef_bindings[rdef_binding_index++];
+      dxbc::RdefInputBind& rdef_binding_color =
+          rdef_bindings[rdef_binding_index++];
       rdef_binding_color.name_ptr = rdef_xe_transfer_color_name_ptr;
       rdef_binding_color.type = dxbc::RdefInputType::kTexture;
-      rdef_binding_color.return_type =
-          source_color_is_uint ? dxbc::ResourceReturnType::kUInt : dxbc::ResourceReturnType::kFloat;
+      rdef_binding_color.return_type = source_color_is_uint
+                                           ? dxbc::ResourceReturnType::kUInt
+                                           : dxbc::ResourceReturnType::kFloat;
       if (key.source_msaa_samples != xenos::MsaaSamples::k1X) {
         rdef_binding_color.dimension = dxbc::RdefDimension::kSRVTexture2DMS;
       } else {
@@ -2064,13 +2270,15 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
       rdef_binding_color.bind_point = kTransferSRVRegisterColor;
       rdef_binding_color.bind_count = 1;
       assert_not_zero(source_color_srv_component_mask);
-      rdef_binding_color.flags = (32 - rex::lzcnt(source_color_srv_component_mask) - 1)
-                                 << dxbc::kRdefInputFlagsComponentsShift;
+      rdef_binding_color.flags =
+          (32 - rex::lzcnt(source_color_srv_component_mask) - 1)
+          << dxbc::kRdefInputFlagsComponentsShift;
       rdef_binding_color.id = srv_index_color;
     }
     // xe_transfer_depth
     if (srv_index_depth != UINT32_MAX) {
-      dxbc::RdefInputBind& rdef_binding_depth = rdef_bindings[rdef_binding_index++];
+      dxbc::RdefInputBind& rdef_binding_depth =
+          rdef_bindings[rdef_binding_index++];
       rdef_binding_depth.name_ptr = rdef_xe_transfer_depth_name_ptr;
       rdef_binding_depth.type = dxbc::RdefInputType::kTexture;
       rdef_binding_depth.return_type = dxbc::ResourceReturnType::kFloat;
@@ -2086,7 +2294,8 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
     }
     // xe_transfer_stencil
     if (srv_index_stencil != UINT32_MAX) {
-      dxbc::RdefInputBind& rdef_binding_stencil = rdef_bindings[rdef_binding_index++];
+      dxbc::RdefInputBind& rdef_binding_stencil =
+          rdef_bindings[rdef_binding_index++];
       rdef_binding_stencil.name_ptr = rdef_xe_transfer_stencil_name_ptr;
       rdef_binding_stencil.type = dxbc::RdefInputType::kTexture;
       rdef_binding_stencil.return_type = dxbc::ResourceReturnType::kUInt;
@@ -2103,7 +2312,8 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
     }
     // xe_transfer_host_depth
     if (srv_index_host_depth != UINT32_MAX) {
-      dxbc::RdefInputBind& rdef_binding_host_depth = rdef_bindings[rdef_binding_index++];
+      dxbc::RdefInputBind& rdef_binding_host_depth =
+          rdef_bindings[rdef_binding_index++];
       rdef_binding_host_depth.name_ptr = rdef_xe_transfer_host_depth_name_ptr;
       rdef_binding_host_depth.type = dxbc::RdefInputType::kTexture;
       if (key.host_depth_source_is_copy) {
@@ -2114,9 +2324,11 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
       } else {
         rdef_binding_host_depth.return_type = dxbc::ResourceReturnType::kFloat;
         if (key.host_depth_source_msaa_samples != xenos::MsaaSamples::k1X) {
-          rdef_binding_host_depth.dimension = dxbc::RdefDimension::kSRVTexture2DMS;
+          rdef_binding_host_depth.dimension =
+              dxbc::RdefDimension::kSRVTexture2DMS;
         } else {
-          rdef_binding_host_depth.dimension = dxbc::RdefDimension::kSRVTexture2D;
+          rdef_binding_host_depth.dimension =
+              dxbc::RdefDimension::kSRVTexture2D;
           rdef_binding_host_depth.sample_count = UINT32_MAX;
         }
       }
@@ -2126,8 +2338,10 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
     }
     // xe_transfer_stencil_mask
     if (cbuffer_index_stencil_mask != UINT32_MAX) {
-      dxbc::RdefInputBind& rdef_binding_stencil_mask = rdef_bindings[rdef_binding_index++];
-      rdef_binding_stencil_mask.name_ptr = rdef_xe_transfer_stencil_mask_name_ptr;
+      dxbc::RdefInputBind& rdef_binding_stencil_mask =
+          rdef_bindings[rdef_binding_index++];
+      rdef_binding_stencil_mask.name_ptr =
+          rdef_xe_transfer_stencil_mask_name_ptr;
       rdef_binding_stencil_mask.type = dxbc::RdefInputType::kCbuffer;
       rdef_binding_stencil_mask.bind_point = kTransferCBVRegisterStencilMask;
       rdef_binding_stencil_mask.bind_count = 1;
@@ -2136,7 +2350,8 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
     }
     // xe_transfer_address
     if (cbuffer_index_address != UINT32_MAX) {
-      dxbc::RdefInputBind& rdef_binding_address = rdef_bindings[rdef_binding_index++];
+      dxbc::RdefInputBind& rdef_binding_address =
+          rdef_bindings[rdef_binding_index++];
       rdef_binding_address.name_ptr = rdef_xe_transfer_address_name_ptr;
       rdef_binding_address.type = dxbc::RdefInputType::kCbuffer;
       rdef_binding_address.bind_point = kTransferCBVRegisterAddress;
@@ -2146,10 +2361,13 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
     }
     // xe_transfer_host_depth_address
     if (cbuffer_index_host_depth_address != UINT32_MAX) {
-      dxbc::RdefInputBind& rdef_binding_host_depth_address = rdef_bindings[rdef_binding_index++];
-      rdef_binding_host_depth_address.name_ptr = rdef_xe_transfer_host_depth_address_name_ptr;
+      dxbc::RdefInputBind& rdef_binding_host_depth_address =
+          rdef_bindings[rdef_binding_index++];
+      rdef_binding_host_depth_address.name_ptr =
+          rdef_xe_transfer_host_depth_address_name_ptr;
       rdef_binding_host_depth_address.type = dxbc::RdefInputType::kCbuffer;
-      rdef_binding_host_depth_address.bind_point = kTransferCBVRegisterHostDepthAddress;
+      rdef_binding_host_depth_address.bind_point =
+          kTransferCBVRegisterHostDepthAddress;
       rdef_binding_host_depth_address.bind_count = 1;
       rdef_binding_host_depth_address.flags = dxbc::kRdefInputFlagUserPacked;
       rdef_binding_host_depth_address.id = cbuffer_index_host_depth_address;
@@ -2158,14 +2376,16 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
 
   // Header.
   {
-    auto& rdef_header =
-        *reinterpret_cast<dxbc::RdefHeader*>(built_shader_.data() + rdef_position_dwords);
+    auto& rdef_header = *reinterpret_cast<dxbc::RdefHeader*>(
+        built_shader_.data() + rdef_position_dwords);
     rdef_header.cbuffer_count = rdef_cbuffer_count;
     rdef_header.cbuffers_ptr =
-        uint32_t((rdef_cbuffer_position_dwords - rdef_position_dwords) * sizeof(uint32_t));
+        uint32_t((rdef_cbuffer_position_dwords - rdef_position_dwords) *
+                 sizeof(uint32_t));
     rdef_header.input_bind_count = rdef_binding_count;
     rdef_header.input_binds_ptr =
-        uint32_t((rdef_binding_position_dwords - rdef_position_dwords) * sizeof(uint32_t));
+        uint32_t((rdef_binding_position_dwords - rdef_position_dwords) *
+                 sizeof(uint32_t));
     rdef_header.shader_model = dxbc::RdefShaderModel::kPixelShader5_1;
     rdef_header.compile_flags =
         dxbc::kCompileFlagNoPreshader | dxbc::kCompileFlagPreferFlowControl |
@@ -2177,12 +2397,13 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
   }
 
   {
-    auto& blob_header =
-        *reinterpret_cast<dxbc::BlobHeader*>(built_shader_.data() + blob_position_dwords);
+    auto& blob_header = *reinterpret_cast<dxbc::BlobHeader*>(
+        built_shader_.data() + blob_position_dwords);
     blob_header.fourcc = dxbc::BlobHeader::FourCC::kResourceDefinition;
     blob_position_dwords = uint32_t(built_shader_.size());
-    blob_header.size_bytes = (blob_position_dwords - kBlobHeaderSizeDwords) * sizeof(uint32_t) -
-                             built_shader_[blob_offset_position_dwords++];
+    blob_header.size_bytes =
+        (blob_position_dwords - kBlobHeaderSizeDwords) * sizeof(uint32_t) -
+        built_shader_[blob_offset_position_dwords++];
   }
 
   // ***************************************************************************
@@ -2198,16 +2419,21 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
   };
 
   // Position, and for multisampled, sample index.
-  uint32_t isgn_parameter_count = 1 + uint32_t(key.dest_msaa_samples != xenos::MsaaSamples::k1X);
+  uint32_t isgn_parameter_count =
+      1 + uint32_t(key.dest_msaa_samples != xenos::MsaaSamples::k1X);
 
   // Reserve space for the header and the parameters.
-  built_shader_[blob_offset_position_dwords] = uint32_t(blob_position_dwords * sizeof(uint32_t));
+  built_shader_[blob_offset_position_dwords] =
+      uint32_t(blob_position_dwords * sizeof(uint32_t));
   uint32_t isgn_position_dwords = blob_position_dwords + kBlobHeaderSizeDwords;
-  built_shader_.resize(isgn_position_dwords + sizeof(dxbc::Signature) / sizeof(uint32_t) +
-                       sizeof(dxbc::SignatureParameter) / sizeof(uint32_t) * isgn_parameter_count);
+  built_shader_.resize(isgn_position_dwords +
+                       sizeof(dxbc::Signature) / sizeof(uint32_t) +
+                       sizeof(dxbc::SignatureParameter) / sizeof(uint32_t) *
+                           isgn_parameter_count);
 
   // Names (after the parameters).
-  name_ptr = uint32_t((built_shader_.size() - isgn_position_dwords) * sizeof(uint32_t));
+  name_ptr = uint32_t((built_shader_.size() - isgn_position_dwords) *
+                      sizeof(uint32_t));
   uint32_t isgn_sv_position_name_ptr = name_ptr;
   name_ptr += dxbc::AppendAlignedString(built_shader_, "SV_Position");
   uint32_t isgn_sv_sample_index_name_ptr = name_ptr;
@@ -2218,28 +2444,33 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
   // Header and parameters.
   {
     // Header.
-    auto& isgn_header =
-        *reinterpret_cast<dxbc::Signature*>(built_shader_.data() + isgn_position_dwords);
+    auto& isgn_header = *reinterpret_cast<dxbc::Signature*>(
+        built_shader_.data() + isgn_position_dwords);
     isgn_header.parameter_count = isgn_parameter_count;
     isgn_header.parameter_info_ptr = sizeof(dxbc::Signature);
     // Parameters.
     auto isgn_parameters = reinterpret_cast<dxbc::SignatureParameter*>(
-        built_shader_.data() + isgn_position_dwords + sizeof(dxbc::Signature) / sizeof(uint32_t));
+        built_shader_.data() + isgn_position_dwords +
+        sizeof(dxbc::Signature) / sizeof(uint32_t));
     uint32_t isgn_parameter_index = 0;
     // SV_Position.xy
-    dxbc::SignatureParameter& isgn_sv_position = isgn_parameters[isgn_parameter_index++];
+    dxbc::SignatureParameter& isgn_sv_position =
+        isgn_parameters[isgn_parameter_index++];
     isgn_sv_position.semantic_name_ptr = isgn_sv_position_name_ptr;
     isgn_sv_position.system_value = dxbc::Name::kPosition;
-    isgn_sv_position.component_type = dxbc::SignatureRegisterComponentType::kFloat32;
+    isgn_sv_position.component_type =
+        dxbc::SignatureRegisterComponentType::kFloat32;
     isgn_sv_position.register_index = kInputRegisterPosition;
     isgn_sv_position.mask = 0b1111;
     isgn_sv_position.always_reads_mask = 0b0011;
     // SV_SampleIndex
     if (key.dest_msaa_samples != xenos::MsaaSamples::k1X) {
-      dxbc::SignatureParameter& isgn_sv_sample_index = isgn_parameters[isgn_parameter_index++];
+      dxbc::SignatureParameter& isgn_sv_sample_index =
+          isgn_parameters[isgn_parameter_index++];
       isgn_sv_sample_index.semantic_name_ptr = isgn_sv_sample_index_name_ptr;
       isgn_sv_sample_index.system_value = dxbc::Name::kSampleIndex;
-      isgn_sv_sample_index.component_type = dxbc::SignatureRegisterComponentType::kUInt32;
+      isgn_sv_sample_index.component_type =
+          dxbc::SignatureRegisterComponentType::kUInt32;
       isgn_sv_sample_index.register_index = kInputRegisterSampleIndex;
       isgn_sv_sample_index.mask = 0b0001;
       isgn_sv_sample_index.always_reads_mask = 0b0001;
@@ -2247,12 +2478,13 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
   }
 
   {
-    auto& blob_header =
-        *reinterpret_cast<dxbc::BlobHeader*>(built_shader_.data() + blob_position_dwords);
+    auto& blob_header = *reinterpret_cast<dxbc::BlobHeader*>(
+        built_shader_.data() + blob_position_dwords);
     blob_header.fourcc = dxbc::BlobHeader::FourCC::kInputSignature;
     blob_position_dwords = uint32_t(built_shader_.size());
-    blob_header.size_bytes = (blob_position_dwords - kBlobHeaderSizeDwords) * sizeof(uint32_t) -
-                             built_shader_[blob_offset_position_dwords++];
+    blob_header.size_bytes =
+        (blob_position_dwords - kBlobHeaderSizeDwords) * sizeof(uint32_t) -
+        built_shader_[blob_offset_position_dwords++];
   }
 
   // ***************************************************************************
@@ -2262,20 +2494,27 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
   // Color or depth.
   uint32_t osgn_parameter_count = 0;
   uint32_t osgn_parameter_index_sv_target =
-      mode.output == TransferOutput::kColor ? osgn_parameter_count++ : UINT32_MAX;
-  uint32_t osgn_parameter_index_sv_depth =
-      mode.output == TransferOutput::kDepth ? osgn_parameter_count++ : UINT32_MAX;
+      mode.output == TransferOutput::kColor ? osgn_parameter_count++
+                                            : UINT32_MAX;
+  uint32_t osgn_parameter_index_sv_depth = mode.output == TransferOutput::kDepth
+                                               ? osgn_parameter_count++
+                                               : UINT32_MAX;
   uint32_t osgn_parameter_index_sv_stencil_ref =
-      shader_uses_stencil_reference_output ? osgn_parameter_count++ : UINT32_MAX;
+      shader_uses_stencil_reference_output ? osgn_parameter_count++
+                                           : UINT32_MAX;
 
   // Reserve space for the header and the parameters.
-  built_shader_[blob_offset_position_dwords] = uint32_t(blob_position_dwords * sizeof(uint32_t));
+  built_shader_[blob_offset_position_dwords] =
+      uint32_t(blob_position_dwords * sizeof(uint32_t));
   uint32_t osgn_position_dwords = blob_position_dwords + kBlobHeaderSizeDwords;
-  built_shader_.resize(osgn_position_dwords + sizeof(dxbc::Signature) / sizeof(uint32_t) +
-                       sizeof(dxbc::SignatureParameter) / sizeof(uint32_t) * osgn_parameter_count);
+  built_shader_.resize(osgn_position_dwords +
+                       sizeof(dxbc::Signature) / sizeof(uint32_t) +
+                       sizeof(dxbc::SignatureParameter) / sizeof(uint32_t) *
+                           osgn_parameter_count);
 
   // Names (after the parameters).
-  name_ptr = uint32_t((built_shader_.size() - osgn_position_dwords) * sizeof(uint32_t));
+  name_ptr = uint32_t((built_shader_.size() - osgn_position_dwords) *
+                      sizeof(uint32_t));
   uint32_t osgn_sv_target_name_ptr = name_ptr;
   if (osgn_parameter_index_sv_target != UINT32_MAX) {
     name_ptr += dxbc::AppendAlignedString(built_shader_, "SV_Target");
@@ -2299,28 +2538,32 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
   // Header and parameters.
   {
     // Header.
-    auto& osgn_header =
-        *reinterpret_cast<dxbc::Signature*>(built_shader_.data() + osgn_position_dwords);
+    auto& osgn_header = *reinterpret_cast<dxbc::Signature*>(
+        built_shader_.data() + osgn_position_dwords);
     osgn_header.parameter_count = osgn_parameter_count;
     osgn_header.parameter_info_ptr = sizeof(dxbc::Signature);
     // Parameters.
     auto osgn_parameters = reinterpret_cast<dxbc::SignatureParameter*>(
-        built_shader_.data() + osgn_position_dwords + sizeof(dxbc::Signature) / sizeof(uint32_t));
+        built_shader_.data() + osgn_position_dwords +
+        sizeof(dxbc::Signature) / sizeof(uint32_t));
     // SV_Target
     if (osgn_parameter_index_sv_target != UINT32_MAX) {
-      dxbc::SignatureParameter& osgn_sv_target = osgn_parameters[osgn_parameter_index_sv_target];
+      dxbc::SignatureParameter& osgn_sv_target =
+          osgn_parameters[osgn_parameter_index_sv_target];
       osgn_sv_target.semantic_name_ptr = osgn_sv_target_name_ptr;
-      osgn_sv_target.component_type = dest_color_is_uint
-                                          ? dxbc::SignatureRegisterComponentType::kUInt32
-                                          : dxbc::SignatureRegisterComponentType::kFloat32;
+      osgn_sv_target.component_type =
+          dest_color_is_uint ? dxbc::SignatureRegisterComponentType::kUInt32
+                             : dxbc::SignatureRegisterComponentType::kFloat32;
       osgn_sv_target.register_index = 0;
       osgn_sv_target.mask = 0b1111;
     }
     // SV_Depth
     if (osgn_parameter_index_sv_depth != UINT32_MAX) {
-      dxbc::SignatureParameter& osgn_sv_depth = osgn_parameters[osgn_parameter_index_sv_depth];
+      dxbc::SignatureParameter& osgn_sv_depth =
+          osgn_parameters[osgn_parameter_index_sv_depth];
       osgn_sv_depth.semantic_name_ptr = osgn_sv_depth_name_ptr;
-      osgn_sv_depth.component_type = dxbc::SignatureRegisterComponentType::kFloat32;
+      osgn_sv_depth.component_type =
+          dxbc::SignatureRegisterComponentType::kFloat32;
       osgn_sv_depth.register_index = UINT32_MAX;
       osgn_sv_depth.mask = 0b0001;
       osgn_sv_depth.never_writes_mask = 0b1110;
@@ -2332,7 +2575,8 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
       osgn_sv_stencil_ref.semantic_name_ptr = osgn_sv_stencil_ref_name_ptr;
       // Older versions of FXC incorrectly expect SV_StencilRef to be float,
       // it's always uint in DXC and also in the latest versions of FXC.
-      osgn_sv_stencil_ref.component_type = dxbc::SignatureRegisterComponentType::kUInt32;
+      osgn_sv_stencil_ref.component_type =
+          dxbc::SignatureRegisterComponentType::kUInt32;
       osgn_sv_stencil_ref.register_index = UINT32_MAX;
       osgn_sv_stencil_ref.mask = 0b0001;
       osgn_sv_stencil_ref.never_writes_mask = 0b1110;
@@ -2340,23 +2584,26 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
   }
 
   {
-    auto& blob_header =
-        *reinterpret_cast<dxbc::BlobHeader*>(built_shader_.data() + blob_position_dwords);
+    auto& blob_header = *reinterpret_cast<dxbc::BlobHeader*>(
+        built_shader_.data() + blob_position_dwords);
     blob_header.fourcc = dxbc::BlobHeader::FourCC::kOutputSignature;
     blob_position_dwords = uint32_t(built_shader_.size());
-    blob_header.size_bytes = (blob_position_dwords - kBlobHeaderSizeDwords) * sizeof(uint32_t) -
-                             built_shader_[blob_offset_position_dwords++];
+    blob_header.size_bytes =
+        (blob_position_dwords - kBlobHeaderSizeDwords) * sizeof(uint32_t) -
+        built_shader_[blob_offset_position_dwords++];
   }
 
   // ***************************************************************************
   // Shader program
   // ***************************************************************************
 
-  built_shader_[blob_offset_position_dwords] = uint32_t(blob_position_dwords * sizeof(uint32_t));
+  built_shader_[blob_offset_position_dwords] =
+      uint32_t(blob_position_dwords * sizeof(uint32_t));
   uint32_t shex_position_dwords = blob_position_dwords + kBlobHeaderSizeDwords;
   built_shader_.resize(shex_position_dwords);
 
-  built_shader_.push_back(dxbc::VersionToken(dxbc::ProgramType::kPixelShader, 5, 1));
+  built_shader_.push_back(
+      dxbc::VersionToken(dxbc::ProgramType::kPixelShader, 5, 1));
   // Reserve space for the length token.
   built_shader_.push_back(0);
 
@@ -2367,60 +2614,71 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
   a.OpDclGlobalFlags(dxbc::kGlobalFlagAllResourcesBound);
   if (cbuffer_index_stencil_mask != UINT32_MAX) {
     a.OpDclConstantBuffer(
-        dxbc::Src::CB(dxbc::Src::Dcl, cbuffer_index_stencil_mask, kTransferCBVRegisterStencilMask,
+        dxbc::Src::CB(dxbc::Src::Dcl, cbuffer_index_stencil_mask,
+                      kTransferCBVRegisterStencilMask,
                       kTransferCBVRegisterStencilMask),
         1);
   }
   if (cbuffer_index_address != UINT32_MAX) {
-    a.OpDclConstantBuffer(dxbc::Src::CB(dxbc::Src::Dcl, cbuffer_index_address,
-                                        kTransferCBVRegisterAddress, kTransferCBVRegisterAddress),
-                          1);
+    a.OpDclConstantBuffer(
+        dxbc::Src::CB(dxbc::Src::Dcl, cbuffer_index_address,
+                      kTransferCBVRegisterAddress, kTransferCBVRegisterAddress),
+        1);
   }
   if (cbuffer_index_host_depth_address != UINT32_MAX) {
     a.OpDclConstantBuffer(
         dxbc::Src::CB(dxbc::Src::Dcl, cbuffer_index_host_depth_address,
-                      kTransferCBVRegisterHostDepthAddress, kTransferCBVRegisterHostDepthAddress),
+                      kTransferCBVRegisterHostDepthAddress,
+                      kTransferCBVRegisterHostDepthAddress),
         1);
   }
   if (srv_index_color != UINT32_MAX) {
     a.OpDclResource(
-        key.source_msaa_samples != xenos::MsaaSamples::k1X ? dxbc::ResourceDimension::kTexture2DMS
-                                                           : dxbc::ResourceDimension::kTexture2D,
-        dxbc::ResourceReturnTypeX4Token(source_color_is_uint ? dxbc::ResourceReturnType::kUInt
-                                                             : dxbc::ResourceReturnType::kFloat),
+        key.source_msaa_samples != xenos::MsaaSamples::k1X
+            ? dxbc::ResourceDimension::kTexture2DMS
+            : dxbc::ResourceDimension::kTexture2D,
+        dxbc::ResourceReturnTypeX4Token(source_color_is_uint
+                                            ? dxbc::ResourceReturnType::kUInt
+                                            : dxbc::ResourceReturnType::kFloat),
         dxbc::Src::T(dxbc::Src::Dcl, srv_index_color, kTransferSRVRegisterColor,
                      kTransferSRVRegisterColor));
   }
   if (srv_index_depth != UINT32_MAX) {
-    a.OpDclResource(key.source_msaa_samples != xenos::MsaaSamples::k1X
-                        ? dxbc::ResourceDimension::kTexture2DMS
-                        : dxbc::ResourceDimension::kTexture2D,
-                    dxbc::ResourceReturnTypeX4Token(dxbc::ResourceReturnType::kFloat),
-                    dxbc::Src::T(dxbc::Src::Dcl, srv_index_depth, kTransferSRVRegisterDepth,
-                                 kTransferSRVRegisterDepth));
+    a.OpDclResource(
+        key.source_msaa_samples != xenos::MsaaSamples::k1X
+            ? dxbc::ResourceDimension::kTexture2DMS
+            : dxbc::ResourceDimension::kTexture2D,
+        dxbc::ResourceReturnTypeX4Token(dxbc::ResourceReturnType::kFloat),
+        dxbc::Src::T(dxbc::Src::Dcl, srv_index_depth, kTransferSRVRegisterDepth,
+                     kTransferSRVRegisterDepth));
   }
   if (srv_index_stencil != UINT32_MAX) {
-    a.OpDclResource(key.source_msaa_samples != xenos::MsaaSamples::k1X
-                        ? dxbc::ResourceDimension::kTexture2DMS
-                        : dxbc::ResourceDimension::kTexture2D,
-                    dxbc::ResourceReturnTypeX4Token(dxbc::ResourceReturnType::kUInt),
-                    dxbc::Src::T(dxbc::Src::Dcl, srv_index_stencil, kTransferSRVRegisterStencil,
-                                 kTransferSRVRegisterStencil));
+    a.OpDclResource(
+        key.source_msaa_samples != xenos::MsaaSamples::k1X
+            ? dxbc::ResourceDimension::kTexture2DMS
+            : dxbc::ResourceDimension::kTexture2D,
+        dxbc::ResourceReturnTypeX4Token(dxbc::ResourceReturnType::kUInt),
+        dxbc::Src::T(dxbc::Src::Dcl, srv_index_stencil,
+                     kTransferSRVRegisterStencil, kTransferSRVRegisterStencil));
   }
   if (srv_index_host_depth != UINT32_MAX) {
-    a.OpDclResource(key.host_depth_source_is_copy
-                        ? dxbc::ResourceDimension::kBuffer
-                        : (key.host_depth_source_msaa_samples != xenos::MsaaSamples::k1X
-                               ? dxbc::ResourceDimension::kTexture2DMS
-                               : dxbc::ResourceDimension::kTexture2D),
-                    dxbc::ResourceReturnTypeX4Token(dxbc::ResourceReturnType::kFloat),
-                    dxbc::Src::T(dxbc::Src::Dcl, srv_index_host_depth,
-                                 kTransferSRVRegisterHostDepth, kTransferSRVRegisterHostDepth));
+    a.OpDclResource(
+        key.host_depth_source_is_copy
+            ? dxbc::ResourceDimension::kBuffer
+            : (key.host_depth_source_msaa_samples != xenos::MsaaSamples::k1X
+                   ? dxbc::ResourceDimension::kTexture2DMS
+                   : dxbc::ResourceDimension::kTexture2D),
+        dxbc::ResourceReturnTypeX4Token(dxbc::ResourceReturnType::kFloat),
+        dxbc::Src::T(dxbc::Src::Dcl, srv_index_host_depth,
+                     kTransferSRVRegisterHostDepth,
+                     kTransferSRVRegisterHostDepth));
   }
   a.OpDclInputPSSIV(dxbc::InterpolationMode::kLinearNoPerspective,
-                    dxbc::Dest::V1D(kInputRegisterPosition, 0b0011), dxbc::Name::kPosition);
+                    dxbc::Dest::V1D(kInputRegisterPosition, 0b0011),
+                    dxbc::Name::kPosition);
   if (key.dest_msaa_samples != xenos::MsaaSamples::k1X) {
-    a.OpDclInputPSSGV(dxbc::Dest::V1D(kInputRegisterSampleIndex, 0b0001), dxbc::Name::kSampleIndex);
+    a.OpDclInputPSSGV(dxbc::Dest::V1D(kInputRegisterSampleIndex, 0b0001),
+                      dxbc::Name::kSampleIndex);
   }
   if (osgn_parameter_index_sv_target != UINT32_MAX) {
     a.OpDclOutput(dxbc::Dest::O(0));
@@ -2433,38 +2691,82 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
   }
   // r0:r2 are involved at least in common addressing code. Texture loads
   // usually can overwrite some of the addressing temps as they are only needed
-  // for the coordinates for that load. Currently 3 temps are enough.
-  a.OpDclTemps(3);
+  // for the coordinates for that load. Currently 3 temps are enough, plus one
+  // more to keep the destination coordinates for the host depth source across
+  // the scale class conversion.
+  bool cross_scale_class = key.source_scale_native != key.dest_scale_native;
+  a.OpDclTemps(3 + uint32_t(cross_scale_class));
 
-  uint32_t draw_resolution_scale_x = this->draw_resolution_scale_x();
-  uint32_t draw_resolution_scale_y = this->draw_resolution_scale_y();
-
-  uint32_t tile_width_samples = xenos::kEdramTileWidthSamples * draw_resolution_scale_x;
-  uint32_t tile_height_samples = xenos::kEdramTileHeightSamples * draw_resolution_scale_y;
+  // The two sides of the transfer may be in different scale classes. The host
+  // depth source always has the destination's scale since native render
+  // targets don't track host depth.
+  uint32_t dest_scale_x =
+      key.dest_scale_native ? 1 : this->draw_resolution_scale_x();
+  uint32_t dest_scale_y =
+      key.dest_scale_native ? 1 : this->draw_resolution_scale_y();
+  uint32_t source_scale_x =
+      key.source_scale_native ? 1 : this->draw_resolution_scale_x();
+  uint32_t source_scale_y =
+      key.source_scale_native ? 1 : this->draw_resolution_scale_y();
+  uint32_t dest_tile_width_samples =
+      xenos::kEdramTileWidthSamples * dest_scale_x;
+  uint32_t dest_tile_height_samples =
+      xenos::kEdramTileHeightSamples * dest_scale_y;
+  uint32_t source_tile_width_samples =
+      xenos::kEdramTileWidthSamples * source_scale_x;
+  uint32_t source_tile_height_samples =
+      xenos::kEdramTileHeightSamples * source_scale_y;
 
   // Split the destination pixel index into 32bpp tile in r0.zw and
   // 32bpp-tile-relative pixel index in r0.xy.
   // r0.xy = pixel XY as uint
   a.OpFToU(dxbc::Dest::R(0, 0b0011), dxbc::Src::V1D(kInputRegisterPosition));
   uint32_t dest_tile_width_pixels =
-      tile_width_samples >>
-      (uint32_t(dest_is_64bpp) + uint32_t(key.dest_msaa_samples >= xenos::MsaaSamples::k4X));
+      dest_tile_width_samples >>
+      (uint32_t(dest_is_64bpp) +
+       uint32_t(key.dest_msaa_samples >= xenos::MsaaSamples::k4X));
   uint32_t dest_tile_height_pixels =
-      tile_height_samples >> uint32_t(key.dest_msaa_samples >= xenos::MsaaSamples::k2X);
+      dest_tile_height_samples >>
+      uint32_t(key.dest_msaa_samples >= xenos::MsaaSamples::k2X);
   // r0.xy = destination pixel XY index within the 32bpp tile
   // r0.zw = 32bpp tile XY index
-  a.OpUDiv(dxbc::Dest::R(0, 0b1100), dxbc::Dest::R(0, 0b0011), dxbc::Src::R(0, 0b01000100),
-           dxbc::Src::LU(dest_tile_width_pixels, dest_tile_height_pixels, dest_tile_width_pixels,
-                         dest_tile_height_pixels));
+  a.OpUDiv(dxbc::Dest::R(0, 0b1100), dxbc::Dest::R(0, 0b0011),
+           dxbc::Src::R(0, dxbc::Src::kXYXY),
+           dxbc::Src::LU(dest_tile_width_pixels, dest_tile_height_pixels,
+                         dest_tile_width_pixels, dest_tile_height_pixels));
 
   // r1.x = destination pitch in 32bpp tiles
-  a.OpUBFE(dxbc::Dest::R(1, 0b0001), dxbc::Src::LU(xenos::kEdramPitchTilesBits), dxbc::Src::LU(0),
-           dxbc::Src::CB(cbuffer_index_address, kTransferCBVRegisterAddress, 0, dxbc::Src::kXXXX));
+  a.OpUBFE(dxbc::Dest::R(1, 0b0001), dxbc::Src::LU(xenos::kEdramPitchTilesBits),
+           dxbc::Src::LU(0),
+           dxbc::Src::CB(cbuffer_index_address, kTransferCBVRegisterAddress, 0,
+                         dxbc::Src::kXXXX));
   // r0.z = 32bpp tile index relative to the destination base
   // r0.w = free
   // r1.x = free
   a.OpUMAd(dxbc::Dest::R(0, 0b0100), dxbc::Src::R(1, dxbc::Src::kXXXX),
-           dxbc::Src::R(0, dxbc::Src::kWWWW), dxbc::Src::R(0, dxbc::Src::kZZZZ));
+           dxbc::Src::R(0, dxbc::Src::kWWWW),
+           dxbc::Src::R(0, dxbc::Src::kZZZZ));
+
+  if (cross_scale_class) {
+    // Convert the tile-local pixel coordinates in r0.xy to the source scale
+    // space - the remappings below transform between two layouts of one
+    // scale. Keep the destination-space r0.xy in r3.xy for the host depth
+    // source. Sample indices don't change.
+    a.OpMov(dxbc::Dest::R(3, 0b0011), dxbc::Src::R(0));
+    if (key.dest_scale_native) {
+      // Native destination reading a scaled source - take the center host
+      // pixel of each guest pixel, like memexport and the resolve downscale
+      // do.
+      a.OpUMAd(dxbc::Dest::R(0, 0b0011),
+               dxbc::Src::LU(source_scale_x, source_scale_y, 0, 0),
+               dxbc::Src::R(0),
+               dxbc::Src::LU(source_scale_x >> 1, source_scale_y >> 1, 0, 0));
+    } else {
+      // Scaled destination reading a native source - duplicate guest pixels.
+      a.OpUDiv(dxbc::Dest::R(0, 0b0011), dxbc::Dest::Null(), dxbc::Src::R(0),
+               dxbc::Src::LU(dest_scale_x, dest_scale_y, 1, 1));
+    }
+  }
 
   // Now the tile index doesn't have any dependencies on the destination. The
   // dword index within the source tile, however, is calculated from both the
@@ -2484,282 +2786,72 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
   // be in the register).
   // If 64bpp -> 32bpp, also the needed half in r0.w.
 
-  dxbc::Src dest_sample(dxbc::Src::V1D(kInputRegisterSampleIndex, dxbc::Src::kXXXX));
+  dxbc::Src dest_sample(
+      dxbc::Src::V1D(kInputRegisterSampleIndex, dxbc::Src::kXXXX));
   dxbc::Src source_sample(dest_sample);
   uint32_t source_tile_pixel_x_reg = 0;
   uint32_t source_tile_pixel_y_reg = 0;
-
-  // First sample bit at 4x in Direct3D 10.1+ - horizontal sample.
-  // Second sample bit at 4x in Direct3D 10.1+ - vertical sample.
-  // At 2x:
-  // - Native 2x: top is 1 in Direct3D 10.1+, bottom is 0.
-  // - 2x as 4x: top is 0, bottom is 3.
-
-  if (!source_is_64bpp && dest_is_64bpp) {
-    // 32bpp -> 64bpp, need two samples of the source.
-    if (key.source_msaa_samples >= xenos::MsaaSamples::k4X) {
-      // 32bpp -> 64bpp, 4x ->.
-      // Source has 32bpp halves in two adjacent samples.
-      if (key.dest_msaa_samples >= xenos::MsaaSamples::k4X) {
-        // 32bpp -> 64bpp, 4x -> 4x.
-        // 1 destination horizontal sample = 2 source horizontal samples.
-        // D p0,0 s0,0 = S p0,0 s0,0 | S p0,0 s1,0
-        // D p0,0 s1,0 = S p1,0 s0,0 | S p1,0 s1,0
-        // D p0,0 s0,1 = S p0,0 s0,1 | S p0,0 s1,1
-        // D p0,0 s1,1 = S p1,0 s0,1 | S p1,0 s1,1
-        // Thus destination horizontal sample -> source horizontal pixel,
-        // vertical samples are 1:1.
-        a.OpAnd(dxbc::Dest::R(1, 0b0100), dest_sample, dxbc::Src::LU(0b10));
-        source_sample = dxbc::Src::R(1, dxbc::Src::kZZZZ);
-        a.OpBFI(dxbc::Dest::R(1, 0b0001), dxbc::Src::LU(31), dxbc::Src::LU(1),
-                dxbc::Src::R(0, dxbc::Src::kXXXX),
-                dxbc::Src::V1D(kInputRegisterSampleIndex, dxbc::Src::kXXXX));
-        source_tile_pixel_x_reg = 1;
-      } else if (key.dest_msaa_samples == xenos::MsaaSamples::k2X) {
-        // 32bpp -> 64bpp, 4x -> 2x.
-        // 1 destination horizontal pixel = 2 source horizontal samples.
-        // D p0,0 s0 = S p0,0 s0,0 | S p0,0 s1,0
-        // D p0,0 s1 = S p0,0 s0,1 | S p0,0 s1,1
-        // D p1,0 s0 = S p1,0 s0,0 | S p1,0 s1,0
-        // D p1,0 s1 = S p1,0 s0,1 | S p1,0 s1,1
-        // Pixel index can be reused. Sample 1 (for native 2x) or 0 (for 2x as
-        // 4x) should become samples 01, sample 0 or 3 should become samples 23.
-        source_sample = dxbc::Src::R(1, dxbc::Src::kZZZZ);
-        if (msaa_2x_supported_) {
-          a.OpXOr(dxbc::Dest::R(1, 0b0100), dest_sample, dxbc::Src::LU(1));
-          a.OpIShL(dxbc::Dest::R(1, 0b0100), source_sample, dxbc::Src::LU(1));
-        } else {
-          a.OpAnd(dxbc::Dest::R(1, 0b0100), dest_sample, dxbc::Src::LU(0b10));
-        }
-      } else {
-        // 32bpp -> 64bpp, 4x -> 1x.
-        // 1 destination horizontal pixel = 2 source horizontal samples.
-        // D p0,0 = S p0,0 s0,0 | S p0,0 s1,0
-        // D p0,1 = S p0,0 s0,1 | S p0,0 s1,1
-        // Horizontal pixel index can be reused. Vertical pixel 1 should
-        // become sample 2.
-        a.OpBFI(dxbc::Dest::R(1, 0b0100), dxbc::Src::LU(1), dxbc::Src::LU(1),
-                dxbc::Src::R(0, dxbc::Src::kYYYY), dxbc::Src::LU(0));
-        source_sample = dxbc::Src::R(1, dxbc::Src::kZZZZ);
-        a.OpUShR(dxbc::Dest::R(1, 0b0010), dxbc::Src::R(0, dxbc::Src::kYYYY), dxbc::Src::LU(1));
-        source_tile_pixel_y_reg = 1;
-      }
-    } else {
-      // 32bpp -> 64bpp, 1x/2x ->.
-      // Source has 32bpp halves in two adjacent pixels.
-      if (key.dest_msaa_samples >= xenos::MsaaSamples::k4X) {
-        // 32bpp -> 64bpp, 1x/2x -> 4x.
-        // The X part.
-        // 1 destination horizontal sample = 2 source horizontal pixels.
-        a.OpIShL(dxbc::Dest::R(1, 0b0001), dxbc::Src::R(0, dxbc::Src::kXXXX), dxbc::Src::LU(2));
-        a.OpBFI(dxbc::Dest::R(1, 0b0001), dxbc::Src::LU(1), dxbc::Src::LU(1),
-                dxbc::Src::V1D(kInputRegisterSampleIndex, dxbc::Src::kXXXX),
-                dxbc::Src::R(1, dxbc::Src::kXXXX));
-        source_tile_pixel_x_reg = 1;
-        // Y is handled by common code.
-      } else {
-        // 32bpp -> 64bpp, 1x/2x -> 1x/2x.
-        // The X part.
-        // 1 destination horizontal pixel = 2 source horizontal pixels.
-        a.OpIShL(dxbc::Dest::R(1, 0b0001), dxbc::Src::R(0, dxbc::Src::kXXXX), dxbc::Src::LU(1));
-        source_tile_pixel_x_reg = 1;
-        // Y is handled by common code.
-      }
+  // The transfer remaps the destination sample to the source sample through
+  // the canonical sample coordinates, the layout is described in
+  // XeEdramOffsetBytes in edram.xesli.
+  if (key.source_msaa_samples != key.dest_msaa_samples ||
+      source_is_64bpp != dest_is_64bpp) {
+    // Remap the destination view sample to the source view using the canonical
+    // coordinates (both views are in the source scale space here).
+    dxbc::Src canonical_u(dxbc::Src::R(0, dxbc::Src::kXXXX));
+    dxbc::Src canonical_v(dxbc::Src::R(0, dxbc::Src::kYYYY));
+    bool canonical_scaled;
+    CanonicalizeSample(a, key.dest_msaa_samples, dest_sample,
+                       msaa_2x_supported_, source_scale_x, source_scale_y,
+                       canonical_u, canonical_v, canonical_scaled);
+    if (dest_is_64bpp && !source_is_64bpp) {
+      // The low 32bpp half of the 64bpp destination sample is obtained from the
+      // source pixel at u = 2 * u_64bpp, and the high half comes from the
+      // horizontally adjacent source pixel later.
+      a.OpIShL(dxbc::Dest::R(1, 0b0001), canonical_u, dxbc::Src::LU(1));
+      canonical_u = dxbc::Src::R(1, dxbc::Src::kXXXX);
+    } else if (!dest_is_64bpp && source_is_64bpp) {
+      // The 32bpp destination sample is one half (r0.w) of the 64bpp
+      // source sample at u = u_32bpp >> 1.
+      a.OpAnd(dxbc::Dest::R(0, 0b1000), canonical_u, dxbc::Src::LU(1));
+      a.OpUShR(dxbc::Dest::R(1, 0b0001), canonical_u, dxbc::Src::LU(1));
+      canonical_u = dxbc::Src::R(1, dxbc::Src::kXXXX);
     }
-  } else if (source_is_64bpp && !dest_is_64bpp) {
-    // 64bpp -> 32bpp, also the half to r0.w.
-    if (key.dest_msaa_samples >= xenos::MsaaSamples::k4X) {
-      // 64bpp -> 32bpp, -> 4x.
-      // The needed half is in the destination horizontal sample index.
-      if (key.source_msaa_samples >= xenos::MsaaSamples::k4X) {
-        // 64bpp -> 32bpp, 4x -> 4x.
-        // D p0,0 s0,0 = S s0,0 low
-        // D p0,0 s1,0 = S s0,0 high
-        // D p1,0 s0,0 = S s1,0 low
-        // D p1,0 s1,0 = S s1,0 high
-        // Vertical pixel and sample (second bit) addressing is the same.
-        // However, 1 horizontal destination pixel = 1 horizontal source sample.
-        a.OpBFI(dxbc::Dest::R(1, 0b0100), dxbc::Src::LU(1), dxbc::Src::LU(0),
-                dxbc::Src::R(0, dxbc::Src::kXXXX), dest_sample);
-        source_sample = dxbc::Src::R(1, dxbc::Src::kZZZZ);
-        // 2 destination horizontal samples = 1 source horizontal sample, thus
-        // 2 destination horizontal pixels = 1 source horizontal pixel.
-        a.OpUShR(dxbc::Dest::R(1, 0b0001), dxbc::Src::R(0, dxbc::Src::kXXXX), dxbc::Src::LU(1));
-        source_tile_pixel_x_reg = 1;
-      } else {
-        // 64bpp -> 32bpp, 1x/2x -> 4x.
-        // 2 destination horizontal samples = 1 source horizontal pixel, thus
-        // 1 destination horizontal pixel = 1 source horizontal pixel. Can reuse
-        // horizontal pixel index.
-        // Y is handled by common code.
-      }
-      // Half in r0.w from the destination horizontal sample index.
-      a.OpAnd(dxbc::Dest::R(0, 0b1000), dest_sample, dxbc::Src::LU(1));
-    } else {
-      // 64bpp -> 32bpp, -> 1x/2x.
-      // The needed half is in the destination horizontal pixel index.
-      if (key.source_msaa_samples >= xenos::MsaaSamples::k4X) {
-        // 64bpp -> 32bpp, 4x -> 1x/2x.
-        // (Destination horizontal pixel >> 1) & 1 = source horizontal sample
-        // (first bit).
-        a.OpUBFE(dxbc::Dest::R(1, 0b0100), dxbc::Src::LU(1), dxbc::Src::LU(1),
-                 dxbc::Src::R(0, dxbc::Src::kXXXX));
-        source_sample = dxbc::Src::R(1, dxbc::Src::kZZZZ);
-        if (key.dest_msaa_samples == xenos::MsaaSamples::k2X) {
-          // 64bpp -> 32bpp, 4x -> 2x.
-          // Destination vertical samples (1/0 in the first bit for native 2x or
-          // 0/1 in the second bit for 2x as 4x) = source vertical samples
-          // (second bit).
-          if (msaa_2x_supported_) {
-            a.OpBFI(dxbc::Dest::R(1, 0b0100), dxbc::Src::LU(1), dxbc::Src::LU(1), dest_sample,
-                    source_sample);
-            a.OpXOr(dxbc::Dest::R(1, 0b0100), source_sample, dxbc::Src::LU(1 << 1));
-          } else {
-            a.OpBFI(dxbc::Dest::R(1, 0b0100), dxbc::Src::LU(1), dxbc::Src::LU(0), source_sample,
-                    dest_sample);
-          }
-        } else {
-          // 64bpp -> 32bpp, 4x -> 1x.
-          // 1 destination vertical pixel = 1 source vertical sample.
-          a.OpBFI(dxbc::Dest::R(1, 0b0100), dxbc::Src::LU(1), dxbc::Src::LU(1),
-                  dxbc::Src::R(0, dxbc::Src::kYYYY), source_sample);
-          a.OpUShR(dxbc::Dest::R(1, 0b0010), dxbc::Src::R(0, dxbc::Src::kYYYY), dxbc::Src::LU(1));
-          source_tile_pixel_y_reg = 1;
-        }
-        // 2 destination horizontal pixels = 1 source horizontal sample.
-        // 4 destination horizontal pixels = 1 source horizontal pixel.
-        a.OpUShR(dxbc::Dest::R(1, 0b0001), dxbc::Src::R(0, dxbc::Src::kXXXX), dxbc::Src::LU(2));
-        source_tile_pixel_x_reg = 1;
-      } else {
-        // 64bpp -> 32bpp, 1x/2x -> 1x/2x.
-        // The X part.
-        // 2 destination horizontal pixels = 1 destination source pixel.
-        a.OpUShR(dxbc::Dest::R(1, 0b0001), dxbc::Src::R(0, dxbc::Src::kXXXX), dxbc::Src::LU(1));
-        source_tile_pixel_x_reg = 1;
-        // Y is handled by common code.
-      }
-      // Half in r0.w from the destination horizontal pixel index.
-      a.OpAnd(dxbc::Dest::R(0, 0b1000), dxbc::Src::R(0, dxbc::Src::kXXXX), dxbc::Src::LU(1));
-    }
-  } else {
-    // Same bit count.
-    if (key.source_msaa_samples != key.dest_msaa_samples) {
-      if (key.source_msaa_samples >= xenos::MsaaSamples::k4X) {
-        // Same BPP, 4x -> 1x/2x.
-        if (key.dest_msaa_samples == xenos::MsaaSamples::k2X) {
-          // Same BPP, 4x -> 2x.
-          // Horizontal pixels to samples. Vertical sample (1/0 in the first bit
-          // for native 2x or 0/1 in the second bit for 2x as 4x) to second
-          // sample bit.
-          source_sample = dxbc::Src::R(1, dxbc::Src::kZZZZ);
-          if (msaa_2x_supported_) {
-            a.OpBFI(dxbc::Dest::R(1, 0b0100), dxbc::Src::LU(31), dxbc::Src::LU(1), dest_sample,
-                    dxbc::Src::R(0, dxbc::Src::kXXXX));
-            a.OpXOr(dxbc::Dest::R(1, 0b0100), source_sample, dxbc::Src::LU(1 << 1));
-          } else {
-            a.OpBFI(dxbc::Dest::R(1, 0b0100), dxbc::Src::LU(1), dxbc::Src::LU(0),
-                    dxbc::Src::R(0, dxbc::Src::kXXXX), dest_sample);
-          }
-          a.OpUShR(dxbc::Dest::R(1, 0b0001), dxbc::Src::R(0, dxbc::Src::kXXXX), dxbc::Src::LU(1));
-          source_tile_pixel_x_reg = 1;
-        } else {
-          // Same BPP, 4x -> 1x.
-          // Pixels to samples.
-          a.OpAnd(dxbc::Dest::R(1, 0b0100), dxbc::Src::R(0, dxbc::Src::kXXXX), dxbc::Src::LU(1));
-          source_sample = dxbc::Src::R(1, dxbc::Src::kZZZZ);
-          a.OpBFI(dxbc::Dest::R(1, 0b0100), dxbc::Src::LU(1), dxbc::Src::LU(1),
-                  dxbc::Src::R(0, dxbc::Src::kYYYY), source_sample);
-          a.OpUShR(dxbc::Dest::R(1, 0b0011), dxbc::Src::R(0), dxbc::Src::LU(1));
-          source_tile_pixel_x_reg = 1;
-          source_tile_pixel_y_reg = 1;
-        }
-      } else {
-        // Same BPP, 1x/2x -> 1x/2x/4x (as long as they're different).
-        // Only the X part - Y is handled by common code.
-        if (key.dest_msaa_samples >= xenos::MsaaSamples::k4X) {
-          // Horizontal samples to pixels.
-          a.OpBFI(dxbc::Dest::R(1, 0b0001), dxbc::Src::LU(31), dxbc::Src::LU(1),
-                  dxbc::Src::R(0, dxbc::Src::kXXXX), dest_sample);
-          source_tile_pixel_x_reg = 1;
-        }
-      }
-    }
-  }
-  // Common source Y and sample index for 1x/2x AA sources, independent of bits
-  // per sample.
-  if (key.source_msaa_samples < xenos::MsaaSamples::k4X &&
-      key.source_msaa_samples != key.dest_msaa_samples) {
-    if (key.dest_msaa_samples >= xenos::MsaaSamples::k4X) {
-      // 1x/2x -> 4x.
-      if (key.source_msaa_samples == xenos::MsaaSamples::k2X) {
-        // 2x -> 4x.
-        // Vertical samples (second bit) of 4x destination to vertical sample
-        // (1, 0 for native 2x, or 0, 3 for 2x as 4x) of 2x source.
-        a.OpUShR(dxbc::Dest::R(1, 0b0100), dest_sample, dxbc::Src::LU(1));
-        source_sample = dxbc::Src::R(1, dxbc::Src::kZZZZ);
-        if (msaa_2x_supported_) {
-          a.OpXOr(dxbc::Dest::R(1, 0b0100), source_sample, dxbc::Src::LU(1));
-        } else {
-          a.OpBFI(dxbc::Dest::R(1, 0b0100), dxbc::Src::LU(1), dxbc::Src::LU(1), source_sample,
-                  source_sample);
-        }
-      } else {
-        // 1x -> 4x.
-        // Vertical samples (second bit) to Y pixels.
-        a.OpUShR(dxbc::Dest::R(1, 0b0010), dest_sample, dxbc::Src::LU(1));
-        a.OpBFI(dxbc::Dest::R(1, 0b0010), dxbc::Src::LU(31), dxbc::Src::LU(1),
-                dxbc::Src::R(0, dxbc::Src::kYYYY), dxbc::Src::R(1, dxbc::Src::kYYYY));
-        source_tile_pixel_y_reg = 1;
-      }
-    } else {
-      // 1x/2x -> different 1x/2x.
-      if (key.source_msaa_samples == xenos::MsaaSamples::k2X) {
-        // 2x -> 1x.
-        // Vertical pixels of 2x destination to vertical samples (1, 0 for
-        // native 2x, or 0, 3 for 2x as 4x) of 1x source.
-        a.OpAnd(dxbc::Dest::R(1, 0b0100), dxbc::Src::R(0, dxbc::Src::kYYYY), dxbc::Src::LU(1));
-        source_sample = dxbc::Src::R(1, dxbc::Src::kZZZZ);
-        if (msaa_2x_supported_) {
-          a.OpXOr(dxbc::Dest::R(1, 0b0100), source_sample, dxbc::Src::LU(1));
-        } else {
-          a.OpBFI(dxbc::Dest::R(1, 0b0100), dxbc::Src::LU(1), dxbc::Src::LU(1), source_sample,
-                  source_sample);
-        }
-        a.OpUShR(dxbc::Dest::R(1, 0b0010), dxbc::Src::R(0, dxbc::Src::kYYYY), dxbc::Src::LU(1));
-        source_tile_pixel_y_reg = 1;
-      } else {
-        // 1x -> 2x.
-        // Vertical samples (1/0 in the first bit for native 2x or 0/1 in the
-        // second bit for 2x as 4x) of 2x destination to vertical pixels of 1x
-        // source.
-        if (msaa_2x_supported_) {
-          a.OpBFI(dxbc::Dest::R(1, 0b0010), dxbc::Src::LU(31), dxbc::Src::LU(1),
-                  dxbc::Src::R(0, dxbc::Src::kYYYY), dest_sample);
-          a.OpXOr(dxbc::Dest::R(1, 0b0010), dxbc::Src::R(1, dxbc::Src::kYYYY), dxbc::Src::LU(1));
-        } else {
-          a.OpUShR(dxbc::Dest::R(1, 0b0010), dest_sample, dxbc::Src::LU(1));
-          a.OpBFI(dxbc::Dest::R(1, 0b0010), dxbc::Src::LU(31), dxbc::Src::LU(1),
-                  dxbc::Src::R(0, dxbc::Src::kYYYY), dxbc::Src::R(1, dxbc::Src::kYYYY));
-        }
-        source_tile_pixel_y_reg = 1;
-      }
-    }
+    dxbc::Src source_pixel_x(canonical_u);
+    dxbc::Src source_pixel_y(canonical_v);
+    DecanonicalizeSample(a, key.source_msaa_samples, canonical_u, canonical_v,
+                         canonical_scaled, msaa_2x_supported_, source_scale_x,
+                         source_scale_y, source_pixel_x, source_pixel_y,
+                         source_sample);
+    // Each of the compositions routes u (and along with that the X result)
+    // through r1.x. The Y result lands in r1.y, except when there is a single
+    // sampled unscaled transfer between bit depths. In that case, v goes into
+    // r0.y.
+    source_tile_pixel_x_reg = 1;
+    source_tile_pixel_y_reg =
+        (key.source_msaa_samples == xenos::MsaaSamples::k1X &&
+         key.dest_msaa_samples == xenos::MsaaSamples::k1X && !canonical_scaled)
+            ? 0
+            : 1;
   }
 
   uint32_t source_pixel_width_dwords_log2 =
-      uint32_t(key.source_msaa_samples >= xenos::MsaaSamples::k4X) + uint32_t(source_is_64bpp);
+      uint32_t(key.source_msaa_samples >= xenos::MsaaSamples::k4X) +
+      uint32_t(source_is_64bpp);
 
   if (source_is_color != dest_is_color) {
     // Copying between color and depth / stencil - swap 40-32bpp-sample columns
     // in the pixel index within the source 32bpp tile using r1.w as temporary.
     uint32_t source_32bpp_tile_half_pixels =
-        tile_width_samples >> (1 + source_pixel_width_dwords_log2);
-    a.OpULT(dxbc::Dest::R(1, 0b1000), dxbc::Src::R(source_tile_pixel_x_reg, dxbc::Src::kXXXX),
+        source_tile_width_samples >> (1 + source_pixel_width_dwords_log2);
+    a.OpULT(dxbc::Dest::R(1, 0b1000),
+            dxbc::Src::R(source_tile_pixel_x_reg, dxbc::Src::kXXXX),
             dxbc::Src::LU(source_32bpp_tile_half_pixels));
     a.OpMovC(dxbc::Dest::R(1, 0b1000), dxbc::Src::R(1, dxbc::Src::kWWWW),
              dxbc::Src::LI(int32_t(source_32bpp_tile_half_pixels)),
              dxbc::Src::LI(-int32_t(source_32bpp_tile_half_pixels)));
-    a.OpIAdd(dxbc::Dest::R(1, 0b0001), dxbc::Src::R(source_tile_pixel_x_reg, dxbc::Src::kXXXX),
+    a.OpIAdd(dxbc::Dest::R(1, 0b0001),
+             dxbc::Src::R(source_tile_pixel_x_reg, dxbc::Src::kXXXX),
              dxbc::Src::R(1, dxbc::Src::kWWWW));
     source_tile_pixel_x_reg = 1;
     // r1.w = free
@@ -2774,9 +2866,11 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
 
   // Apply the source 32bpp tile index.
   // r1.w = destination to source EDRAM tile adjustment
-  a.OpIBFE(dxbc::Dest::R(1, 0b1000), dxbc::Src::LU(xenos::kEdramBaseTilesBits + 1),
+  a.OpIBFE(dxbc::Dest::R(1, 0b1000),
+           dxbc::Src::LU(xenos::kEdramBaseTilesBits + 1),
            dxbc::Src::LU(xenos::kEdramPitchTilesBits * 2),
-           dxbc::Src::CB(cbuffer_index_address, kTransferCBVRegisterAddress, 0, dxbc::Src::kXXXX));
+           dxbc::Src::CB(cbuffer_index_address, kTransferCBVRegisterAddress, 0,
+                         dxbc::Src::kXXXX));
   // r1.w = 32bpp tile index within the source, or the tile index within the
   //        source minus the EDRAM tile count if transferring across addressing
   //        wrapping (if negative)
@@ -2788,21 +2882,26 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
   // r2.x = source pitch in 32bpp tiles
   a.OpUBFE(dxbc::Dest::R(2, 0b0001), dxbc::Src::LU(xenos::kEdramPitchTilesBits),
            dxbc::Src::LU(xenos::kEdramPitchTilesBits),
-           dxbc::Src::CB(cbuffer_index_address, kTransferCBVRegisterAddress, 0, dxbc::Src::kXXXX));
+           dxbc::Src::CB(cbuffer_index_address, kTransferCBVRegisterAddress, 0,
+                         dxbc::Src::kXXXX));
   // r1.w = source tile row
   // r2.x = source 32bpp tile within the row
-  a.OpUDiv(dxbc::Dest::R(1, 0b1000), dxbc::Dest::R(2, 0b0001), dxbc::Src::R(1, dxbc::Src::kWWWW),
+  a.OpUDiv(dxbc::Dest::R(1, 0b1000), dxbc::Dest::R(2, 0b0001),
+           dxbc::Src::R(1, dxbc::Src::kWWWW),
            dxbc::Src::R(2, dxbc::Src::kXXXX));
   // r1.x = pixel X within the source texture
   // r2.x = free
-  a.OpUMAd(
-      dxbc::Dest::R(1, 0b0001), dxbc::Src::LU(tile_width_samples >> source_pixel_width_dwords_log2),
-      dxbc::Src::R(2, dxbc::Src::kXXXX), dxbc::Src::R(source_tile_pixel_x_reg, dxbc::Src::kXXXX));
+  a.OpUMAd(dxbc::Dest::R(1, 0b0001),
+           dxbc::Src::LU(source_tile_width_samples >>
+                         source_pixel_width_dwords_log2),
+           dxbc::Src::R(2, dxbc::Src::kXXXX),
+           dxbc::Src::R(source_tile_pixel_x_reg, dxbc::Src::kXXXX));
   // r1.y = pixel Y within the source texture
   // r1.w = free
   a.OpUMAd(dxbc::Dest::R(1, 0b0010),
-           dxbc::Src::LU(tile_height_samples >>
-                         uint32_t(key.source_msaa_samples >= xenos::MsaaSamples::k2X)),
+           dxbc::Src::LU(
+               source_tile_height_samples >>
+               uint32_t(key.source_msaa_samples >= xenos::MsaaSamples::k2X)),
            dxbc::Src::R(1, dxbc::Src::kWWWW),
            dxbc::Src::R(source_tile_pixel_y_reg, dxbc::Src::kYYYY));
 
@@ -2818,27 +2917,32 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
     for (uint32_t i = 0; i <= uint32_t(source_load_is_two_dwords); ++i) {
       uint32_t source_load_register = source_load_is_two_dwords ? i : 1;
       if (srv_index_depth != UINT32_MAX) {
-        a.OpLdMS(dxbc::Dest::R(source_load_register, 0b1000), dxbc::Src::R(1), 0b0011,
-                 dxbc::Src::T(srv_index_depth, kTransferSRVRegisterDepth, dxbc::Src::kXXXX),
+        a.OpLdMS(dxbc::Dest::R(source_load_register, 0b1000), dxbc::Src::R(1),
+                 0b0011,
+                 dxbc::Src::T(srv_index_depth, kTransferSRVRegisterDepth,
+                              dxbc::Src::kXXXX),
                  source_sample);
       }
       if (srv_index_stencil != UINT32_MAX) {
-        a.OpLdMS(dxbc::Dest::R(source_load_register, 0b0001), dxbc::Src::R(1), 0b0011,
-                 dxbc::Src::T(srv_index_stencil, kTransferSRVRegisterStencil, dxbc::Src::kYYYY),
+        a.OpLdMS(dxbc::Dest::R(source_load_register, 0b0001), dxbc::Src::R(1),
+                 0b0011,
+                 dxbc::Src::T(srv_index_stencil, kTransferSRVRegisterStencil,
+                              dxbc::Src::kYYYY),
                  source_sample);
       } else if (srv_index_color != UINT32_MAX) {
-        a.OpLdMS(dxbc::Dest::R(source_load_register, source_color_srv_component_mask),
-                 dxbc::Src::R(1), 0b0011, dxbc::Src::T(srv_index_color, kTransferSRVRegisterColor),
+        a.OpLdMS(dxbc::Dest::R(source_load_register,
+                               source_color_srv_component_mask),
+                 dxbc::Src::R(1), 0b0011,
+                 dxbc::Src::T(srv_index_color, kTransferSRVRegisterColor),
                  source_sample);
       }
       if (source_load_is_two_dwords && !i) {
-        // Go to the next sample or pixel along X if need to load two dwords.
-        if (key.source_msaa_samples >= xenos::MsaaSamples::k4X) {
-          a.OpOr(dxbc::Dest::R(1, 0b0100), source_sample, dxbc::Src::LU(1));
-          source_sample = dxbc::Src::R(1, dxbc::Src::kZZZZ);
-        } else {
-          a.OpOr(dxbc::Dest::R(1, 0b0001), dxbc::Src::R(1, dxbc::Src::kXXXX), dxbc::Src::LU(1));
-        }
+        // The high 32bpp half of a 64bpp destination sample is identical to the
+        // sample of the horizontally adjacent source pixel since each canonical
+        // sample column of a single 64bpp value decodes to the same sample of
+        // two horizontally adjacent pixels, regardless of sample count.
+        a.OpIAdd(dxbc::Dest::R(1, 0b0001), dxbc::Src::R(1, dxbc::Src::kXXXX),
+                 dxbc::Src::LU(source_scale_x));
       }
     }
   } else {
@@ -2848,26 +2952,33 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
     for (uint32_t i = 0; i <= uint32_t(source_load_is_two_dwords); ++i) {
       uint32_t source_load_register = source_load_is_two_dwords ? i : 1;
       if (srv_index_depth != UINT32_MAX) {
-        a.OpLd(dxbc::Dest::R(source_load_register, 0b1000), source_coordinates, 0b1011,
-               dxbc::Src::T(srv_index_depth, kTransferSRVRegisterDepth, dxbc::Src::kXXXX));
+        a.OpLd(dxbc::Dest::R(source_load_register, 0b1000), source_coordinates,
+               0b1011,
+               dxbc::Src::T(srv_index_depth, kTransferSRVRegisterDepth,
+                            dxbc::Src::kXXXX));
       }
       if (srv_index_stencil != UINT32_MAX) {
-        a.OpLd(dxbc::Dest::R(source_load_register, 0b0001), source_coordinates, 0b1011,
-               dxbc::Src::T(srv_index_stencil, kTransferSRVRegisterStencil, dxbc::Src::kYYYY));
+        a.OpLd(dxbc::Dest::R(source_load_register, 0b0001), source_coordinates,
+               0b1011,
+               dxbc::Src::T(srv_index_stencil, kTransferSRVRegisterStencil,
+                            dxbc::Src::kYYYY));
       } else if (srv_index_color != UINT32_MAX) {
-        a.OpLd(dxbc::Dest::R(source_load_register, source_color_srv_component_mask),
+        a.OpLd(dxbc::Dest::R(source_load_register,
+                             source_color_srv_component_mask),
                source_coordinates, 0b1011,
                dxbc::Src::T(srv_index_color, kTransferSRVRegisterColor));
       }
       if (source_load_is_two_dwords && !i) {
-        // Go to the next pixel along X if need to load two dwords.
-        a.OpOr(dxbc::Dest::R(1, 0b0001), dxbc::Src::R(1, dxbc::Src::kXXXX), dxbc::Src::LU(1));
+        // The high half, same as in the multisampled case above.
+        a.OpIAdd(dxbc::Dest::R(1, 0b0001), dxbc::Src::R(1, dxbc::Src::kXXXX),
+                 dxbc::Src::LU(source_scale_x));
       }
     }
   }
   // Pick the needed 32bpp half of the 64bpp color based on r0.w.
   if (source_is_64bpp && !dest_is_64bpp) {
-    uint32_t source_color_half_component_count = source_color_format_component_count >> 1;
+    uint32_t source_color_half_component_count =
+        source_color_format_component_count >> 1;
     if (dest_is_stencil_bit) {
       a.OpMovC(dxbc::Dest::R(1, 0b0001), dxbc::Src::R(0, dxbc::Src::kWWWW),
                dxbc::Src::R(1).Select(source_color_half_component_count),
@@ -2877,15 +2988,17 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
           (source_color_half_component_count * 0b01010101) &
           ~((uint32_t(1) << (source_color_half_component_count * 2)) - 1);
       for (uint32_t i = 0; i < source_color_half_component_count; ++i) {
-        color_high_dword_swizzle |= (source_color_half_component_count + i) << (i * 2);
+        color_high_dword_swizzle |= (source_color_half_component_count + i)
+                                    << (i * 2);
       }
       a.OpMovC(dxbc::Dest::R(1, (1 << source_color_half_component_count) - 1),
-               dxbc::Src::R(0, dxbc::Src::kWWWW), dxbc::Src::R(1, color_high_dword_swizzle),
-               dxbc::Src::R(1));
+               dxbc::Src::R(0, dxbc::Src::kWWWW),
+               dxbc::Src::R(1, color_high_dword_swizzle), dxbc::Src::R(1));
     }
   }
 
-  if (osgn_parameter_index_sv_stencil_ref != UINT32_MAX && srv_index_stencil != UINT32_MAX) {
+  if (osgn_parameter_index_sv_stencil_ref != UINT32_MAX &&
+      srv_index_stencil != UINT32_MAX) {
     // For the depth -> depth case, write the stencil loaded to r1.x directly to
     // the output.
     assert_true(mode.output == TransferOutput::kDepth);
@@ -2894,7 +3007,7 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
 
   if (dest_is_64bpp || dest_is_gamma_unorm16) {
     // Handle construction of 64bpp color, either from two 32-bit samples in r0
-    // and r1, or from one 64bpp sample in r1. Using r2.x as temporary when
+    // and r1, or from one 64bpp sample in r1. Using r2.xy as temporary when
     // needed.
     // If color_packed_in_r0x_and_r1x, use the generic path for combining two
     // 32-bit samples - as raw in r0.x and r1.x - into the destination.
@@ -2910,7 +3023,8 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
           }
           for (uint32_t i = 0; i < 2; ++i) {
             for (uint32_t j = 0; j < 3; ++j) {
-              DxbcShaderTranslator::PreSaturatedLinearToPWLGamma(a, i, j, i, j, 2, 0, 2, 1);
+              DxbcShaderTranslator::PreSaturatedLinearToPWLGamma(a, i, j, i, j,
+                                                                 2, 0, 2, 1);
             }
           }
         }
@@ -2919,18 +3033,21 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
           if (dest_is_gamma_unorm16) {
             // Convert gamma-encoded source to linear for gamma_unorm16 dest.
             for (uint32_t j = 0; j < 3; ++j) {
-              DxbcShaderTranslator::PWLGammaToLinear(a, 1, j, 1, j, true, 2, 0, 2, 1);
+              DxbcShaderTranslator::PWLGammaToLinear(a, 1, j, 1, j, true, 2, 0,
+                                                     2, 1);
             }
             a.OpMov(dxbc::Dest::O(0), dxbc::Src::R(1));
             break;
           }
           color_packed_in_r0x_and_r1x = true;
           for (uint32_t i = 0; i < 2; ++i) {
-            a.OpMAd(dxbc::Dest::R(i), dxbc::Src::R(i), dxbc::Src::LF(255.0f), dxbc::Src::LF(0.5f));
+            a.OpMAd(dxbc::Dest::R(i), dxbc::Src::R(i), dxbc::Src::LF(255.0f),
+                    dxbc::Src::LF(0.5f));
             a.OpFToU(dxbc::Dest::R(i), dxbc::Src::R(i));
             for (uint32_t j = 1; j < 4; ++j) {
-              a.OpBFI(dxbc::Dest::R(i, 0b0001), dxbc::Src::LU(8), dxbc::Src::LU(j * 8),
-                      dxbc::Src::R(i).Select(j), dxbc::Src::R(i, dxbc::Src::kXXXX));
+              a.OpBFI(dxbc::Dest::R(i, 0b0001), dxbc::Src::LU(8),
+                      dxbc::Src::LU(j * 8), dxbc::Src::R(i).Select(j),
+                      dxbc::Src::R(i, dxbc::Src::kXXXX));
             }
           }
         } break;
@@ -2939,7 +3056,8 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
           color_packed_in_r0x_and_r1x = true;
           for (uint32_t i = 0; i < 2; ++i) {
             a.OpMAd(dxbc::Dest::R(i), dxbc::Src::R(i),
-                    dxbc::Src::LF(1023.0f, 1023.0f, 1023.0f, 3.0f), dxbc::Src::LF(0.5f));
+                    dxbc::Src::LF(1023.0f, 1023.0f, 1023.0f, 3.0f),
+                    dxbc::Src::LF(0.5f));
             a.OpFToU(dxbc::Dest::R(i), dxbc::Src::R(i));
             for (uint32_t j = 1; j < 4; ++j) {
               a.OpBFI(dxbc::Dest::R(i, 0b0001), dxbc::Src::LU(j == 3 ? 2 : 10),
@@ -2949,7 +3067,8 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
           }
         } break;
         case xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT:
-        case xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT_AS_16_16_16_16: {
+        case xenos::ColorRenderTargetFormat::
+            k_2_10_10_10_FLOAT_AS_16_16_16_16: {
           color_packed_in_r0x_and_r1x = true;
           for (uint32_t i = 0; i < 2; ++i) {
             // Float16 has a wider range for both color and alpha, also NaNs -
@@ -2957,17 +3076,21 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
             for (uint32_t j = 0; j < 3; ++j) {
               DxbcShaderTranslator::UnclampedFloat32To7e3(a, i, j, i, j, 2, 0);
               if (j) {
-                a.OpBFI(dxbc::Dest::R(i, 0b0001), dxbc::Src::LU(10), dxbc::Src::LU(j * 10),
-                        dxbc::Src::R(i).Select(j), dxbc::Src::R(i, dxbc::Src::kXXXX));
+                a.OpBFI(dxbc::Dest::R(i, 0b0001), dxbc::Src::LU(10),
+                        dxbc::Src::LU(j * 10), dxbc::Src::R(i).Select(j),
+                        dxbc::Src::R(i, dxbc::Src::kXXXX));
               }
             }
             // Saturate and convert the alpha.
-            a.OpMov(dxbc::Dest::R(i, 0b1000), dxbc::Src::R(i, dxbc::Src::kWWWW), true);
+            a.OpMov(dxbc::Dest::R(i, 0b1000), dxbc::Src::R(i, dxbc::Src::kWWWW),
+                    true);
             a.OpMAd(dxbc::Dest::R(i, 0b1000), dxbc::Src::R(i, dxbc::Src::kWWWW),
                     dxbc::Src::LF(3.0f), dxbc::Src::LF(0.5f));
-            a.OpFToU(dxbc::Dest::R(i, 0b1000), dxbc::Src::R(i, dxbc::Src::kWWWW));
-            a.OpBFI(dxbc::Dest::R(i, 0b0001), dxbc::Src::LU(2), dxbc::Src::LU(30),
-                    dxbc::Src::R(i, dxbc::Src::kWWWW), dxbc::Src::R(i, dxbc::Src::kXXXX));
+            a.OpFToU(dxbc::Dest::R(i, 0b1000),
+                     dxbc::Src::R(i, dxbc::Src::kWWWW));
+            a.OpBFI(dxbc::Dest::R(i, 0b0001), dxbc::Src::LU(2),
+                    dxbc::Src::LU(30), dxbc::Src::R(i, dxbc::Src::kWWWW),
+                    dxbc::Src::R(i, dxbc::Src::kXXXX));
           }
         } break;
         // All 64bpp formats, and all 16 bits per component formats, are
@@ -2975,10 +3098,12 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
         // NaNs and -32768 / -32767.
         case xenos::ColorRenderTargetFormat::k_16_16:
         case xenos::ColorRenderTargetFormat::k_16_16_FLOAT: {
-          if (dest_color_format == xenos::ColorRenderTargetFormat::k_32_32_FLOAT) {
+          if (dest_color_format ==
+              xenos::ColorRenderTargetFormat::k_32_32_FLOAT) {
             for (uint32_t i = 0; i < 2; ++i) {
-              a.OpBFI(dxbc::Dest::O(0, 1 << i), dxbc::Src::LU(16), dxbc::Src::LU(16),
-                      dxbc::Src::R(i, dxbc::Src::kYYYY), dxbc::Src::R(i, dxbc::Src::kXXXX));
+              a.OpBFI(dxbc::Dest::O(0, 1 << i), dxbc::Src::LU(16),
+                      dxbc::Src::LU(16), dxbc::Src::R(i, dxbc::Src::kYYYY),
+                      dxbc::Src::R(i, dxbc::Src::kXXXX));
             }
           } else {
             a.OpMov(dxbc::Dest::O(0, 0b0011), dxbc::Src::R(0));
@@ -2987,9 +3112,11 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
         } break;
         case xenos::ColorRenderTargetFormat::k_16_16_16_16:
         case xenos::ColorRenderTargetFormat::k_16_16_16_16_FLOAT: {
-          if (dest_color_format == xenos::ColorRenderTargetFormat::k_32_32_FLOAT) {
-            a.OpBFI(dxbc::Dest::O(0, 0b0011), dxbc::Src::LU(16), dxbc::Src::LU(16),
-                    dxbc::Src::R(1, 0b1101), dxbc::Src::R(1, 0b1000));
+          if (dest_color_format ==
+              xenos::ColorRenderTargetFormat::k_32_32_FLOAT) {
+            a.OpBFI(dxbc::Dest::O(0, 0b0011), dxbc::Src::LU(16),
+                    dxbc::Src::LU(16), dxbc::Src::R(1, 0b1101),
+                    dxbc::Src::R(1, 0b1000));
           } else {
             a.OpMov(dxbc::Dest::O(0), dxbc::Src::R(1));
           }
@@ -2998,11 +3125,12 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
           color_packed_in_r0x_and_r1x = true;
         } break;
         case xenos::ColorRenderTargetFormat::k_32_32_FLOAT: {
-          if (dest_color_format == xenos::ColorRenderTargetFormat::k_32_32_FLOAT) {
+          if (dest_color_format ==
+              xenos::ColorRenderTargetFormat::k_32_32_FLOAT) {
             a.OpMov(dxbc::Dest::O(0, 0b0011), dxbc::Src::R(1));
           } else {
-            a.OpUBFE(dxbc::Dest::O(0), dxbc::Src::LU(16), dxbc::Src::LU(0, 16, 0, 16),
-                     dxbc::Src::R(1, 0b01010000));
+            a.OpUBFE(dxbc::Dest::O(0), dxbc::Src::LU(16),
+                     dxbc::Src::LU(0, 16, 0, 16), dxbc::Src::R(1, 0b01010000));
           }
         } break;
       }
@@ -3017,8 +3145,10 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
             // instead of black in the 4D5307E6 clear shader.
             a.OpMul(dxbc::Dest::R(i, 0b1000), dxbc::Src::R(i, dxbc::Src::kWWWW),
                     dxbc::Src::LF(float(0xFFFFFF)));
-            a.OpRoundNE(dxbc::Dest::R(i, 0b1000), dxbc::Src::R(i, dxbc::Src::kWWWW));
-            a.OpFToU(dxbc::Dest::R(i, 0b1000), dxbc::Src::R(i, dxbc::Src::kWWWW));
+            a.OpRoundNE(dxbc::Dest::R(i, 0b1000),
+                        dxbc::Src::R(i, dxbc::Src::kWWWW));
+            a.OpFToU(dxbc::Dest::R(i, 0b1000),
+                     dxbc::Src::R(i, dxbc::Src::kWWWW));
           } break;
           case xenos::DepthRenderTargetFormat::kD24FS8: {
             // Convert using r1.y as temporary.
@@ -3026,12 +3156,15 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
             // truncating not to insert additional rounding instructions.
             DxbcShaderTranslator::PreClampedDepthTo20e4(
                 a, i, 3, i, 3, 1, 1,
-                !depth_float24_convert_in_pixel_shader() && depth_float24_round(), true);
+                !depth_float24_convert_in_pixel_shader() &&
+                    depth_float24_round(),
+                true);
           } break;
         }
         // Merge depth and stencil into r0/r1.x.
         a.OpBFI(dxbc::Dest::R(i, 0b0001), dxbc::Src::LU(24), dxbc::Src::LU(8),
-                dxbc::Src::R(i, dxbc::Src::kWWWW), dxbc::Src::R(i, dxbc::Src::kXXXX));
+                dxbc::Src::R(i, dxbc::Src::kWWWW),
+                dxbc::Src::R(i, dxbc::Src::kXXXX));
       }
     }
     if (color_packed_in_r0x_and_r1x) {
@@ -3060,7 +3193,8 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
 
         // Extract 4 bytes: r1.xyzw = [R, G, B, A] as uint.
         a.OpUBFE(dxbc::Dest::R(1), dxbc::Src::LU(8, 8, 8, 8),
-                 dxbc::Src::LU(0, 8, 16, 24), dxbc::Src::R(1, dxbc::Src::kXXXX));
+                 dxbc::Src::LU(0, 8, 16, 24),
+                 dxbc::Src::R(1, dxbc::Src::kXXXX));
 
         // Alpha: o0.w = float(A) / 255.0 (no gamma conversion).
         a.OpUToF(dxbc::Dest::R(0, 0b1000), dxbc::Src::R(1, dxbc::Src::kWWWW));
@@ -3074,32 +3208,43 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
           a.OpMov(dxbc::Dest::R(0, 0b0001), dxbc::Src::LF(1.0f / 1023.0f));
           a.OpMov(dxbc::Dest::R(0, 0b0010), dxbc::Src::LF(0.5f / 1023.0f));
           // Piece 1: byte >= 64.
-          a.OpUGE(dxbc::Dest::R(2, 0b0001), dxbc::Src::R(1).Select(j), dxbc::Src::LU(64));
+          a.OpUGE(dxbc::Dest::R(2, 0b0001), dxbc::Src::R(1).Select(j),
+                  dxbc::Src::LU(64));
           a.OpMovC(dxbc::Dest::R(0, 0b0001), dxbc::Src::R(2, dxbc::Src::kXXXX),
-                   dxbc::Src::LF(1.0f / 511.5f), dxbc::Src::R(0, dxbc::Src::kXXXX));
+                   dxbc::Src::LF(1.0f / 511.5f),
+                   dxbc::Src::R(0, dxbc::Src::kXXXX));
           a.OpMovC(dxbc::Dest::R(0, 0b0010), dxbc::Src::R(2, dxbc::Src::kXXXX),
-                   dxbc::Src::LF(-31.5f / 511.5f), dxbc::Src::R(0, dxbc::Src::kYYYY));
+                   dxbc::Src::LF(-31.5f / 511.5f),
+                   dxbc::Src::R(0, dxbc::Src::kYYYY));
           // Piece 2: byte >= 96.
-          a.OpUGE(dxbc::Dest::R(2, 0b0001), dxbc::Src::R(1).Select(j), dxbc::Src::LU(96));
+          a.OpUGE(dxbc::Dest::R(2, 0b0001), dxbc::Src::R(1).Select(j),
+                  dxbc::Src::LU(96));
           a.OpMovC(dxbc::Dest::R(0, 0b0001), dxbc::Src::R(2, dxbc::Src::kXXXX),
-                   dxbc::Src::LF(1.0f / 255.75f), dxbc::Src::R(0, dxbc::Src::kXXXX));
+                   dxbc::Src::LF(1.0f / 255.75f),
+                   dxbc::Src::R(0, dxbc::Src::kXXXX));
           a.OpMovC(dxbc::Dest::R(0, 0b0010), dxbc::Src::R(2, dxbc::Src::kXXXX),
-                   dxbc::Src::LF(-63.5f / 255.75f), dxbc::Src::R(0, dxbc::Src::kYYYY));
+                   dxbc::Src::LF(-63.5f / 255.75f),
+                   dxbc::Src::R(0, dxbc::Src::kYYYY));
           // Piece 3: byte >= 192.
-          a.OpUGE(dxbc::Dest::R(2, 0b0001), dxbc::Src::R(1).Select(j), dxbc::Src::LU(192));
+          a.OpUGE(dxbc::Dest::R(2, 0b0001), dxbc::Src::R(1).Select(j),
+                  dxbc::Src::LU(192));
           a.OpMovC(dxbc::Dest::R(0, 0b0001), dxbc::Src::R(2, dxbc::Src::kXXXX),
-                   dxbc::Src::LF(1.0f / 127.875f), dxbc::Src::R(0, dxbc::Src::kXXXX));
+                   dxbc::Src::LF(1.0f / 127.875f),
+                   dxbc::Src::R(0, dxbc::Src::kXXXX));
           a.OpMovC(dxbc::Dest::R(0, 0b0010), dxbc::Src::R(2, dxbc::Src::kXXXX),
-                   dxbc::Src::LF(-127.5f / 127.875f), dxbc::Src::R(0, dxbc::Src::kYYYY));
+                   dxbc::Src::LF(-127.5f / 127.875f),
+                   dxbc::Src::R(0, dxbc::Src::kYYYY));
           // F = float(byte) * recip + offset.
           a.OpUToF(dxbc::Dest::R(2, 0b0001), dxbc::Src::R(1).Select(j));
           a.OpMAd(dxbc::Dest::O(0, 1 << j), dxbc::Src::R(2, dxbc::Src::kXXXX),
-                  dxbc::Src::R(0, dxbc::Src::kXXXX), dxbc::Src::R(0, dxbc::Src::kYYYY));
+                  dxbc::Src::R(0, dxbc::Src::kXXXX),
+                  dxbc::Src::R(0, dxbc::Src::kYYYY));
         }
       } else {
         for (uint32_t i = 0; i < 2; ++i) {
           a.OpUBFE(dxbc::Dest::O(0, 0b11 << (i * 2)), dxbc::Src::LU(16),
-                   dxbc::Src::LU(0, 16, 0, 16), dxbc::Src::R(i, dxbc::Src::kXXXX));
+                   dxbc::Src::LU(0, 16, 0, 16),
+                   dxbc::Src::R(i, dxbc::Src::kXXXX));
         }
       }
     }
@@ -3113,66 +3258,84 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
       switch (source_color_format) {
         case xenos::ColorRenderTargetFormat::k_8_8_8_8:
         case xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA: {
+          // 8_8_8_8_GAMMA is represented by linear stored in
+          // R16G16B16A16_UNORM.
           if (dest_is_stencil_bit) {
-            if (source_color_format == xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA) {
-              DxbcShaderTranslator::PreSaturatedLinearToPWLGamma(a, 1, 0, 1, 0, 2, 0, 2, 1);
+            if (source_color_format ==
+                xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA) {
+              DxbcShaderTranslator::PreSaturatedLinearToPWLGamma(a, 1, 0, 1, 0,
+                                                                 2, 0, 2, 1);
             }
             a.OpMAd(dxbc::Dest::R(1, 0b0001), dxbc::Src::R(1, dxbc::Src::kXXXX),
                     dxbc::Src::LF(255.0f), dxbc::Src::LF(0.5f));
-            a.OpFToU(dxbc::Dest::R(1, 0b0001), dxbc::Src::R(1, dxbc::Src::kXXXX));
+            a.OpFToU(dxbc::Dest::R(1, 0b0001),
+                     dxbc::Src::R(1, dxbc::Src::kXXXX));
           } else if (dest_is_color &&
-                     (dest_color_format == xenos::ColorRenderTargetFormat::k_8_8_8_8 ||
-                      dest_color_format == xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA)) {
-            if (source_color_format != dest_color_format) {
-              // Color space conversion between k_8_8_8_8 and
-              // k_8_8_8_8_GAMMA.
-              if (dest_color_format != xenos::ColorRenderTargetFormat::k_8_8_8_8) {
+                     (dest_color_format ==
+                          xenos::ColorRenderTargetFormat::k_8_8_8_8 ||
+                      dest_color_format ==
+                          xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA)) {
+            // Same format - only perform color space conversion.
+            if (dest_color_format != source_color_format) {
+              if (dest_color_format ==
+                  xenos::ColorRenderTargetFormat::k_8_8_8_8) {
                 for (uint32_t i = 0; i < 3; ++i) {
-                  DxbcShaderTranslator::PreSaturatedLinearToPWLGamma(a, 1, i, 1, i, 2, 0, 2, 1);
+                  DxbcShaderTranslator::PreSaturatedLinearToPWLGamma(
+                      a, 1, i, 1, i, 2, 0, 2, 1);
                 }
               } else {
                 for (uint32_t i = 0; i < 3; ++i) {
-                  DxbcShaderTranslator::PWLGammaToLinear(a, 1, i, 1, i, true, 2, 0, 2, 1);
+                  DxbcShaderTranslator::PWLGammaToLinear(a, 1, i, 1, i, true, 2,
+                                                         0, 2, 1);
                 }
               }
             }
-            // Same or converted format - passthrough.
             a.OpMov(dxbc::Dest::O(0), dxbc::Src::R(1));
           } else if (mode.output == TransferOutput::kDepth) {
-            if (source_color_format == xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA) {
-              for (uint32_t i = osgn_parameter_index_sv_stencil_ref != UINT32_MAX ? 0 : 1; i < 3;
-                   ++i) {
-                DxbcShaderTranslator::PreSaturatedLinearToPWLGamma(a, 1, i, 1, i, 2, 0, 2, 1);
+            // When need only depth, not stencil, skipping the red component.
+            if (source_color_format ==
+                xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA) {
+              for (uint32_t i = shader_uses_stencil_reference_output ? 0 : 1;
+                   i < 3; ++i) {
+                DxbcShaderTranslator::PreSaturatedLinearToPWLGamma(
+                    a, 1, i, 1, i, 2, 0, 2, 1);
               }
             }
-            // When need only depth, not stencil, skip the red component.
-            a.OpMAd(dxbc::Dest::R(
-                        1, osgn_parameter_index_sv_stencil_ref != UINT32_MAX ? 0b1111 : 0b1110),
-                    dxbc::Src::R(1), dxbc::Src::LF(255.0f), dxbc::Src::LF(0.5f));
+            a.OpMAd(
+                dxbc::Dest::R(
+                    1, shader_uses_stencil_reference_output ? 0b1111 : 0b1110),
+                dxbc::Src::R(1), dxbc::Src::LF(255.0f), dxbc::Src::LF(0.5f));
             a.OpFToU(dxbc::Dest::R(1, 0b1110), dxbc::Src::R(1));
-            if (osgn_parameter_index_sv_stencil_ref != UINT32_MAX) {
+            if (shader_uses_stencil_reference_output) {
               // Write the red component to the stencil reference.
-              a.OpFToU(dxbc::Dest::OStencilRef(), dxbc::Src::R(1, dxbc::Src::kXXXX));
+              a.OpFToU(dxbc::Dest::OStencilRef(),
+                       dxbc::Src::R(1, dxbc::Src::kXXXX));
             }
             // Put depth in 0:23 of r1.w.
             // r1.y = 0xGGBB0000.
-            a.OpBFI(dxbc::Dest::R(1, 0b0010), dxbc::Src::LU(8), dxbc::Src::LU(8),
-                    dxbc::Src::R(1, dxbc::Src::kZZZZ), dxbc::Src::R(1, dxbc::Src::kYYYY));
+            a.OpBFI(dxbc::Dest::R(1, 0b0010), dxbc::Src::LU(8),
+                    dxbc::Src::LU(8), dxbc::Src::R(1, dxbc::Src::kZZZZ),
+                    dxbc::Src::R(1, dxbc::Src::kYYYY));
             // r1.w = 0xGGBBAA00.
-            a.OpBFI(dxbc::Dest::R(1, 0b1000), dxbc::Src::LU(8), dxbc::Src::LU(16),
-                    dxbc::Src::R(1, dxbc::Src::kWWWW), dxbc::Src::R(1, dxbc::Src::kYYYY));
+            a.OpBFI(dxbc::Dest::R(1, 0b1000), dxbc::Src::LU(8),
+                    dxbc::Src::LU(16), dxbc::Src::R(1, dxbc::Src::kWWWW),
+                    dxbc::Src::R(1, dxbc::Src::kYYYY));
           } else {
-            if (source_color_format == xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA) {
+            color_packed_in_r1x = true;
+            if (source_color_format ==
+                xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA) {
               for (uint32_t i = 0; i < 3; ++i) {
-                DxbcShaderTranslator::PreSaturatedLinearToPWLGamma(a, 1, i, 1, i, 2, 0, 2, 1);
+                DxbcShaderTranslator::PreSaturatedLinearToPWLGamma(
+                    a, 1, i, 1, i, 2, 0, 2, 1);
               }
             }
-            color_packed_in_r1x = true;
-            a.OpMAd(dxbc::Dest::R(1), dxbc::Src::R(1), dxbc::Src::LF(255.0f), dxbc::Src::LF(0.5f));
+            a.OpMAd(dxbc::Dest::R(1), dxbc::Src::R(1), dxbc::Src::LF(255.0f),
+                    dxbc::Src::LF(0.5f));
             a.OpFToU(dxbc::Dest::R(1), dxbc::Src::R(1));
             for (uint32_t i = 1; i < 4; ++i) {
-              a.OpBFI(dxbc::Dest::R(1, 0b0001), dxbc::Src::LU(8), dxbc::Src::LU(i * 8),
-                      dxbc::Src::R(1).Select(i), dxbc::Src::R(1, dxbc::Src::kXXXX));
+              a.OpBFI(dxbc::Dest::R(1, 0b0001), dxbc::Src::LU(8),
+                      dxbc::Src::LU(i * 8), dxbc::Src::R(1).Select(i),
+                      dxbc::Src::R(1, dxbc::Src::kXXXX));
             }
           }
         } break;
@@ -3181,16 +3344,19 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
           if (dest_is_stencil_bit) {
             a.OpMAd(dxbc::Dest::R(1, 0b0001), dxbc::Src::R(1, dxbc::Src::kXXXX),
                     dxbc::Src::LF(1023.0f), dxbc::Src::LF(0.5f));
-            a.OpFToU(dxbc::Dest::R(1, 0b0001), dxbc::Src::R(1, dxbc::Src::kXXXX));
+            a.OpFToU(dxbc::Dest::R(1, 0b0001),
+                     dxbc::Src::R(1, dxbc::Src::kXXXX));
           } else if (dest_is_color &&
-                     (dest_color_format == xenos::ColorRenderTargetFormat::k_2_10_10_10 ||
-                      dest_color_format ==
-                          xenos::ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10)) {
+                     (dest_color_format ==
+                          xenos::ColorRenderTargetFormat::k_2_10_10_10 ||
+                      dest_color_format == xenos::ColorRenderTargetFormat::
+                                               k_2_10_10_10_AS_10_10_10_10)) {
             a.OpMov(dxbc::Dest::O(0), dxbc::Src::R(1));
           } else {
             color_packed_in_r1x = true;
             a.OpMAd(dxbc::Dest::R(1), dxbc::Src::R(1),
-                    dxbc::Src::LF(1023.0f, 1023.0f, 1023.0f, 3.0f), dxbc::Src::LF(0.5f));
+                    dxbc::Src::LF(1023.0f, 1023.0f, 1023.0f, 3.0f),
+                    dxbc::Src::LF(0.5f));
             a.OpFToU(dxbc::Dest::R(1), dxbc::Src::R(1));
             for (uint32_t i = 1; i < 4; ++i) {
               a.OpBFI(dxbc::Dest::R(1, 0b0001), dxbc::Src::LU(i == 3 ? 2 : 10),
@@ -3200,13 +3366,16 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
           }
         } break;
         case xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT:
-        case xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT_AS_16_16_16_16: {
+        case xenos::ColorRenderTargetFormat::
+            k_2_10_10_10_FLOAT_AS_16_16_16_16: {
           if (dest_is_stencil_bit) {
             DxbcShaderTranslator::UnclampedFloat32To7e3(a, 1, 0, 1, 0, 2, 0);
           } else if (dest_is_color &&
-                     (dest_color_format == xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT ||
+                     (dest_color_format ==
+                          xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT ||
                       dest_color_format ==
-                          xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT_AS_16_16_16_16)) {
+                          xenos::ColorRenderTargetFormat::
+                              k_2_10_10_10_FLOAT_AS_16_16_16_16)) {
             a.OpMov(dxbc::Dest::O(0), dxbc::Src::R(1));
           } else {
             color_packed_in_r1x = true;
@@ -3215,17 +3384,21 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
             for (uint32_t i = 0; i < 3; ++i) {
               DxbcShaderTranslator::UnclampedFloat32To7e3(a, 1, i, 1, i, 2, 0);
               if (i) {
-                a.OpBFI(dxbc::Dest::R(1, 0b0001), dxbc::Src::LU(10), dxbc::Src::LU(i * 10),
-                        dxbc::Src::R(1).Select(i), dxbc::Src::R(1, dxbc::Src::kXXXX));
+                a.OpBFI(dxbc::Dest::R(1, 0b0001), dxbc::Src::LU(10),
+                        dxbc::Src::LU(i * 10), dxbc::Src::R(1).Select(i),
+                        dxbc::Src::R(1, dxbc::Src::kXXXX));
               }
             }
             // Saturate and convert the alpha.
-            a.OpMov(dxbc::Dest::R(1, 0b1000), dxbc::Src::R(1, dxbc::Src::kWWWW), true);
+            a.OpMov(dxbc::Dest::R(1, 0b1000), dxbc::Src::R(1, dxbc::Src::kWWWW),
+                    true);
             a.OpMAd(dxbc::Dest::R(1, 0b1000), dxbc::Src::R(1, dxbc::Src::kWWWW),
                     dxbc::Src::LF(3.0f), dxbc::Src::LF(0.5f));
-            a.OpFToU(dxbc::Dest::R(1, 0b1000), dxbc::Src::R(1, dxbc::Src::kWWWW));
-            a.OpBFI(dxbc::Dest::R(1, 0b0001), dxbc::Src::LU(2), dxbc::Src::LU(30),
-                    dxbc::Src::R(1, dxbc::Src::kWWWW), dxbc::Src::R(1, dxbc::Src::kXXXX));
+            a.OpFToU(dxbc::Dest::R(1, 0b1000),
+                     dxbc::Src::R(1, dxbc::Src::kWWWW));
+            a.OpBFI(dxbc::Dest::R(1, 0b0001), dxbc::Src::LU(2),
+                    dxbc::Src::LU(30), dxbc::Src::R(1, dxbc::Src::kWWWW),
+                    dxbc::Src::R(1, dxbc::Src::kXXXX));
           }
         } break;
         case xenos::ColorRenderTargetFormat::k_16_16:
@@ -3238,13 +3411,16 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
             // High bits are not important for discarding, as only one bit is
             // checked - already loaded to red.
           } else if (dest_is_color &&
-                     (dest_color_format == xenos::ColorRenderTargetFormat::k_16_16 ||
-                      dest_color_format == xenos::ColorRenderTargetFormat::k_16_16_FLOAT)) {
+                     (dest_color_format ==
+                          xenos::ColorRenderTargetFormat::k_16_16 ||
+                      dest_color_format ==
+                          xenos::ColorRenderTargetFormat::k_16_16_FLOAT)) {
             a.OpMov(dxbc::Dest::O(0, 0b0011), dxbc::Src::R(1));
           } else {
             color_packed_in_r1x = true;
-            a.OpBFI(dxbc::Dest::R(1, 0b0001), dxbc::Src::LU(16), dxbc::Src::LU(16),
-                    dxbc::Src::R(1, dxbc::Src::kYYYY), dxbc::Src::R(1, dxbc::Src::kXXXX));
+            a.OpBFI(dxbc::Dest::R(1, 0b0001), dxbc::Src::LU(16),
+                    dxbc::Src::LU(16), dxbc::Src::R(1, dxbc::Src::kYYYY),
+                    dxbc::Src::R(1, dxbc::Src::kXXXX));
           }
         } break;
         case xenos::ColorRenderTargetFormat::k_32_FLOAT:
@@ -3264,8 +3440,10 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
             // instead of black in the 4D5307E6 clear shader.
             a.OpMul(dxbc::Dest::R(1, 0b1000), dxbc::Src::R(1, dxbc::Src::kWWWW),
                     dxbc::Src::LF(float(0xFFFFFF)));
-            a.OpRoundNE(dxbc::Dest::R(1, 0b1000), dxbc::Src::R(1, dxbc::Src::kWWWW));
-            a.OpFToU(dxbc::Dest::R(1, 0b1000), dxbc::Src::R(1, dxbc::Src::kWWWW));
+            a.OpRoundNE(dxbc::Dest::R(1, 0b1000),
+                        dxbc::Src::R(1, dxbc::Src::kWWWW));
+            a.OpFToU(dxbc::Dest::R(1, 0b1000),
+                     dxbc::Src::R(1, dxbc::Src::kWWWW));
           } break;
           case xenos::DepthRenderTargetFormat::kD24FS8: {
             // Convert using r1.y as temporary.
@@ -3273,14 +3451,17 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
             // truncating not to insert additional rounding instructions.
             DxbcShaderTranslator::PreClampedDepthTo20e4(
                 a, 1, 3, 1, 3, 1, 1,
-                !depth_float24_convert_in_pixel_shader() && depth_float24_round(), true);
+                !depth_float24_convert_in_pixel_shader() &&
+                    depth_float24_round(),
+                true);
           } break;
         }
         if (dest_is_color) {
           // Merge depth and stencil into r1.x for reinterpretation as color.
           color_packed_in_r1x = true;
           a.OpBFI(dxbc::Dest::R(1, 0b0001), dxbc::Src::LU(24), dxbc::Src::LU(8),
-                  dxbc::Src::R(1, dxbc::Src::kWWWW), dxbc::Src::R(1, dxbc::Src::kXXXX));
+                  dxbc::Src::R(1, dxbc::Src::kWWWW),
+                  dxbc::Src::R(1, dxbc::Src::kXXXX));
         }
       }
     }
@@ -3292,44 +3473,58 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
         if (color_packed_in_r1x) {
           switch (dest_color_format) {
             case xenos::ColorRenderTargetFormat::k_8_8_8_8: {
-              a.OpUBFE(dxbc::Dest::R(1), dxbc::Src::LU(8), dxbc::Src::LU(0, 8, 16, 24),
+              a.OpUBFE(dxbc::Dest::R(1), dxbc::Src::LU(8),
+                       dxbc::Src::LU(0, 8, 16, 24),
                        dxbc::Src::R(1, dxbc::Src::kXXXX));
               a.OpUToF(dxbc::Dest::R(1), dxbc::Src::R(1));
-              a.OpMul(dxbc::Dest::O(0), dxbc::Src::R(1), dxbc::Src::LF(1.0f / 255.0f));
+              a.OpMul(dxbc::Dest::O(0), dxbc::Src::R(1),
+                      dxbc::Src::LF(1.0f / 255.0f));
             } break;
             case xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA: {
               // 8_8_8_8_GAMMA is represented by linear stored in
               // R16G16B16A16_UNORM.
-              a.OpUBFE(dxbc::Dest::R(1), dxbc::Src::LU(8), dxbc::Src::LU(0, 8, 16, 24),
+              a.OpUBFE(dxbc::Dest::R(1), dxbc::Src::LU(8),
+                       dxbc::Src::LU(0, 8, 16, 24),
                        dxbc::Src::R(1, dxbc::Src::kXXXX));
               a.OpUToF(dxbc::Dest::R(1), dxbc::Src::R(1));
-              a.OpMul(dxbc::Dest::R(1, 0b0111), dxbc::Src::R(1), dxbc::Src::LF(1.0f / 255.0f));
-              a.OpMul(dxbc::Dest::O(0, 0b1000), dxbc::Src::R(1), dxbc::Src::LF(1.0f / 255.0f));
+              a.OpMul(dxbc::Dest::R(1, 0b0111), dxbc::Src::R(1),
+                      dxbc::Src::LF(1.0f / 255.0f));
+              a.OpMul(dxbc::Dest::O(0, 0b1000), dxbc::Src::R(1),
+                      dxbc::Src::LF(1.0f / 255.0f));
               for (uint32_t i = 0; i < 3; ++i) {
-                DxbcShaderTranslator::PWLGammaToLinear(a, 1, i, 1, i, true, 0, 0, 0, 1);
+                DxbcShaderTranslator::PWLGammaToLinear(a, 1, i, 1, i, true, 0,
+                                                       0, 0, 1);
               }
+              // TODO(Triang3l): The `mov` can be eliminated by passing the
+              // destination to `PWLGammaToLinear` as `dxbc::Dest` rather than
+              // just the register index.
               a.OpMov(dxbc::Dest::O(0, 0b0111), dxbc::Src::R(1));
             } break;
             case xenos::ColorRenderTargetFormat::k_2_10_10_10:
             case xenos::ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10: {
-              a.OpUBFE(dxbc::Dest::R(1), dxbc::Src::LU(10, 10, 10, 2), dxbc::Src::LU(0, 10, 20, 30),
+              a.OpUBFE(dxbc::Dest::R(1), dxbc::Src::LU(10, 10, 10, 2),
+                       dxbc::Src::LU(0, 10, 20, 30),
                        dxbc::Src::R(1, dxbc::Src::kXXXX));
               a.OpUToF(dxbc::Dest::R(1), dxbc::Src::R(1));
               a.OpMul(dxbc::Dest::O(0), dxbc::Src::R(1),
-                      dxbc::Src::LF(1.0f / 1023.0f, 1.0f / 1023.0f, 1.0f / 1023.0f, 1.0f / 3.0f));
+                      dxbc::Src::LF(1.0f / 1023.0f, 1.0f / 1023.0f,
+                                    1.0f / 1023.0f, 1.0f / 3.0f));
             } break;
             case xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT:
-            case xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT_AS_16_16_16_16: {
+            case xenos::ColorRenderTargetFormat::
+                k_2_10_10_10_FLOAT_AS_16_16_16_16: {
               // Color using r1.yz as temporary.
               for (uint32_t i = 0; i < 3; ++i) {
-                DxbcShaderTranslator::Float7e3To32(a, dxbc::Dest::O(0, 1 << i), 1, 0, i * 10, 1, 1,
-                                                   1, 2);
+                DxbcShaderTranslator::Float7e3To32(a, dxbc::Dest::O(0, 1 << i),
+                                                   1, 0, i * 10, 1, 1, 1, 2);
               }
               // Alpha.
-              a.OpUBFE(dxbc::Dest::R(1, 0b1000), dxbc::Src::LU(2), dxbc::Src::LU(30),
-                       dxbc::Src::R(1, dxbc::Src::kXXXX));
-              a.OpUToF(dxbc::Dest::R(1, 0b1000), dxbc::Src::R(1, dxbc::Src::kWWWW));
-              a.OpMul(dxbc::Dest::O(0, 0b1000), dxbc::Src::R(1, dxbc::Src::kWWWW),
+              a.OpUBFE(dxbc::Dest::R(1, 0b1000), dxbc::Src::LU(2),
+                       dxbc::Src::LU(30), dxbc::Src::R(1, dxbc::Src::kXXXX));
+              a.OpUToF(dxbc::Dest::R(1, 0b1000),
+                       dxbc::Src::R(1, dxbc::Src::kWWWW));
+              a.OpMul(dxbc::Dest::O(0, 0b1000),
+                      dxbc::Src::R(1, dxbc::Src::kWWWW),
                       dxbc::Src::LF(1.0f / 3.0f));
             } break;
             case xenos::ColorRenderTargetFormat::k_16_16:
@@ -3337,12 +3532,14 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
               // All 16 bits per component formats are represented as integers
               // in ownership transfer for safe handling of NaNs and
               // -32768 / -32767.
-              a.OpUBFE(dxbc::Dest::O(0, 0b0011), dxbc::Src::LU(16), dxbc::Src::LU(0, 16, 0, 0),
+              a.OpUBFE(dxbc::Dest::O(0, 0b0011), dxbc::Src::LU(16),
+                       dxbc::Src::LU(0, 16, 0, 0),
                        dxbc::Src::R(1, dxbc::Src::kXXXX));
             } break;
             case xenos::ColorRenderTargetFormat::k_32_FLOAT: {
               // Already as a 32-bit value.
-              a.OpMov(dxbc::Dest::O(0, 0b0001), dxbc::Src::R(1, dxbc::Src::kXXXX));
+              a.OpMov(dxbc::Dest::O(0, 0b0001),
+                      dxbc::Src::R(1, dxbc::Src::kXXXX));
             } break;
             default:
               // A 64bpp format (handled separately) or an invalid one.
@@ -3354,14 +3551,14 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
         if (source_is_color || depth_loaded_in_guest_format) {
           if (color_packed_in_r1x) {
             // Extract the depth bits to r1.w.
-            a.OpUBFE(dxbc::Dest::R(1, 0b1000), dxbc::Src::LU(24), dxbc::Src::LU(8),
-                     dxbc::Src::R(1, dxbc::Src::kXXXX));
+            a.OpUBFE(dxbc::Dest::R(1, 0b1000), dxbc::Src::LU(24),
+                     dxbc::Src::LU(8), dxbc::Src::R(1, dxbc::Src::kXXXX));
             if (osgn_parameter_index_sv_stencil_ref != UINT32_MAX) {
               // Extract the stencil bits to the stencil reference.
               // The depth -> depth case is handled earlier, not long after
               // loading the stencil, for simplicity.
-              a.OpUBFE(dxbc::Dest::OStencilRef(), dxbc::Src::LU(8), dxbc::Src::LU(0),
-                       dxbc::Src::R(1, dxbc::Src::kXXXX));
+              a.OpUBFE(dxbc::Dest::OStencilRef(), dxbc::Src::LU(8),
+                       dxbc::Src::LU(0), dxbc::Src::R(1, dxbc::Src::kXXXX));
             }
           }
           // r1.w contains the depth in the guest format. If a host depth source
@@ -3382,6 +3579,12 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
             // r0.z = 32bpp tile index relative to the destination base
             // r1.w = depth in guest format
 
+            if (cross_scale_class) {
+              // r0.xy is in the source scale space - the host depth source
+              // needs the destination-space coordinates saved in r3.xy.
+              a.OpMov(dxbc::Dest::R(0, 0b0011), dxbc::Src::R(3));
+            }
+
             if (key.host_depth_source_is_copy) {
               // Get the address in the EDRAM scratch buffer and load from
               // there.
@@ -3390,25 +3593,31 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
               // (because this is used for depth -> depth transfers, where
               // swapping isn't needed).
               // Convert samples to pixels.
-              assert_true(key.host_depth_source_msaa_samples == xenos::MsaaSamples::k1X);
+              assert_true(key.host_depth_source_msaa_samples ==
+                          xenos::MsaaSamples::k1X);
               if (key.dest_msaa_samples >= xenos::MsaaSamples::k2X) {
                 if (key.dest_msaa_samples >= xenos::MsaaSamples::k4X) {
                   // Horizontal sample index in bit 0.
-                  a.OpBFI(dxbc::Dest::R(0, 0b0001), dxbc::Src::LU(31), dxbc::Src::LU(1),
-                          dxbc::Src::R(0, dxbc::Src::kXXXX), dest_sample);
+                  a.OpBFI(dxbc::Dest::R(0, 0b0001), dxbc::Src::LU(31),
+                          dxbc::Src::LU(1), dxbc::Src::R(0, dxbc::Src::kXXXX),
+                          dest_sample);
                 }
                 // Vertical sample index as 1 or 0 in bit 0 for true 2x or as 0
                 // or 1 in bit 1 for 4x or for 2x emulated as 4x.
-                if (key.dest_msaa_samples == xenos::MsaaSamples::k2X && msaa_2x_supported_) {
-                  a.OpBFI(dxbc::Dest::R(0, 0b0010), dxbc::Src::LU(31), dxbc::Src::LU(1),
-                          dxbc::Src::R(0, dxbc::Src::kYYYY), dest_sample);
-                  a.OpXOr(dxbc::Dest::R(0, 0b0010), dxbc::Src::R(0, dxbc::Src::kYYYY),
-                          dxbc::Src::LU(1));
+                if (key.dest_msaa_samples == xenos::MsaaSamples::k2X &&
+                    msaa_2x_supported_) {
+                  a.OpBFI(dxbc::Dest::R(0, 0b0010), dxbc::Src::LU(31),
+                          dxbc::Src::LU(1), dxbc::Src::R(0, dxbc::Src::kYYYY),
+                          dest_sample);
+                  a.OpXOr(dxbc::Dest::R(0, 0b0010),
+                          dxbc::Src::R(0, dxbc::Src::kYYYY), dxbc::Src::LU(1));
                 } else {
                   // Using r0.w as a temporary.
-                  a.OpUShR(dxbc::Dest::R(0, 0b1000), dest_sample, dxbc::Src::LU(1));
-                  a.OpBFI(dxbc::Dest::R(0, 0b0010), dxbc::Src::LU(31), dxbc::Src::LU(1),
-                          dxbc::Src::R(0, dxbc::Src::kYYYY), dxbc::Src::R(0, dxbc::Src::kWWWW));
+                  a.OpUShR(dxbc::Dest::R(0, 0b1000), dest_sample,
+                           dxbc::Src::LU(1));
+                  a.OpBFI(dxbc::Dest::R(0, 0b0010), dxbc::Src::LU(31),
+                          dxbc::Src::LU(1), dxbc::Src::R(0, dxbc::Src::kYYYY),
+                          dxbc::Src::R(0, dxbc::Src::kWWWW));
                 }
               }
               // Combine the tile sample index and the tile index into buffer
@@ -3416,177 +3625,116 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
               // The tile index doesn't need to be wrapped, as the host depth is
               // written to the beginning of the buffer, without the base
               // offset.
-              a.OpUMAd(dxbc::Dest::R(0, 0b0001), dxbc::Src::LU(tile_width_samples),
-                       dxbc::Src::R(0, dxbc::Src::kYYYY), dxbc::Src::R(0, dxbc::Src::kXXXX));
               a.OpUMAd(dxbc::Dest::R(0, 0b0001),
-                       dxbc::Src::LU(tile_width_samples * tile_height_samples),
-                       dxbc::Src::R(0, dxbc::Src::kZZZZ), dxbc::Src::R(0, dxbc::Src::kXXXX));
+                       dxbc::Src::LU(dest_tile_width_samples),
+                       dxbc::Src::R(0, dxbc::Src::kYYYY),
+                       dxbc::Src::R(0, dxbc::Src::kXXXX));
+              a.OpUMAd(dxbc::Dest::R(0, 0b0001),
+                       dxbc::Src::LU(dest_tile_width_samples *
+                                     dest_tile_height_samples),
+                       dxbc::Src::R(0, dxbc::Src::kZZZZ),
+                       dxbc::Src::R(0, dxbc::Src::kXXXX));
               // Load from the buffer.
-              a.OpLd(dxbc::Dest::R(0, 0b0001), dxbc::Src::R(0, dxbc::Src::kXXXX), 0b0001,
-                     dxbc::Src::T(srv_index_host_depth, kTransferSRVRegisterHostDepth,
+              a.OpLd(dxbc::Dest::R(0, 0b0001),
+                     dxbc::Src::R(0, dxbc::Src::kXXXX), 0b0001,
+                     dxbc::Src::T(srv_index_host_depth,
+                                  kTransferSRVRegisterHostDepth,
                                   dxbc::Src::kXXXX));
             } else {
               // Adjust the tile index from the destination to the host depth
               // source.
               // r0.w = destination to host depth source EDRAM tile adjustment
-              a.OpIBFE(dxbc::Dest::R(0, 0b1000), dxbc::Src::LU(xenos::kEdramBaseTilesBits + 1),
+              a.OpIBFE(dxbc::Dest::R(0, 0b1000),
+                       dxbc::Src::LU(xenos::kEdramBaseTilesBits + 1),
                        dxbc::Src::LU(xenos::kEdramPitchTilesBits * 2),
                        dxbc::Src::CB(cbuffer_index_host_depth_address,
-                                     kTransferCBVRegisterHostDepthAddress, 0, dxbc::Src::kXXXX));
+                                     kTransferCBVRegisterHostDepthAddress, 0,
+                                     dxbc::Src::kXXXX));
               // r0.z = tile index relative to the host depth source base, or
               //        the tile index within the host depth source minus the
               //        EDRAM tile count if transferring across addressing
               //        wrapping (if negative)
               // r0.w = free
-              a.OpIAdd(dxbc::Dest::R(0, 0b0100), dxbc::Src::R(0, dxbc::Src::kZZZZ),
+              a.OpIAdd(dxbc::Dest::R(0, 0b0100),
+                       dxbc::Src::R(0, dxbc::Src::kZZZZ),
                        dxbc::Src::R(0, dxbc::Src::kWWWW));
               // r0.z = tile index relative to the host depth source base
-              a.OpAnd(dxbc::Dest::R(0, 0b0100), dxbc::Src::R(0, dxbc::Src::kZZZZ),
+              a.OpAnd(dxbc::Dest::R(0, 0b0100),
+                      dxbc::Src::R(0, dxbc::Src::kZZZZ),
                       dxbc::Src::LU(xenos::kEdramTileCount - 1));
               // Convert position and sample index from within the destination
-              // tile to within the host depth source tile, like for the guest
-              // render target, but for 32bpp -> 32bpp only.
+              // tile to within the host depth source tile by remapping
+              // through the canonical coordinates. Both views are 32bpp and
+              // use the destination scale.
               dxbc::Src host_depth_source_sample(dest_sample);
               if (key.host_depth_source_msaa_samples != key.dest_msaa_samples) {
-                if (key.host_depth_source_msaa_samples >= xenos::MsaaSamples::k4X) {
-                  // 4x -> 1x/2x.
-                  if (key.dest_msaa_samples == xenos::MsaaSamples::k2X) {
-                    // 4x -> 2x.
-                    // Horizontal pixels to samples. Vertical sample (1, 0 in
-                    // the first bit for native 2x or 0, 1 in the second bit for
-                    // 2x as 4x) to second sample bit.
-                    host_depth_source_sample = dxbc::Src::R(0, dxbc::Src::kWWWW);
-                    if (msaa_2x_supported_) {
-                      a.OpBFI(dxbc::Dest::R(0, 0b1000), dxbc::Src::LU(31), dxbc::Src::LU(1),
-                              dest_sample, dxbc::Src::R(0, dxbc::Src::kXXXX));
-                      a.OpXOr(dxbc::Dest::R(0, 0b1000), host_depth_source_sample,
-                              dxbc::Src::LU(1 << 1));
-                    } else {
-                      a.OpBFI(dxbc::Dest::R(0, 0b1000), dxbc::Src::LU(1), dxbc::Src::LU(0),
-                              dxbc::Src::R(0, dxbc::Src::kXXXX), dest_sample);
-                    }
-                    a.OpUShR(dxbc::Dest::R(0, 0b0001), dxbc::Src::R(0, dxbc::Src::kXXXX),
-                             dxbc::Src::LU(1));
-                  } else {
-                    // 4x -> 1x.
-                    // Pixels to samples.
-                    a.OpAnd(dxbc::Dest::R(0, 0b1000), dxbc::Src::R(0, dxbc::Src::kXXXX),
-                            dxbc::Src::LU(1));
-                    host_depth_source_sample = dxbc::Src::R(0, dxbc::Src::kWWWW);
-                    a.OpBFI(dxbc::Dest::R(0, 0b1000), dxbc::Src::LU(1), dxbc::Src::LU(1),
-                            dxbc::Src::R(0, dxbc::Src::kYYYY), host_depth_source_sample);
-                    a.OpUShR(dxbc::Dest::R(0, 0b0011), dxbc::Src::R(0), dxbc::Src::LU(1));
-                  }
-                } else {
-                  // 1x/2x -> 1x/2x/4x (as long as they're different).
-                  // Only the X part - Y is handled by common code.
-                  if (key.dest_msaa_samples >= xenos::MsaaSamples::k4X) {
-                    // Horizontal samples to pixels.
-                    a.OpBFI(dxbc::Dest::R(0, 0b0001), dxbc::Src::LU(31), dxbc::Src::LU(1),
-                            dxbc::Src::R(0, dxbc::Src::kXXXX), dest_sample);
-                  }
-                }
-                // Host depth source Y and sample index for 1x/2x AA sources.
-                if (key.host_depth_source_msaa_samples < xenos::MsaaSamples::k4X) {
-                  if (key.dest_msaa_samples >= xenos::MsaaSamples::k4X) {
-                    // 1x/2x -> 4x.
-                    if (key.host_depth_source_msaa_samples == xenos::MsaaSamples::k2X) {
-                      // 2x -> 4x.
-                      // Vertical samples (second bit) of 4x destination to
-                      // vertical sample (1, 0 for native 2x, or 0, 3 for 2x as
-                      // 4x) of 2x source.
-                      a.OpUShR(dxbc::Dest::R(0, 0b1000), dest_sample, dxbc::Src::LU(1));
-                      host_depth_source_sample = dxbc::Src::R(0, dxbc::Src::kWWWW);
-                      if (msaa_2x_supported_) {
-                        a.OpXOr(dxbc::Dest::R(0, 0b1000), host_depth_source_sample,
-                                dxbc::Src::LU(1));
-                      } else {
-                        a.OpBFI(dxbc::Dest::R(0, 0b1000), dxbc::Src::LU(1), dxbc::Src::LU(1),
-                                host_depth_source_sample, host_depth_source_sample);
-                      }
-                    } else {
-                      // 1x -> 4x.
-                      // Vertical samples (second bit) to Y pixels, using r0.w
-                      // (not needed without source MSAA) as a temporary.
-                      a.OpUShR(dxbc::Dest::R(0, 0b1000), dest_sample, dxbc::Src::LU(1));
-                      a.OpBFI(dxbc::Dest::R(0, 0b0010), dxbc::Src::LU(31), dxbc::Src::LU(1),
-                              dxbc::Src::R(0, dxbc::Src::kYYYY), dxbc::Src::R(0, dxbc::Src::kWWWW));
-                    }
-                  } else {
-                    // 1x/2x -> different 1x/2x.
-                    if (key.host_depth_source_msaa_samples == xenos::MsaaSamples::k2X) {
-                      // 2x -> 1x.
-                      // Vertical pixels of 2x destination to vertical samples
-                      // (1, 0 for native 2x, or 0, 3 for 2x as 4x) of 1x
-                      // source.
-                      a.OpAnd(dxbc::Dest::R(0, 0b1000), dxbc::Src::R(0, dxbc::Src::kYYYY),
-                              dxbc::Src::LU(1));
-                      host_depth_source_sample = dxbc::Src::R(0, dxbc::Src::kWWWW);
-                      if (msaa_2x_supported_) {
-                        a.OpXOr(dxbc::Dest::R(0, 0b1000), host_depth_source_sample,
-                                dxbc::Src::LU(1));
-                      } else {
-                        a.OpBFI(dxbc::Dest::R(0, 0b1000), dxbc::Src::LU(1), dxbc::Src::LU(1),
-                                host_depth_source_sample, host_depth_source_sample);
-                      }
-                      a.OpUShR(dxbc::Dest::R(0, 0b0010), dxbc::Src::R(0, dxbc::Src::kYYYY),
-                               dxbc::Src::LU(1));
-                    } else {
-                      // 1x -> 2x.
-                      // Vertical samples (1, 0 in the first bit for native 2x
-                      // or 0, 1 in the second bit for 2x as 4x) of 2x
-                      // destination to vertical pixels of 1x source.
-                      // Using r0.w (not needed without source MSAA) as a
-                      // temporary.
-                      if (msaa_2x_supported_) {
-                        a.OpBFI(dxbc::Dest::R(0, 0b0010), dxbc::Src::LU(31), dxbc::Src::LU(1),
-                                dxbc::Src::R(0, dxbc::Src::kYYYY), dest_sample);
-                        a.OpXOr(dxbc::Dest::R(0, 0b0010), dxbc::Src::R(0, dxbc::Src::kYYYY),
-                                dxbc::Src::LU(1));
-                      } else {
-                        a.OpUShR(dxbc::Dest::R(0, 0b1000), dest_sample, dxbc::Src::LU(1));
-                        a.OpBFI(dxbc::Dest::R(0, 0b0010), dxbc::Src::LU(31), dxbc::Src::LU(1),
-                                dxbc::Src::R(0, dxbc::Src::kYYYY),
-                                dxbc::Src::R(0, dxbc::Src::kWWWW));
-                      }
-                    }
-                  }
-                }
+                dxbc::Src host_depth_u(dxbc::Src::R(0, dxbc::Src::kXXXX));
+                dxbc::Src host_depth_v(dxbc::Src::R(0, dxbc::Src::kYYYY));
+                bool host_depth_scaled;
+                CanonicalizeSample(a, key.dest_msaa_samples, dest_sample,
+                                   msaa_2x_supported_, dest_scale_x,
+                                   dest_scale_y, host_depth_u, host_depth_v,
+                                   host_depth_scaled);
+                dxbc::Src host_depth_x(host_depth_u);
+                dxbc::Src host_depth_y(host_depth_v);
+                DecanonicalizeSample(a, key.host_depth_source_msaa_samples,
+                                     host_depth_u, host_depth_v,
+                                     host_depth_scaled, msaa_2x_supported_,
+                                     dest_scale_x, dest_scale_y, host_depth_x,
+                                     host_depth_y, host_depth_source_sample);
+                // With varying sample counts, the remapped coordinates will
+                // always be stored in r1.xy here. The remapping helpers keep
+                // the value of r1.w as the guest depth value, while r1.z, the
+                // host sample index, is read before the pitch takes up r1.x.
+                // Move the coordinates to r0.xy for the common host depth
+                // source addressing.
+                a.OpMov(dxbc::Dest::R(0, 0b0011), dxbc::Src::R(1));
               }
               // r1.x = host depth source pitch in tiles
-              a.OpUBFE(dxbc::Dest::R(1, 0b0001), dxbc::Src::LU(xenos::kEdramPitchTilesBits),
+              a.OpUBFE(dxbc::Dest::R(1, 0b0001),
+                       dxbc::Src::LU(xenos::kEdramPitchTilesBits),
                        dxbc::Src::LU(xenos::kEdramPitchTilesBits),
                        dxbc::Src::CB(cbuffer_index_host_depth_address,
-                                     kTransferCBVRegisterHostDepthAddress, 0, dxbc::Src::kXXXX));
+                                     kTransferCBVRegisterHostDepthAddress, 0,
+                                     dxbc::Src::kXXXX));
               // r0.z = host depth source tile row
               // r1.x = host depth source tile within the row
               a.OpUDiv(dxbc::Dest::R(0, 0b0100), dxbc::Dest::R(1, 0b0001),
-                       dxbc::Src::R(0, dxbc::Src::kZZZZ), dxbc::Src::R(1, dxbc::Src::kXXXX));
+                       dxbc::Src::R(0, dxbc::Src::kZZZZ),
+                       dxbc::Src::R(1, dxbc::Src::kXXXX));
               // r0.x = pixel X within the host depth source texture
               // r1.x = free
               a.OpUMAd(
                   dxbc::Dest::R(0, 0b0001),
-                  dxbc::Src::LU(tile_width_samples >> uint32_t(key.host_depth_source_msaa_samples >=
-                                                               xenos::MsaaSamples::k4X)),
-                  dxbc::Src::R(1, dxbc::Src::kXXXX), dxbc::Src::R(0, dxbc::Src::kXXXX));
+                  dxbc::Src::LU(dest_tile_width_samples >>
+                                uint32_t(key.host_depth_source_msaa_samples >=
+                                         xenos::MsaaSamples::k4X)),
+                  dxbc::Src::R(1, dxbc::Src::kXXXX),
+                  dxbc::Src::R(0, dxbc::Src::kXXXX));
               // r0.y = pixel Y within the host depth source texture
               // r0.z = free
-              a.OpUMAd(dxbc::Dest::R(0, 0b0010),
-                       dxbc::Src::LU(
-                           tile_height_samples >>
-                           uint32_t(key.host_depth_source_msaa_samples >= xenos::MsaaSamples::k2X)),
-                       dxbc::Src::R(0, dxbc::Src::kZZZZ), dxbc::Src::R(0, dxbc::Src::kYYYY));
+              a.OpUMAd(
+                  dxbc::Dest::R(0, 0b0010),
+                  dxbc::Src::LU(dest_tile_height_samples >>
+                                uint32_t(key.host_depth_source_msaa_samples >=
+                                         xenos::MsaaSamples::k2X)),
+                  dxbc::Src::R(0, dxbc::Src::kZZZZ),
+                  dxbc::Src::R(0, dxbc::Src::kYYYY));
               // Load from the host depth texture.
-              if (key.host_depth_source_msaa_samples != xenos::MsaaSamples::k1X) {
+              if (key.host_depth_source_msaa_samples !=
+                  xenos::MsaaSamples::k1X) {
                 a.OpLdMS(dxbc::Dest::R(0, 0b0001), dxbc::Src::R(0), 0b0011,
-                         dxbc::Src::T(srv_index_host_depth, kTransferSRVRegisterHostDepth,
+                         dxbc::Src::T(srv_index_host_depth,
+                                      kTransferSRVRegisterHostDepth,
                                       dxbc::Src::kXXXX),
                          host_depth_source_sample);
               } else {
                 // Write zero to the LOD index in r0.z.
                 a.OpMov(dxbc::Dest::R(0, 0b0100), dxbc::Src::LU(0));
-                a.OpLd(dxbc::Dest::R(0, 0b0001), dxbc::Src::R(0, 0b10000100), 0b1011,
-                       dxbc::Src::T(srv_index_host_depth, kTransferSRVRegisterHostDepth,
+                a.OpLd(dxbc::Dest::R(0, 0b0001), dxbc::Src::R(0, 0b10000100),
+                       0b1011,
+                       dxbc::Src::T(srv_index_host_depth,
+                                    kTransferSRVRegisterHostDepth,
                                     dxbc::Src::kXXXX));
               }
             }
@@ -3598,10 +3746,13 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
                 // Round to the nearest even integer. This seems to be the
                 // correct, adding +0.5 and rounding towards zero results in red
                 // instead of black in the 4D5307E6 clear shader.
-                a.OpMul(dxbc::Dest::R(0, 0b0010), dxbc::Src::R(0, dxbc::Src::kXXXX),
+                a.OpMul(dxbc::Dest::R(0, 0b0010),
+                        dxbc::Src::R(0, dxbc::Src::kXXXX),
                         dxbc::Src::LF(float(0xFFFFFF)));
-                a.OpRoundNE(dxbc::Dest::R(0, 0b0010), dxbc::Src::R(0, dxbc::Src::kYYYY));
-                a.OpFToU(dxbc::Dest::R(0, 0b0010), dxbc::Src::R(0, dxbc::Src::kYYYY));
+                a.OpRoundNE(dxbc::Dest::R(0, 0b0010),
+                            dxbc::Src::R(0, dxbc::Src::kYYYY));
+                a.OpFToU(dxbc::Dest::R(0, 0b0010),
+                         dxbc::Src::R(0, dxbc::Src::kYYYY));
               } break;
               case xenos::DepthRenderTargetFormat::kD24FS8: {
                 // When converting the depth in pixel shaders, it's always
@@ -3609,7 +3760,9 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
                 // instructions.
                 DxbcShaderTranslator::PreClampedDepthTo20e4(
                     a, 0, 1, 0, 0, 0, 2,
-                    !depth_float24_convert_in_pixel_shader() && depth_float24_round(), true);
+                    !depth_float24_convert_in_pixel_shader() &&
+                        depth_float24_round(),
+                    true);
               } break;
             }
             a.OpIEq(dxbc::Dest::R(0, 0b0010), dxbc::Src::R(0, dxbc::Src::kYYYY),
@@ -3617,7 +3770,8 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
             a.OpIf(true, dxbc::Src::R(0, dxbc::Src::kYYYY));
             // If the host depth is up to date, write it to oDepth at the host
             // precision instead of converting the guest depth.
-            a.OpMov(dxbc::Dest::R(1, 0b1000), dxbc::Src::R(0, dxbc::Src::kXXXX));
+            a.OpMov(dxbc::Dest::R(1, 0b1000),
+                    dxbc::Src::R(0, dxbc::Src::kXXXX));
             a.OpElse();
           }
           // Convert using r0.x as a temporary.
@@ -3629,17 +3783,20 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
               // float division followed by multiplication does (on x86-64 MSVC
               // with default SSE rounding) - values starting from 0x800000
               // become bigger by 1; then accurately bias the result's exponent.
-              a.OpUShR(dxbc::Dest::R(0, 0b0001), dxbc::Src::R(1, dxbc::Src::kWWWW),
-                       dxbc::Src::LU(23));
-              a.OpIAdd(dxbc::Dest::R(1, 0b1000), dxbc::Src::R(1, dxbc::Src::kWWWW),
+              a.OpUShR(dxbc::Dest::R(0, 0b0001),
+                       dxbc::Src::R(1, dxbc::Src::kWWWW), dxbc::Src::LU(23));
+              a.OpIAdd(dxbc::Dest::R(1, 0b1000),
+                       dxbc::Src::R(1, dxbc::Src::kWWWW),
                        dxbc::Src::R(0, dxbc::Src::kXXXX));
-              a.OpUToF(dxbc::Dest::R(1, 0b1000), dxbc::Src::R(1, dxbc::Src::kWWWW));
-              a.OpMul(dxbc::Dest::R(1, 0b1000), dxbc::Src::R(1, dxbc::Src::kWWWW),
+              a.OpUToF(dxbc::Dest::R(1, 0b1000),
+                       dxbc::Src::R(1, dxbc::Src::kWWWW));
+              a.OpMul(dxbc::Dest::R(1, 0b1000),
+                      dxbc::Src::R(1, dxbc::Src::kWWWW),
                       dxbc::Src::LF(1.0f / float(1 << 24)));
             } break;
             case xenos::DepthRenderTargetFormat::kD24FS8: {
-              DxbcShaderTranslator::Depth20e4To32(a, dxbc::Dest::R(1, 0b1000), 1, 3, 0, 1, 3, 0, 0,
-                                                  true);
+              DxbcShaderTranslator::Depth20e4To32(a, dxbc::Dest::R(1, 0b1000),
+                                                  1, 3, 0, 1, 3, 0, 0, true);
             } break;
           }
           // Host depth is different, or not available - convert the guest depth
@@ -3653,11 +3810,14 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
         break;
       case TransferOutput::kStencilBit:
         // Discard the sample if the needed stencil bit is not set.
-        assert_true(cbuffer_index_stencil_mask != UINT32_MAX);
-        a.OpAnd(dxbc::Dest::R(0, 0b0001), dxbc::Src::R(1, dxbc::Src::kXXXX),
-                dxbc::Src::CB(cbuffer_index_stencil_mask, kTransferCBVRegisterStencilMask, 0,
-                              dxbc::Src::kXXXX));
-        a.OpDiscard(false, dxbc::Src::R(0, dxbc::Src::kXXXX));
+        if (!REXCVAR_GET(no_discard_stencil_in_transfer_pipelines)) {
+          assert_true(cbuffer_index_stencil_mask != UINT32_MAX);
+          a.OpAnd(dxbc::Dest::R(0, 0b0001), dxbc::Src::R(1, dxbc::Src::kXXXX),
+                  dxbc::Src::CB(cbuffer_index_stencil_mask,
+                                kTransferCBVRegisterStencilMask, 0,
+                                dxbc::Src::kXXXX));
+          a.OpDiscard(false, dxbc::Src::R(0, dxbc::Src::kXXXX));
+        }
         break;
     }
   }
@@ -3666,7 +3826,8 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
     // Fill the unused components of the color result.
     uint32_t dest_color_component_count =
         xenos::GetColorRenderTargetFormatComponentCount(dest_color_format);
-    uint32_t dest_color_unwritten_mask = 0b1111 & ~uint32_t((1 << dest_color_component_count) - 1);
+    uint32_t dest_color_unwritten_mask =
+        0b1111 & ~uint32_t((1 << dest_color_component_count) - 1);
     if (dest_color_component_count < 4) {
       a.OpMov(dxbc::Dest::O(0, dest_color_unwritten_mask), dxbc::Src::LU(0));
     }
@@ -3675,15 +3836,17 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
   a.OpRet();
 
   // Write the shader program length in dwords.
-  built_shader_[shex_position_dwords + 1] = uint32_t(built_shader_.size()) - shex_position_dwords;
+  built_shader_[shex_position_dwords + 1] =
+      uint32_t(built_shader_.size()) - shex_position_dwords;
 
   {
-    auto& blob_header =
-        *reinterpret_cast<dxbc::BlobHeader*>(built_shader_.data() + blob_position_dwords);
+    auto& blob_header = *reinterpret_cast<dxbc::BlobHeader*>(
+        built_shader_.data() + blob_position_dwords);
     blob_header.fourcc = dxbc::BlobHeader::FourCC::kShaderEx;
     blob_position_dwords = uint32_t(built_shader_.size());
-    blob_header.size_bytes = (blob_position_dwords - kBlobHeaderSizeDwords) * sizeof(uint32_t) -
-                             built_shader_[blob_offset_position_dwords++];
+    blob_header.size_bytes =
+        (blob_position_dwords - kBlobHeaderSizeDwords) * sizeof(uint32_t) -
+        built_shader_[blob_offset_position_dwords++];
   }
 
   // ***************************************************************************
@@ -3691,19 +3854,23 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
   // ***************************************************************************
 
   if (shader_uses_stencil_reference_output) {
-    built_shader_[blob_offset_position_dwords] = uint32_t(blob_position_dwords * sizeof(uint32_t));
-    uint32_t sfi0_position_dwords = blob_position_dwords + kBlobHeaderSizeDwords;
-    built_shader_.resize(sfi0_position_dwords + sizeof(dxbc::ShaderFeatureInfo) / sizeof(uint32_t));
-    auto& shader_feature_info =
-        *reinterpret_cast<dxbc::ShaderFeatureInfo*>(built_shader_.data() + sfi0_position_dwords);
+    built_shader_[blob_offset_position_dwords] =
+        uint32_t(blob_position_dwords * sizeof(uint32_t));
+    uint32_t sfi0_position_dwords =
+        blob_position_dwords + kBlobHeaderSizeDwords;
+    built_shader_.resize(sfi0_position_dwords +
+                         sizeof(dxbc::ShaderFeatureInfo) / sizeof(uint32_t));
+    auto& shader_feature_info = *reinterpret_cast<dxbc::ShaderFeatureInfo*>(
+        built_shader_.data() + sfi0_position_dwords);
     shader_feature_info.feature_flags[0] |= dxbc::kShaderFeature0_StencilRef;
     {
-      auto& blob_header =
-          *reinterpret_cast<dxbc::BlobHeader*>(built_shader_.data() + blob_position_dwords);
+      auto& blob_header = *reinterpret_cast<dxbc::BlobHeader*>(
+          built_shader_.data() + blob_position_dwords);
       blob_header.fourcc = dxbc::BlobHeader::FourCC::kShaderFeatureInfo;
       blob_position_dwords = uint32_t(built_shader_.size());
-      blob_header.size_bytes = (blob_position_dwords - kBlobHeaderSizeDwords) * sizeof(uint32_t) -
-                               built_shader_[blob_offset_position_dwords++];
+      blob_header.size_bytes =
+          (blob_position_dwords - kBlobHeaderSizeDwords) * sizeof(uint32_t) -
+          built_shader_[blob_offset_position_dwords++];
     }
   }
 
@@ -3711,32 +3878,39 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
   // Statistics
   // ***************************************************************************
 
-  built_shader_[blob_offset_position_dwords] = uint32_t(blob_position_dwords * sizeof(uint32_t));
+  built_shader_[blob_offset_position_dwords] =
+      uint32_t(blob_position_dwords * sizeof(uint32_t));
   uint32_t stat_position_dwords = blob_position_dwords + kBlobHeaderSizeDwords;
-  built_shader_.resize(stat_position_dwords + sizeof(dxbc::Statistics) / sizeof(uint32_t));
-  std::memcpy(built_shader_.data() + stat_position_dwords, &stat, sizeof(dxbc::Statistics));
+  built_shader_.resize(stat_position_dwords +
+                       sizeof(dxbc::Statistics) / sizeof(uint32_t));
+  std::memcpy(built_shader_.data() + stat_position_dwords, &stat,
+              sizeof(dxbc::Statistics));
   {
-    auto& blob_header =
-        *reinterpret_cast<dxbc::BlobHeader*>(built_shader_.data() + blob_position_dwords);
+    auto& blob_header = *reinterpret_cast<dxbc::BlobHeader*>(
+        built_shader_.data() + blob_position_dwords);
     blob_header.fourcc = dxbc::BlobHeader::FourCC::kStatistics;
     blob_position_dwords = uint32_t(built_shader_.size());
-    blob_header.size_bytes = (blob_position_dwords - kBlobHeaderSizeDwords) * sizeof(uint32_t) -
-                             built_shader_[blob_offset_position_dwords++];
+    blob_header.size_bytes =
+        (blob_position_dwords - kBlobHeaderSizeDwords) * sizeof(uint32_t) -
+        built_shader_[blob_offset_position_dwords++];
   }
 
   // ***************************************************************************
   // Container header
   // ***************************************************************************
 
-  uint32_t built_shader_size_bytes = uint32_t(built_shader_.size() * sizeof(uint32_t));
+  uint32_t built_shader_size_bytes =
+      uint32_t(built_shader_.size() * sizeof(uint32_t));
   {
-    auto& container_header = *reinterpret_cast<dxbc::ContainerHeader*>(built_shader_.data());
+    auto& container_header =
+        *reinterpret_cast<dxbc::ContainerHeader*>(built_shader_.data());
     container_header.InitializeIdentification();
     container_header.size_bytes = built_shader_size_bytes;
     container_header.blob_count = blob_count;
-    CalculateDXBCChecksum(reinterpret_cast<unsigned char*>(built_shader_.data()),
-                          static_cast<unsigned int>(built_shader_size_bytes),
-                          reinterpret_cast<unsigned int*>(&container_header.hash));
+    CalculateDXBCChecksum(
+        reinterpret_cast<unsigned char*>(built_shader_.data()),
+        static_cast<unsigned int>(built_shader_size_bytes),
+        reinterpret_cast<unsigned int*>(&container_header.hash));
   }
 
   // ***************************************************************************
@@ -3751,7 +3925,8 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
   pipeline_input_element_desc.Format = DXGI_FORMAT_R32G32_FLOAT;
   pipeline_input_element_desc.InputSlot = 0;
   pipeline_input_element_desc.AlignedByteOffset = 0;
-  pipeline_input_element_desc.InputSlotClass = D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA;
+  pipeline_input_element_desc.InputSlotClass =
+      D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA;
   pipeline_input_element_desc.InstanceDataStepRate = 0;
   D3D12_GRAPHICS_PIPELINE_STATE_DESC pipeline_desc = {};
   pipeline_desc.pRootSignature = transfer_root_signatures_[size_t(
@@ -3771,29 +3946,35 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
   }
   pipeline_desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
   pipeline_desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-  pipeline_desc.RasterizerState.DepthClipEnable = TRUE;
+  pipeline_desc.RasterizerState.DepthClipEnable = true;
   pipeline_desc.InputLayout.pInputElementDescs = &pipeline_input_element_desc;
   pipeline_desc.InputLayout.NumElements = 1;
   pipeline_desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
   if (dest_is_stencil_bit) {
-    pipeline_desc.DepthStencilState.StencilEnable = TRUE;
-    pipeline_desc.DepthStencilState.FrontFace.StencilFailOp = D3D12_STENCIL_OP_KEEP;
-    pipeline_desc.DepthStencilState.FrontFace.StencilDepthFailOp = D3D12_STENCIL_OP_KEEP;
-    pipeline_desc.DepthStencilState.FrontFace.StencilPassOp = D3D12_STENCIL_OP_REPLACE;
-    pipeline_desc.DepthStencilState.FrontFace.StencilFunc = D3D12_COMPARISON_FUNC_ALWAYS;
-    pipeline_desc.DepthStencilState.BackFace = pipeline_desc.DepthStencilState.FrontFace;
+    pipeline_desc.DepthStencilState.StencilEnable = true;
+    pipeline_desc.DepthStencilState.FrontFace.StencilFailOp =
+        D3D12_STENCIL_OP_KEEP;
+    pipeline_desc.DepthStencilState.FrontFace.StencilDepthFailOp =
+        D3D12_STENCIL_OP_KEEP;
+    pipeline_desc.DepthStencilState.FrontFace.StencilPassOp =
+        D3D12_STENCIL_OP_REPLACE;
+    pipeline_desc.DepthStencilState.FrontFace.StencilFunc =
+        D3D12_COMPARISON_FUNC_ALWAYS;
+    pipeline_desc.DepthStencilState.BackFace =
+        pipeline_desc.DepthStencilState.FrontFace;
     pipeline_desc.DSVFormat = GetDepthDSVDXGIFormat(dest_depth_format);
     // Even if creation fails, still store the null pointers not to try to
     // create again.
     std::array<ID3D12PipelineState*, 8>& stencil_bit_pipelines =
         transfer_stencil_bit_pipelines_
-            .emplace(std::piecewise_construct, std::make_tuple(key), std::make_tuple())
+            .emplace(std::piecewise_construct, std::make_tuple(key),
+                     std::make_tuple())
             .first->second;
     bool stencil_pipelines_created = true;
     for (uint32_t i = 0; i < 8; ++i) {
       pipeline_desc.DepthStencilState.StencilWriteMask = UINT8(1) << i;
-      if (SUCCEEDED(device->CreateGraphicsPipelineState(&pipeline_desc,
-                                                        IID_PPV_ARGS(&stencil_bit_pipelines[i])))) {
+      if (SUCCEEDED(device->CreateGraphicsPipelineState(
+              &pipeline_desc, IID_PPV_ARGS(&stencil_bit_pipelines[i])))) {
         continue;
       }
       stencil_pipelines_created = false;
@@ -3803,35 +3984,44 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
       }
       break;
     }
-    pipelines = stencil_pipelines_created ? stencil_bit_pipelines.data() : nullptr;
+    pipelines =
+        stencil_pipelines_created ? stencil_bit_pipelines.data() : nullptr;
   } else {
     if (dest_is_color) {
-      pipeline_desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+      pipeline_desc.BlendState.RenderTarget[0].RenderTargetWriteMask =
+          D3D12_COLOR_WRITE_ENABLE_ALL;
       pipeline_desc.NumRenderTargets = 1;
-      pipeline_desc.RTVFormats[0] = GetColorOwnershipTransferDXGIFormat(dest_color_format);
+      pipeline_desc.RTVFormats[0] =
+          GetColorOwnershipTransferDXGIFormat(dest_color_format);
     } else {
-      pipeline_desc.DepthStencilState.DepthEnable = TRUE;
-      pipeline_desc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
-      pipeline_desc.DepthStencilState.DepthFunc = REXCVAR_GET(depth_transfer_not_equal_test)
-                                                      ? D3D12_COMPARISON_FUNC_NOT_EQUAL
-                                                      : D3D12_COMPARISON_FUNC_ALWAYS;
+      pipeline_desc.DepthStencilState.DepthEnable = true;
+      pipeline_desc.DepthStencilState.DepthWriteMask =
+          D3D12_DEPTH_WRITE_MASK_ALL;
+      pipeline_desc.DepthStencilState.DepthFunc =
+          REXCVAR_GET(depth_transfer_not_equal_test) ? D3D12_COMPARISON_FUNC_NOT_EQUAL
+                                               : D3D12_COMPARISON_FUNC_ALWAYS;
       if (use_stencil_reference_output_) {
-        pipeline_desc.DepthStencilState.StencilEnable = TRUE;
+        pipeline_desc.DepthStencilState.StencilEnable = true;
         pipeline_desc.DepthStencilState.StencilWriteMask = UINT8_MAX;
-        pipeline_desc.DepthStencilState.FrontFace.StencilFailOp = D3D12_STENCIL_OP_KEEP;
+        pipeline_desc.DepthStencilState.FrontFace.StencilFailOp =
+            D3D12_STENCIL_OP_KEEP;
         pipeline_desc.DepthStencilState.FrontFace.StencilDepthFailOp =
             REXCVAR_GET(depth_transfer_not_equal_test) ? D3D12_STENCIL_OP_REPLACE
-                                                       : D3D12_STENCIL_OP_KEEP;
-        pipeline_desc.DepthStencilState.FrontFace.StencilPassOp = D3D12_STENCIL_OP_REPLACE;
+                                                 : D3D12_STENCIL_OP_KEEP;
+        pipeline_desc.DepthStencilState.FrontFace.StencilPassOp =
+            D3D12_STENCIL_OP_REPLACE;
         // Using ALWAYS, not NOT_EQUAL, so depth writing is unaffected by
         // stencil being different.
-        pipeline_desc.DepthStencilState.FrontFace.StencilFunc = D3D12_COMPARISON_FUNC_ALWAYS;
-        pipeline_desc.DepthStencilState.BackFace = pipeline_desc.DepthStencilState.FrontFace;
+        pipeline_desc.DepthStencilState.FrontFace.StencilFunc =
+            D3D12_COMPARISON_FUNC_ALWAYS;
+        pipeline_desc.DepthStencilState.BackFace =
+            pipeline_desc.DepthStencilState.FrontFace;
       }
       pipeline_desc.DSVFormat = GetDepthDSVDXGIFormat(dest_depth_format);
     }
     ID3D12PipelineState* pipeline;
-    if (FAILED(device->CreateGraphicsPipelineState(&pipeline_desc, IID_PPV_ARGS(&pipeline)))) {
+    if (FAILED(device->CreateGraphicsPipelineState(&pipeline_desc,
+                                                   IID_PPV_ARGS(&pipeline)))) {
       pipeline = nullptr;
     }
     // Even if creation fails, still store the null pointer not to try to create
@@ -3852,9 +4042,10 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
         (rs & kTransferUsedRootParameterColorSRVBit)
             ? xenos::GetColorRenderTargetFormatName(source_color_format)
             : xenos::GetDepthRenderTargetFormatName(source_depth_format);
-    const char* dest_format_name = mode.output == TransferOutput::kColor
-                                       ? xenos::GetColorRenderTargetFormatName(dest_color_format)
-                                       : xenos::GetDepthRenderTargetFormatName(dest_depth_format);
+    const char* dest_format_name =
+        mode.output == TransferOutput::kColor
+            ? xenos::GetColorRenderTargetFormatName(dest_color_format)
+            : xenos::GetDepthRenderTargetFormatName(dest_depth_format);
     if (srv_index_host_depth != UINT32_MAX) {
       REXGPU_ERROR(
           "D3D12RenderTargetCache: Failed to create a render target ownership "
@@ -3863,13 +4054,15 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
           uint32_t(1) << uint32_t(key.source_msaa_samples), source_format_name,
           uint32_t(1) << uint32_t(key.host_depth_source_msaa_samples),
           key.host_depth_source_is_copy ? " copy" : "",
-          uint32_t(1) << uint32_t(key.dest_msaa_samples), dest_format_name, uint32_t(key.mode));
+          uint32_t(1) << uint32_t(key.dest_msaa_samples), dest_format_name,
+          uint32_t(key.mode));
     } else {
       REXGPU_ERROR(
           "D3D12RenderTargetCache: Failed to create a render target ownership "
           "transfer pipeline for {}-sample {} -> {}-sample {} for mode {}",
           uint32_t(1) << uint32_t(key.source_msaa_samples), source_format_name,
-          uint32_t(1) << uint32_t(key.dest_msaa_samples), dest_format_name, uint32_t(key.mode));
+          uint32_t(1) << uint32_t(key.dest_msaa_samples), dest_format_name,
+          uint32_t(key.mode));
     }
   }
   return pipelines;
@@ -4830,7 +5023,8 @@ void D3D12RenderTargetCache::SetCommandListRenderTargets(
   }
 }
 
-ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDumpPipeline(DumpPipelineKey key) {
+ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDumpPipeline(
+    DumpPipelineKey key) {
   auto pipeline_it = dump_pipelines_.find(key);
   if (pipeline_it != dump_pipelines_.end()) {
     return pipeline_it->second;
@@ -4845,10 +5039,13 @@ ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDumpPipeline(DumpPipelin
   constexpr uint32_t kBlobCount = 5;
 
   // Allocate space for the container header and the blob offsets.
-  built_shader_.resize(sizeof(dxbc::ContainerHeader) / sizeof(uint32_t) + kBlobCount);
-  uint32_t blob_offset_position_dwords = sizeof(dxbc::ContainerHeader) / sizeof(uint32_t);
+  built_shader_.resize(sizeof(dxbc::ContainerHeader) / sizeof(uint32_t) +
+                       kBlobCount);
+  uint32_t blob_offset_position_dwords =
+      sizeof(dxbc::ContainerHeader) / sizeof(uint32_t);
   uint32_t blob_position_dwords = uint32_t(built_shader_.size());
-  constexpr uint32_t kBlobHeaderSizeDwords = sizeof(dxbc::BlobHeader) / sizeof(uint32_t);
+  constexpr uint32_t kBlobHeaderSizeDwords =
+      sizeof(dxbc::BlobHeader) / sizeof(uint32_t);
 
   uint32_t name_ptr;
 
@@ -4856,30 +5053,35 @@ ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDumpPipeline(DumpPipelin
   // Resource definition
   // ***************************************************************************
 
-  built_shader_[blob_offset_position_dwords] = uint32_t(blob_position_dwords * sizeof(uint32_t));
+  built_shader_[blob_offset_position_dwords] =
+      uint32_t(blob_position_dwords * sizeof(uint32_t));
   uint32_t rdef_position_dwords = blob_position_dwords + kBlobHeaderSizeDwords;
   // Not needed, as the next operation done is resize, to allocate the space for
   // both the blob header and the resource definition header.
   // built_shader_.resize(rdef_position_dwords);
 
   // Allocate space for the RDEF header.
-  built_shader_.resize(rdef_position_dwords + sizeof(dxbc::RdefHeader) / sizeof(uint32_t));
+  built_shader_.resize(rdef_position_dwords +
+                       sizeof(dxbc::RdefHeader) / sizeof(uint32_t));
   // Generator name.
   dxbc::AppendAlignedString(built_shader_, "Xenia");
 
   // Constant types - uint (aka "dword" when it's scalar) only.
   // Names.
-  name_ptr = uint32_t((built_shader_.size() - rdef_position_dwords) * sizeof(uint32_t));
+  name_ptr = uint32_t((built_shader_.size() - rdef_position_dwords) *
+                      sizeof(uint32_t));
   uint32_t rdef_dword_name_ptr = name_ptr;
   name_ptr += dxbc::AppendAlignedString(built_shader_, "dword");
   // Types.
   uint32_t rdef_type_uint_position_dwords = uint32_t(built_shader_.size());
   uint32_t rdef_type_uint_ptr =
-      uint32_t((rdef_type_uint_position_dwords - rdef_position_dwords) * sizeof(uint32_t));
-  built_shader_.resize(rdef_type_uint_position_dwords + sizeof(dxbc::RdefType) / sizeof(uint32_t));
+      uint32_t((rdef_type_uint_position_dwords - rdef_position_dwords) *
+               sizeof(uint32_t));
+  built_shader_.resize(rdef_type_uint_position_dwords +
+                       sizeof(dxbc::RdefType) / sizeof(uint32_t));
   {
-    auto& rdef_type_uint =
-        *reinterpret_cast<dxbc::RdefType*>(built_shader_.data() + rdef_type_uint_position_dwords);
+    auto& rdef_type_uint = *reinterpret_cast<dxbc::RdefType*>(
+        built_shader_.data() + rdef_type_uint_position_dwords);
     rdef_type_uint.variable_class = dxbc::RdefVariableClass::kScalar;
     rdef_type_uint.variable_type = dxbc::RdefVariableType::kUInt;
     rdef_type_uint.row_count = 1;
@@ -4896,7 +5098,8 @@ ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDumpPipeline(DumpPipelin
     kConstantCount,
   };
   // Names.
-  name_ptr = uint32_t((built_shader_.size() - rdef_position_dwords) * sizeof(uint32_t));
+  name_ptr = uint32_t((built_shader_.size() - rdef_position_dwords) *
+                      sizeof(uint32_t));
   uint32_t rdef_xe_edram_dump_offsets_name_ptr = name_ptr;
   name_ptr += dxbc::AppendAlignedString(built_shader_, "xe_edram_dump_offsets");
   uint32_t rdef_xe_edram_dump_pitches_name_ptr = name_ptr;
@@ -4904,14 +5107,17 @@ ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDumpPipeline(DumpPipelin
   // Constants.
   uint32_t rdef_constants_position_dwords = uint32_t(built_shader_.size());
   uint32_t rdef_constants_ptr =
-      uint32_t((rdef_constants_position_dwords - rdef_position_dwords) * sizeof(uint32_t));
+      uint32_t((rdef_constants_position_dwords - rdef_position_dwords) *
+               sizeof(uint32_t));
   built_shader_.resize(rdef_constants_position_dwords +
-                       sizeof(dxbc::RdefVariable) / sizeof(uint32_t) * kConstantCount);
+                       sizeof(dxbc::RdefVariable) / sizeof(uint32_t) *
+                           kConstantCount);
   {
-    auto rdef_constants = reinterpret_cast<dxbc::RdefVariable*>(built_shader_.data() +
-                                                                rdef_constants_position_dwords);
+    auto rdef_constants = reinterpret_cast<dxbc::RdefVariable*>(
+        built_shader_.data() + rdef_constants_position_dwords);
     // uint xe_edram_dump_offsets
-    dxbc::RdefVariable& rdef_constant_offsets = rdef_constants[kConstantOffsets];
+    dxbc::RdefVariable& rdef_constant_offsets =
+        rdef_constants[kConstantOffsets];
     rdef_constant_offsets.name_ptr = rdef_xe_edram_dump_offsets_name_ptr;
     rdef_constant_offsets.size_bytes = sizeof(uint32_t);
     rdef_constant_offsets.flags = dxbc::kRdefVariableFlagUsed;
@@ -4919,7 +5125,8 @@ ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDumpPipeline(DumpPipelin
     rdef_constant_offsets.start_texture = UINT32_MAX;
     rdef_constant_offsets.start_sampler = UINT32_MAX;
     // uint xe_edram_dump_pitches
-    dxbc::RdefVariable& rdef_constant_pitches = rdef_constants[kConstantPitches];
+    dxbc::RdefVariable& rdef_constant_pitches =
+        rdef_constants[kConstantPitches];
     rdef_constant_pitches.name_ptr = rdef_xe_edram_dump_pitches_name_ptr;
     rdef_constant_pitches.size_bytes = sizeof(uint32_t);
     rdef_constant_pitches.flags = dxbc::kRdefVariableFlagUsed;
@@ -4934,46 +5141,52 @@ ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDumpPipeline(DumpPipelin
   // Reusing the constant names for constant buffers.
   uint32_t rdef_cbuffer_position_dwords = uint32_t(built_shader_.size());
   built_shader_.resize(rdef_cbuffer_position_dwords +
-                       sizeof(dxbc::RdefCbuffer) / sizeof(uint32_t) * kDumpCbufferCount);
+                       sizeof(dxbc::RdefCbuffer) / sizeof(uint32_t) *
+                           kDumpCbufferCount);
   {
-    auto rdef_cbuffers =
-        reinterpret_cast<dxbc::RdefCbuffer*>(built_shader_.data() + rdef_cbuffer_position_dwords);
+    auto rdef_cbuffers = reinterpret_cast<dxbc::RdefCbuffer*>(
+        built_shader_.data() + rdef_cbuffer_position_dwords);
     // xe_edram_dump_offsets
-    dxbc::RdefCbuffer& rdef_cbuffer_offsets = rdef_cbuffers[kDumpCbufferOffsets];
+    dxbc::RdefCbuffer& rdef_cbuffer_offsets =
+        rdef_cbuffers[kDumpCbufferOffsets];
     rdef_cbuffer_offsets.name_ptr = rdef_xe_edram_dump_offsets_name_ptr;
     rdef_cbuffer_offsets.variable_count = 1;
-    rdef_cbuffer_offsets.variables_ptr =
-        uint32_t(rdef_constants_ptr + sizeof(dxbc::RdefVariable) * kConstantOffsets);
+    rdef_cbuffer_offsets.variables_ptr = uint32_t(
+        rdef_constants_ptr + sizeof(dxbc::RdefVariable) * kConstantOffsets);
     rdef_cbuffer_offsets.size_vector_aligned_bytes = sizeof(uint32_t) * 4;
     // xe_edram_dump_pitches
-    dxbc::RdefCbuffer& rdef_cbuffer_pitches = rdef_cbuffers[kDumpCbufferPitches];
+    dxbc::RdefCbuffer& rdef_cbuffer_pitches =
+        rdef_cbuffers[kDumpCbufferPitches];
     rdef_cbuffer_pitches.name_ptr = rdef_xe_edram_dump_pitches_name_ptr;
     rdef_cbuffer_pitches.variable_count = 1;
-    rdef_cbuffer_pitches.variables_ptr =
-        uint32_t(rdef_constants_ptr + sizeof(dxbc::RdefVariable) * kConstantPitches);
+    rdef_cbuffer_pitches.variables_ptr = uint32_t(
+        rdef_constants_ptr + sizeof(dxbc::RdefVariable) * kConstantPitches);
     rdef_cbuffer_pitches.size_vector_aligned_bytes = sizeof(uint32_t) * 4;
   }
 
   // Bindings.
   // - Texture2D/Texture2DMS<float4/uint4> xe_edram_dump_source : t0
   // - Optionally, Texture2D/Texture2DMS<uint2> xe_edram_dump_stencil : t1
-  // - RWBuffer<uint/uint2> xe_edram : u0
+  // - RWByteAddressBuffer xe_edram : u0
   // - Constant buffers
   uint32_t rdef_binding_count = 1 + key.is_depth + 1 + kDumpCbufferCount;
   // Names.
-  name_ptr = uint32_t((built_shader_.size() - rdef_position_dwords) * sizeof(uint32_t));
+  name_ptr = uint32_t((built_shader_.size() - rdef_position_dwords) *
+                      sizeof(uint32_t));
   uint32_t rdef_xe_edram_dump_source_name_ptr = name_ptr;
   name_ptr += dxbc::AppendAlignedString(built_shader_, "xe_edram_dump_source");
   uint32_t rdef_xe_edram_dump_stencil_name_ptr = name_ptr;
   if (key.is_depth) {
-    name_ptr += dxbc::AppendAlignedString(built_shader_, "xe_edram_dump_stencil");
+    name_ptr +=
+        dxbc::AppendAlignedString(built_shader_, "xe_edram_dump_stencil");
   }
   uint32_t rdef_xe_edram_name_ptr = name_ptr;
   name_ptr += dxbc::AppendAlignedString(built_shader_, "xe_edram");
   // Bindings.
   uint32_t rdef_binding_position_dwords = uint32_t(built_shader_.size());
   built_shader_.resize(rdef_binding_position_dwords +
-                       sizeof(dxbc::RdefInputBind) / sizeof(uint32_t) * rdef_binding_count);
+                       sizeof(dxbc::RdefInputBind) / sizeof(uint32_t) *
+                           rdef_binding_count);
   bool source_is_uint;
   if (key.is_depth) {
     source_is_uint = false;
@@ -4981,17 +5194,21 @@ ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDumpPipeline(DumpPipelin
     GetColorOwnershipTransferDXGIFormat(key.GetColorFormat(), &source_is_uint);
   }
   dxbc::ResourceReturnType source_return_type =
-      source_is_uint ? dxbc::ResourceReturnType::kUInt : dxbc::ResourceReturnType::kFloat;
+      source_is_uint ? dxbc::ResourceReturnType::kUInt
+                     : dxbc::ResourceReturnType::kFloat;
   uint32_t source_component_count =
-      key.is_depth ? 1 : xenos::GetColorRenderTargetFormatComponentCount(key.GetColorFormat());
-  bool format_is_64bpp =
-      !key.is_depth && xenos::IsColorRenderTargetFormat64bpp(key.GetColorFormat());
+      key.is_depth ? 1
+                   : xenos::GetColorRenderTargetFormatComponentCount(
+                         key.GetColorFormat());
+  bool format_is_64bpp = !key.is_depth && xenos::IsColorRenderTargetFormat64bpp(
+                                              key.GetColorFormat());
   {
-    auto rdef_bindings =
-        reinterpret_cast<dxbc::RdefInputBind*>(built_shader_.data() + rdef_binding_position_dwords);
+    auto rdef_bindings = reinterpret_cast<dxbc::RdefInputBind*>(
+        built_shader_.data() + rdef_binding_position_dwords);
     uint32_t rdef_binding_index = 0;
     // xe_edram_dump_source
-    dxbc::RdefInputBind& rdef_binding_source = rdef_bindings[rdef_binding_index++];
+    dxbc::RdefInputBind& rdef_binding_source =
+        rdef_bindings[rdef_binding_index++];
     rdef_binding_source.name_ptr = rdef_xe_edram_dump_source_name_ptr;
     rdef_binding_source.type = dxbc::RdefInputType::kTexture;
     rdef_binding_source.return_type = source_return_type;
@@ -5007,7 +5224,8 @@ ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDumpPipeline(DumpPipelin
                                 << dxbc::kRdefInputFlagsComponentsShift;
     // xe_edram_dump_stencil
     if (key.is_depth) {
-      dxbc::RdefInputBind& rdef_binding_stencil = rdef_bindings[rdef_binding_index++];
+      dxbc::RdefInputBind& rdef_binding_stencil =
+          rdef_bindings[rdef_binding_index++];
       rdef_binding_stencil.name_ptr = rdef_xe_edram_dump_stencil_name_ptr;
       rdef_binding_stencil.type = dxbc::RdefInputType::kTexture;
       rdef_binding_stencil.return_type = dxbc::ResourceReturnType::kUInt;
@@ -5019,16 +5237,16 @@ ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDumpPipeline(DumpPipelin
       rdef_binding_stencil.id = 1;
     }
     // xe_edram
-    dxbc::RdefInputBind& rdef_binding_edram = rdef_bindings[rdef_binding_index++];
+    dxbc::RdefInputBind& rdef_binding_edram =
+        rdef_bindings[rdef_binding_index++];
     rdef_binding_edram.name_ptr = rdef_xe_edram_name_ptr;
-    rdef_binding_edram.type = dxbc::RdefInputType::kUAVRWTyped;
-    rdef_binding_edram.return_type = dxbc::ResourceReturnType::kUInt;
+    rdef_binding_edram.type = dxbc::RdefInputType::kUAVRWByteAddress;
+    rdef_binding_edram.return_type = dxbc::ResourceReturnType::kMixed;
     rdef_binding_edram.dimension = dxbc::RdefDimension::kUAVBuffer;
-    rdef_binding_edram.sample_count = UINT32_MAX;
     rdef_binding_edram.bind_count = 1;
-    rdef_binding_edram.flags = format_is_64bpp ? dxbc::kRdefInputFlags2Component : 0;
     // xe_edram_dump_offsets
-    dxbc::RdefInputBind& rdef_binding_offsets = rdef_bindings[rdef_binding_index++];
+    dxbc::RdefInputBind& rdef_binding_offsets =
+        rdef_bindings[rdef_binding_index++];
     rdef_binding_offsets.name_ptr = rdef_xe_edram_dump_offsets_name_ptr;
     rdef_binding_offsets.type = dxbc::RdefInputType::kCbuffer;
     rdef_binding_offsets.bind_point = kDumpCbufferOffsets;
@@ -5036,7 +5254,8 @@ ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDumpPipeline(DumpPipelin
     rdef_binding_offsets.flags = dxbc::kRdefInputFlagUserPacked;
     rdef_binding_offsets.id = kDumpCbufferOffsets;
     // xe_edram_dump_pitches
-    dxbc::RdefInputBind& rdef_binding_pitches = rdef_bindings[rdef_binding_index++];
+    dxbc::RdefInputBind& rdef_binding_pitches =
+        rdef_bindings[rdef_binding_index++];
     rdef_binding_pitches.name_ptr = rdef_xe_edram_dump_pitches_name_ptr;
     rdef_binding_pitches.type = dxbc::RdefInputType::kCbuffer;
     rdef_binding_pitches.bind_point = kDumpCbufferPitches;
@@ -5047,14 +5266,16 @@ ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDumpPipeline(DumpPipelin
 
   // Header.
   {
-    auto& rdef_header =
-        *reinterpret_cast<dxbc::RdefHeader*>(built_shader_.data() + rdef_position_dwords);
+    auto& rdef_header = *reinterpret_cast<dxbc::RdefHeader*>(
+        built_shader_.data() + rdef_position_dwords);
     rdef_header.cbuffer_count = kDumpCbufferCount;
     rdef_header.cbuffers_ptr =
-        uint32_t((rdef_cbuffer_position_dwords - rdef_position_dwords) * sizeof(uint32_t));
+        uint32_t((rdef_cbuffer_position_dwords - rdef_position_dwords) *
+                 sizeof(uint32_t));
     rdef_header.input_bind_count = rdef_binding_count;
     rdef_header.input_binds_ptr =
-        uint32_t((rdef_binding_position_dwords - rdef_position_dwords) * sizeof(uint32_t));
+        uint32_t((rdef_binding_position_dwords - rdef_position_dwords) *
+                 sizeof(uint32_t));
     rdef_header.shader_model = dxbc::RdefShaderModel::kComputeShader5_1;
     rdef_header.compile_flags =
         dxbc::kCompileFlagNoPreshader | dxbc::kCompileFlagPreferFlowControl |
@@ -5066,12 +5287,13 @@ ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDumpPipeline(DumpPipelin
   }
 
   {
-    auto& blob_header =
-        *reinterpret_cast<dxbc::BlobHeader*>(built_shader_.data() + blob_position_dwords);
+    auto& blob_header = *reinterpret_cast<dxbc::BlobHeader*>(
+        built_shader_.data() + blob_position_dwords);
     blob_header.fourcc = dxbc::BlobHeader::FourCC::kResourceDefinition;
     blob_position_dwords = uint32_t(built_shader_.size());
-    blob_header.size_bytes = (blob_position_dwords - kBlobHeaderSizeDwords) * sizeof(uint32_t) -
-                             built_shader_[blob_offset_position_dwords++];
+    blob_header.size_bytes =
+        (blob_position_dwords - kBlobHeaderSizeDwords) * sizeof(uint32_t) -
+        built_shader_[blob_offset_position_dwords++];
   }
 
   // ***************************************************************************
@@ -5079,23 +5301,27 @@ ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDumpPipeline(DumpPipelin
   // ***************************************************************************
 
   for (uint32_t i = 0; i < 2; ++i) {
-    built_shader_[blob_offset_position_dwords] = uint32_t(blob_position_dwords * sizeof(uint32_t));
-    uint32_t signature_position_dwords = blob_position_dwords + kBlobHeaderSizeDwords;
-    built_shader_.resize(signature_position_dwords + sizeof(dxbc::Signature) / sizeof(uint32_t));
+    built_shader_[blob_offset_position_dwords] =
+        uint32_t(blob_position_dwords * sizeof(uint32_t));
+    uint32_t signature_position_dwords =
+        blob_position_dwords + kBlobHeaderSizeDwords;
+    built_shader_.resize(signature_position_dwords +
+                         sizeof(dxbc::Signature) / sizeof(uint32_t));
     {
-      auto& signature =
-          *reinterpret_cast<dxbc::Signature*>(built_shader_.data() + signature_position_dwords);
+      auto& signature = *reinterpret_cast<dxbc::Signature*>(
+          built_shader_.data() + signature_position_dwords);
       // Empty - just set parameter pointer to the end.
       signature.parameter_info_ptr = sizeof(dxbc::Signature);
     }
     {
-      auto& blob_header =
-          *reinterpret_cast<dxbc::BlobHeader*>(built_shader_.data() + blob_position_dwords);
+      auto& blob_header = *reinterpret_cast<dxbc::BlobHeader*>(
+          built_shader_.data() + blob_position_dwords);
       blob_header.fourcc = i ? dxbc::BlobHeader::FourCC::kOutputSignature
                              : dxbc::BlobHeader::FourCC::kInputSignature;
       blob_position_dwords = uint32_t(built_shader_.size());
-      blob_header.size_bytes = (blob_position_dwords - kBlobHeaderSizeDwords) * sizeof(uint32_t) -
-                               built_shader_[blob_offset_position_dwords++];
+      blob_header.size_bytes =
+          (blob_position_dwords - kBlobHeaderSizeDwords) * sizeof(uint32_t) -
+          built_shader_[blob_offset_position_dwords++];
     }
   }
 
@@ -5103,11 +5329,13 @@ ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDumpPipeline(DumpPipelin
   // Shader program
   // ***************************************************************************
 
-  built_shader_[blob_offset_position_dwords] = uint32_t(blob_position_dwords * sizeof(uint32_t));
+  built_shader_[blob_offset_position_dwords] =
+      uint32_t(blob_position_dwords * sizeof(uint32_t));
   uint32_t shex_position_dwords = blob_position_dwords + kBlobHeaderSizeDwords;
   built_shader_.resize(shex_position_dwords);
 
-  built_shader_.push_back(dxbc::VersionToken(dxbc::ProgramType::kComputeShader, 5, 1));
+  built_shader_.push_back(
+      dxbc::VersionToken(dxbc::ProgramType::kComputeShader, 5, 1));
   // Reserve space for the length token.
   built_shader_.push_back(0);
 
@@ -5116,31 +5344,31 @@ ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDumpPipeline(DumpPipelin
   dxbc::Assembler a(built_shader_, stat);
 
   a.OpDclGlobalFlags(dxbc::kGlobalFlagAllResourcesBound);
-  a.OpDclConstantBuffer(
-      dxbc::Src::CB(dxbc::Src::Dcl, kDumpCbufferOffsets, kDumpCbufferOffsets, kDumpCbufferOffsets),
-      1);
-  a.OpDclConstantBuffer(
-      dxbc::Src::CB(dxbc::Src::Dcl, kDumpCbufferPitches, kDumpCbufferPitches, kDumpCbufferPitches),
-      1);
+  a.OpDclConstantBuffer(dxbc::Src::CB(dxbc::Src::Dcl, kDumpCbufferOffsets,
+                                      kDumpCbufferOffsets, kDumpCbufferOffsets),
+                        1);
+  a.OpDclConstantBuffer(dxbc::Src::CB(dxbc::Src::Dcl, kDumpCbufferPitches,
+                                      kDumpCbufferPitches, kDumpCbufferPitches),
+                        1);
   // Source texture.
-  dxbc::ResourceDimension source_dimension = key.msaa_samples != xenos::MsaaSamples::k1X
-                                                 ? dxbc::ResourceDimension::kTexture2DMS
-                                                 : dxbc::ResourceDimension::kTexture2D;
-  a.OpDclResource(
-      source_dimension,
-      dxbc::ResourceReturnTypeX4Token(source_is_uint ? dxbc::ResourceReturnType::kUInt
-                                                     : dxbc::ResourceReturnType::kFloat),
-      dxbc::Src::T(dxbc::Src::Dcl, 0, 0, 0));
+  dxbc::ResourceDimension source_dimension =
+      key.msaa_samples != xenos::MsaaSamples::k1X
+          ? dxbc::ResourceDimension::kTexture2DMS
+          : dxbc::ResourceDimension::kTexture2D;
+  a.OpDclResource(source_dimension,
+                  dxbc::ResourceReturnTypeX4Token(
+                      source_is_uint ? dxbc::ResourceReturnType::kUInt
+                                     : dxbc::ResourceReturnType::kFloat),
+                  dxbc::Src::T(dxbc::Src::Dcl, 0, 0, 0));
   // Source stencil texture.
   if (key.is_depth) {
-    a.OpDclResource(source_dimension,
-                    dxbc::ResourceReturnTypeX4Token(dxbc::ResourceReturnType::kUInt),
-                    dxbc::Src::T(dxbc::Src::Dcl, 1, 1, 1));
+    a.OpDclResource(
+        source_dimension,
+        dxbc::ResourceReturnTypeX4Token(dxbc::ResourceReturnType::kUInt),
+        dxbc::Src::T(dxbc::Src::Dcl, 1, 1, 1));
   }
   // EDRAM buffer.
-  a.OpDclUnorderedAccessViewTyped(dxbc::ResourceDimension::kBuffer, 0,
-                                  dxbc::ResourceReturnTypeX4Token(dxbc::ResourceReturnType::kUInt),
-                                  dxbc::Src::U(dxbc::Src::Dcl, 0, 0, 0));
+  a.OpDclUnorderedAccessViewRaw(0, dxbc::Src::U(dxbc::Src::Dcl, 0, 0, 0));
   a.OpDclInput(dxbc::Dest::VThreadID(0b0011));
   // r0 - addressing before the load, then addressing and conversion scratch
   // r1 - addressing scratch before the load, then data
@@ -5155,16 +5383,22 @@ ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDumpPipeline(DumpPipelin
   // fits in it, while 80x16 doesn't.
   a.OpDclThreadGroup(40, 16, 1);
 
-  uint32_t draw_resolution_scale_x = this->draw_resolution_scale_x();
-  uint32_t draw_resolution_scale_y = this->draw_resolution_scale_y();
+  // Dumps for fully native resolves address the EDRAM buffer with the plain
+  // 1x1 tile layout.
+  uint32_t draw_resolution_scale_x =
+      key.native_layout ? 1 : this->draw_resolution_scale_x();
+  uint32_t draw_resolution_scale_y =
+      key.native_layout ? 1 : this->draw_resolution_scale_y();
 
   // For now, as the exact addressing in 64bpp render targets relatively to
   // 32bpp is unknown, treating 64bpp tiles as storing 40x16 samples rather than
   // 80x16 for simplicity of addressing into the texture.
 
   uint32_t tile_width =
-      (xenos::kEdramTileWidthSamples * draw_resolution_scale_x) >> uint32_t(format_is_64bpp);
-  uint32_t tile_height = xenos::kEdramTileHeightSamples * draw_resolution_scale_y;
+      (xenos::kEdramTileWidthSamples * draw_resolution_scale_x) >>
+      uint32_t(format_is_64bpp);
+  uint32_t tile_height =
+      xenos::kEdramTileHeightSamples * draw_resolution_scale_y;
 
   // Get the parts of the address - tile row index within the dispatch to r0.zw,
   // sample Y within the tile to r0.xy.
@@ -5172,7 +5406,8 @@ ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDumpPipeline(DumpPipelin
   // r0.y = Y sample position within the tile
   // r0.z = X tile position
   // r0.w = Y tile position
-  a.OpUDiv(dxbc::Dest::R(0, 0b1100), dxbc::Dest::R(0, 0b0011), dxbc::Src::VThreadID(0b01000100),
+  a.OpUDiv(dxbc::Dest::R(0, 0b1100), dxbc::Dest::R(0, 0b0011),
+           dxbc::Src::VThreadID(0b01000100),
            dxbc::Src::LU(tile_width, tile_height, tile_width, tile_height));
 
   // Extract the dump rectangle tile row pitch to r1.x.
@@ -5181,8 +5416,10 @@ ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDumpPipeline(DumpPipelin
   // r0.z = X tile position
   // r0.w = Y tile position
   // r1.x = dump rectangle pitch in tiles
-  a.OpUBFE(dxbc::Dest::R(1, 0b0001), dxbc::Src::LU(xenos::kEdramPitchTilesBits), dxbc::Src::LU(0),
-           dxbc::Src::CB(kDumpCbufferPitches, kDumpCbufferPitches, 0, dxbc::Src::kXXXX));
+  a.OpUBFE(dxbc::Dest::R(1, 0b0001), dxbc::Src::LU(xenos::kEdramPitchTilesBits),
+           dxbc::Src::LU(0),
+           dxbc::Src::CB(kDumpCbufferPitches, kDumpCbufferPitches, 0,
+                         dxbc::Src::kXXXX));
   // Get the tile index in the EDRAM relative to the dump rectangle base tile to
   // r0.w.
   // r0.x = X sample position within the tile
@@ -5191,7 +5428,8 @@ ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDumpPipeline(DumpPipelin
   // r0.w = tile index relative to the dump rectangle base
   // r1.x = free
   a.OpUMAd(dxbc::Dest::R(0, 0b1000), dxbc::Src::R(0, dxbc::Src::kWWWW),
-           dxbc::Src::R(1, dxbc::Src::kXXXX), dxbc::Src::R(0, dxbc::Src::kZZZZ));
+           dxbc::Src::R(1, dxbc::Src::kXXXX),
+           dxbc::Src::R(0, dxbc::Src::kZZZZ));
 
   // Extract the index of the first tile (taking EDRAM addressing wrapping into
   // account) of the dispatch in the EDRAM to r0.z.
@@ -5199,9 +5437,10 @@ ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDumpPipeline(DumpPipelin
   // r0.y = Y sample position within the tile
   // r0.z = first EDRAM tile index in the dispatch
   // r0.w = tile index relative to the dump rectangle base
-  a.OpUBFE(dxbc::Dest::R(0, 0b0100), dxbc::Src::LU(xenos::kEdramBaseTilesBits + 1),
-           dxbc::Src::LU(0),
-           dxbc::Src::CB(kDumpCbufferOffsets, kDumpCbufferOffsets, 0, dxbc::Src::kXXXX));
+  a.OpUBFE(dxbc::Dest::R(0, 0b0100),
+           dxbc::Src::LU(xenos::kEdramBaseTilesBits + 1), dxbc::Src::LU(0),
+           dxbc::Src::CB(kDumpCbufferOffsets, kDumpCbufferOffsets, 0,
+                         dxbc::Src::kXXXX));
   // Add the base tile in the dispatch to the dispatch-local tile index to r0.w,
   // not wrapping yet so in case of a wraparound, the address relative to the
   // base in the texture after subtraction of the base won't be negative.
@@ -5224,9 +5463,10 @@ ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDumpPipeline(DumpPipelin
   // r0.z = tile sample offset in the EDRAM plus X sample offset
   // r0.w = non-wrapped tile index in the EDRAM
   a.OpUMAd(dxbc::Dest::R(0, 0b0100), dxbc::Src::R(0, dxbc::Src::kZZZZ),
-           dxbc::Src::LU(draw_resolution_scale_x * draw_resolution_scale_y *
-                         (xenos::kEdramTileWidthSamples >> uint32_t(format_is_64bpp)) *
-                         xenos::kEdramTileHeightSamples),
+           dxbc::Src::LU(
+               draw_resolution_scale_x * draw_resolution_scale_y *
+               (xenos::kEdramTileWidthSamples >> uint32_t(format_is_64bpp)) *
+               xenos::kEdramTileHeightSamples),
            dxbc::Src::R(0, dxbc::Src::kXXXX));
   // Add the contribution of the Y sample position within the tile to the sample
   // address in the EDRAM to r0.z.
@@ -5234,8 +5474,8 @@ ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDumpPipeline(DumpPipelin
   // r0.y = Y sample position within the tile
   // r0.z = sample offset in the EDRAM without the depth column swapping
   // r0.w = non-wrapped tile index in the EDRAM
-  a.OpUMAd(dxbc::Dest::R(0, 0b0100), dxbc::Src::R(0, dxbc::Src::kYYYY), dxbc::Src::LU(tile_width),
-           dxbc::Src::R(0, dxbc::Src::kZZZZ));
+  a.OpUMAd(dxbc::Dest::R(0, 0b0100), dxbc::Src::R(0, dxbc::Src::kYYYY),
+           dxbc::Src::LU(tile_width), dxbc::Src::R(0, dxbc::Src::kZZZZ));
   if (key.is_depth) {
     uint32_t tile_width_half = tile_width >> 1;
     // Get which 40-sample half within the tile is being processed to r1.x.
@@ -5253,7 +5493,8 @@ ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDumpPipeline(DumpPipelin
     // r0.w = non-wrapped tile index in the EDRAM
     // r1.x = depth half-tile flipping offset
     a.OpMovC(dxbc::Dest::R(1, 0b0001), dxbc::Src::R(1, dxbc::Src::kXXXX),
-             dxbc::Src::LI(-int32_t(tile_width_half)), dxbc::Src::LI(int32_t(tile_width_half)));
+             dxbc::Src::LI(-int32_t(tile_width_half)),
+             dxbc::Src::LI(int32_t(tile_width_half)));
     // Swap 40-sample columns in the depth buffer in the destination address in
     // r0.w to get the final address of the sample in EDRAM.
     // r0.x = X sample position within the tile
@@ -5264,6 +5505,9 @@ ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDumpPipeline(DumpPipelin
     a.OpIAdd(dxbc::Dest::R(0, 0b0100), dxbc::Src::R(0, dxbc::Src::kZZZZ),
              dxbc::Src::R(1, dxbc::Src::kXXXX));
   }
+  // Convert the destination address from samples to bytes.
+  a.OpIShL(dxbc::Dest::R(0, 0b0100), dxbc::Src::R(0, dxbc::Src::kZZZZ),
+           dxbc::Src::LU(format_is_64bpp ? 3 : 2));
 
   // Extract the source texture base tile index to r1.x.
   // r0.x = X sample position within the tile
@@ -5273,7 +5517,8 @@ ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDumpPipeline(DumpPipelin
   // r1.x = source texture base tile index
   a.OpUBFE(dxbc::Dest::R(1, 0b0001), dxbc::Src::LU(xenos::kEdramBaseTilesBits),
            dxbc::Src::LU(xenos::kEdramBaseTilesBits + 1),
-           dxbc::Src::CB(kDumpCbufferOffsets, kDumpCbufferOffsets, 0, dxbc::Src::kXXXX));
+           dxbc::Src::CB(kDumpCbufferOffsets, kDumpCbufferOffsets, 0,
+                         dxbc::Src::kXXXX));
   // Get the linear tile index within the source texture to r0.w.
   // r0.x = X sample position within the tile
   // r0.y = Y sample position within the tile
@@ -5290,14 +5535,16 @@ ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDumpPipeline(DumpPipelin
   // r1.x = source texture pitch in tiles
   a.OpUBFE(dxbc::Dest::R(1, 0b0001), dxbc::Src::LU(xenos::kEdramPitchTilesBits),
            dxbc::Src::LU(xenos::kEdramPitchTilesBits),
-           dxbc::Src::CB(kDumpCbufferPitches, kDumpCbufferPitches, 0, dxbc::Src::kXXXX));
+           dxbc::Src::CB(kDumpCbufferPitches, kDumpCbufferPitches, 0,
+                         dxbc::Src::kXXXX));
   // Split the linear tile index in the source texture into X and Y in tiles.
   // r0.x = X sample position within the tile
   // r0.y = Y sample position within the tile
   // r0.z = sample offset in the EDRAM
   // r0.w = X tile index within the tile row in the source texture
   // r1.x = Y tile row index within the source texture
-  a.OpUDiv(dxbc::Dest::R(1, 0b0001), dxbc::Dest::R(0, 0b1000), dxbc::Src::R(0, dxbc::Src::kWWWW),
+  a.OpUDiv(dxbc::Dest::R(1, 0b0001), dxbc::Dest::R(0, 0b1000),
+           dxbc::Src::R(0, dxbc::Src::kWWWW),
            dxbc::Src::R(1, dxbc::Src::kXXXX));
   // Add the source texture tile X offset to the source texture sample X
   // coordinate.
@@ -5306,74 +5553,125 @@ ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDumpPipeline(DumpPipelin
   // r0.z = sample offset in the EDRAM
   // r0.w = free
   // r1.x = Y tile row index within the source texture
-  a.OpUMAd(dxbc::Dest::R(0, 0b0001), dxbc::Src::R(0, dxbc::Src::kWWWW), dxbc::Src::LU(tile_width),
-           dxbc::Src::R(0, dxbc::Src::kXXXX));
+  a.OpUMAd(dxbc::Dest::R(0, 0b0001), dxbc::Src::R(0, dxbc::Src::kWWWW),
+           dxbc::Src::LU(tile_width), dxbc::Src::R(0, dxbc::Src::kXXXX));
   // Add the source texture tile Y offset to the source texture sample Y
   // coordinate.
   // r0.x = X sample position within the source texture
   // r0.y = Y sample position within the source texture
   // r0.z = sample offset in the EDRAM
   // r1.x = free
-  a.OpUMAd(dxbc::Dest::R(0, 0b0010), dxbc::Src::R(1, dxbc::Src::kXXXX),
-           dxbc::Src::LU(xenos::kEdramTileHeightSamples * draw_resolution_scale_y),
-           dxbc::Src::R(0, dxbc::Src::kYYYY));
+  a.OpUMAd(
+      dxbc::Dest::R(0, 0b0010), dxbc::Src::R(1, dxbc::Src::kXXXX),
+      dxbc::Src::LU(xenos::kEdramTileHeightSamples * draw_resolution_scale_y),
+      dxbc::Src::R(0, dxbc::Src::kYYYY));
   // Will be using the source texture coordinates from r0.xy, and for
   // single-sampled source, LOD from r0.w.
   dxbc::Src source_address_src(dxbc::Src::R(0, 0b11000100));
   if (key.msaa_samples >= xenos::MsaaSamples::k2X) {
+    // r0.xy holds the canonical sample coordinates within the EDRAM layout.
+    // Convert them into the pixel and the sample of the multisampled view
+    // using the canonical layout formulas, at guest pixel granularity when the
+    // layout is scaled.
+    uint32_t layout_scale_x =
+        key.native_layout ? 1 : this->draw_resolution_scale_x();
+    uint32_t layout_scale_y =
+        key.native_layout ? 1 : this->draw_resolution_scale_y();
+    bool layout_scaled = layout_scale_x > 1 || layout_scale_y > 1;
+    if (layout_scaled) {
+      // r0.xy = guest canonical sample coordinates
+      // r1.xy = subpixel within the guest sample
+      a.OpUDiv(dxbc::Dest::R(0, 0b0011), dxbc::Dest::R(1, 0b0011),
+               dxbc::Src::R(0),
+               dxbc::Src::LU(layout_scale_x, layout_scale_y, 1, 1));
+    }
     if (key.msaa_samples >= xenos::MsaaSamples::k4X) {
-      // 4x MSAA source texture sample index - bit 0 for horizontal, bit 1 for
-      // vertical.
-      // Extract the horizontal sample index to r0.w.
-      // r0.x = X sample position within the source texture
-      // r0.y = Y sample position within the source texture
-      // r0.z = sample offset in the EDRAM
-      // r0.w = horizontal sample index within the source pixel
-      a.OpAnd(dxbc::Dest::R(0, 0b1000), dxbc::Src::R(0, dxbc::Src::kXXXX), dxbc::Src::LU(1));
-      // Insert the vertical sample index to r0.w.
-      // r0.x = X sample position within the source texture
-      // r0.y = Y sample position within the source texture
-      // r0.z = sample offset in the EDRAM
+      // The 4x sample index has bit 0 horizontal and bit 1 vertical, same as
+      // the canonical layout.
+      // r0.w = horizontal sample index = (u >> 1) & 1
+      a.OpUBFE(dxbc::Dest::R(0, 0b1000), dxbc::Src::LU(1), dxbc::Src::LU(1),
+               dxbc::Src::R(0, dxbc::Src::kXXXX));
+      // r1.z = vertical sample index = (v >> 1) & 1
+      a.OpUBFE(dxbc::Dest::R(1, 0b0100), dxbc::Src::LU(1), dxbc::Src::LU(1),
+               dxbc::Src::R(0, dxbc::Src::kYYYY));
       // r0.w = sample index within the source pixel
       a.OpBFI(dxbc::Dest::R(0, 0b1000), dxbc::Src::LU(1), dxbc::Src::LU(1),
-              dxbc::Src::R(0, dxbc::Src::kYYYY), dxbc::Src::R(0, dxbc::Src::kWWWW));
-      // Convert sample to pixel coordinates in the source texture to r0.xy.
-      // r0.x = X pixel position within the source texture
-      // r0.y = Y pixel position within the source texture
-      // r0.z = sample offset in the EDRAM
-      // r0.w = sample index within the source pixel
-      a.OpUShR(dxbc::Dest::R(0, 0b0011), dxbc::Src::R(0), dxbc::Src::LU(1));
+              dxbc::Src::R(1, dxbc::Src::kZZZZ),
+              dxbc::Src::R(0, dxbc::Src::kWWWW));
+      // Guest pixel per axis = ((c >> 2) << 1) | (c & 1).
+      // r1.z = u >> 2
+      a.OpUShR(dxbc::Dest::R(1, 0b0100), dxbc::Src::R(0, dxbc::Src::kXXXX),
+               dxbc::Src::LU(2));
+      // r0.x = X guest pixel position
+      a.OpBFI(dxbc::Dest::R(0, 0b0001), dxbc::Src::LU(31), dxbc::Src::LU(1),
+              dxbc::Src::R(1, dxbc::Src::kZZZZ),
+              dxbc::Src::R(0, dxbc::Src::kXXXX));
+      // r1.z = v >> 2
+      a.OpUShR(dxbc::Dest::R(1, 0b0100), dxbc::Src::R(0, dxbc::Src::kYYYY),
+               dxbc::Src::LU(2));
+      // r0.y = Y guest pixel position
+      a.OpBFI(dxbc::Dest::R(0, 0b0010), dxbc::Src::LU(31), dxbc::Src::LU(1),
+              dxbc::Src::R(1, dxbc::Src::kZZZZ),
+              dxbc::Src::R(0, dxbc::Src::kYYYY));
     } else {
       // 2x MSAA source texture sample index.
       // Extract the vertical sample index to r0.w.
       // r0.x = X pixel position within the source texture
       // r0.y = Y sample position within the source texture
       // r0.z = sample offset in the EDRAM
-      // r0.w = vertical sample index within the destination pixel
-      a.OpAnd(dxbc::Dest::R(0, 0b1000), dxbc::Src::R(0, dxbc::Src::kYYYY), dxbc::Src::LU(1));
+      // r0.w = guest vertical sample index = (u >> 1) & 1
+      a.OpUBFE(dxbc::Dest::R(0, 0b1000), dxbc::Src::LU(1), dxbc::Src::LU(1),
+               dxbc::Src::R(0, dxbc::Src::kXXXX));
+      // Guest pixel X = (u & ~2) | (v & 2).
+      // r1.z = v & 2
+      a.OpAnd(dxbc::Dest::R(1, 0b0100), dxbc::Src::R(0, dxbc::Src::kYYYY),
+              dxbc::Src::LU(2));
+      // r0.x = (u & ~2)
+      a.OpAnd(dxbc::Dest::R(0, 0b0001), dxbc::Src::R(0, dxbc::Src::kXXXX),
+              dxbc::Src::LU(~uint32_t(2)));
+      // r0.x = X guest pixel position
+      a.OpOr(dxbc::Dest::R(0, 0b0001), dxbc::Src::R(0, dxbc::Src::kXXXX),
+             dxbc::Src::R(1, dxbc::Src::kZZZZ));
+      // Guest pixel Y = ((v & ~3) >> 1) | (v & 1).
+      // r1.z = v & 1
+      a.OpAnd(dxbc::Dest::R(1, 0b0100), dxbc::Src::R(0, dxbc::Src::kYYYY),
+              dxbc::Src::LU(1));
+      // r0.y = v & ~3
+      a.OpAnd(dxbc::Dest::R(0, 0b0010), dxbc::Src::R(0, dxbc::Src::kYYYY),
+              dxbc::Src::LU(~uint32_t(3)));
+      // r0.y = (v & ~3) >> 1
+      a.OpUShR(dxbc::Dest::R(0, 0b0010), dxbc::Src::R(0, dxbc::Src::kYYYY),
+               dxbc::Src::LU(1));
+      // r0.y = Y guest pixel position
+      a.OpOr(dxbc::Dest::R(0, 0b0010), dxbc::Src::R(0, dxbc::Src::kYYYY),
+             dxbc::Src::R(1, dxbc::Src::kZZZZ));
       // Convert the 2x MSAA sample index from the guest to Direct3D 10.1+.
-      // r0.x = X pixel position within the source texture
-      // r0.y = Y sample position within the source texture
-      // r0.z = sample offset in the EDRAM
       // r0.w = sample index within the source pixel
       a.OpMovC(dxbc::Dest::R(0, 0b1000), dxbc::Src::R(0, dxbc::Src::kWWWW),
-               dxbc::Src::LU(draw_util::GetD3D10SampleIndexForGuest2xMSAA(1, msaa_2x_supported_)),
-               dxbc::Src::LU(draw_util::GetD3D10SampleIndexForGuest2xMSAA(0, msaa_2x_supported_)));
-      // Convert sample Y to pixel Y in the source texture to r0.y.
-      // r0.x = X pixel position within the source texture
-      // r0.y = Y pixel position within the source texture
-      // r0.z = sample offset in the EDRAM
-      // r0.w = sample index within the source pixel
-      a.OpUShR(dxbc::Dest::R(0, 0b0010), dxbc::Src::R(0, dxbc::Src::kYYYY), dxbc::Src::LU(1));
+               dxbc::Src::LU(draw_util::GetD3D10SampleIndexForGuest2xMSAA(
+                   1, msaa_2x_supported_)),
+               dxbc::Src::LU(draw_util::GetD3D10SampleIndexForGuest2xMSAA(
+                   0, msaa_2x_supported_)));
     }
+    if (!key.source_scale_native && layout_scaled) {
+      // Scaled source in the scaled layout. Restore the subpixel position.
+      // r0.xy = XY pixel position within the source texture
+      a.OpUMAd(dxbc::Dest::R(0, 0b0011), dxbc::Src::R(0),
+               dxbc::Src::LU(layout_scale_x, layout_scale_y, 1, 1),
+               dxbc::Src::R(1));
+    }
+    // With a native source and a scaled layout, the guest pixel position comes
+    // directly from the source texture position, and all the scaled sample
+    // slots covering one guest sample receive its value.
     // Load the source to r1.
     // r0.x = X pixel position within the source texture if stencil is needed
     // r0.y = Y pixel position within the source texture if stencil is needed
     // r0.z = sample offset in the EDRAM
     // r0.w = sample index within the source pixel if stencil is needed
     // r1 = source texel value
-    a.OpLdMS(dxbc::Dest::R(1, (1 << source_component_count) - 1), source_address_src, 0b0011,
-             dxbc::Src::T(0, 0), dxbc::Src::R(0, dxbc::Src::kWWWW));
+    a.OpLdMS(dxbc::Dest::R(1, (1 << source_component_count) - 1),
+             source_address_src, 0b0011, dxbc::Src::T(0, 0),
+             dxbc::Src::R(0, dxbc::Src::kWWWW));
     if (key.is_depth) {
       // Load the source stencil to r1.y.
       // r0.x = free
@@ -5382,10 +5680,17 @@ ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDumpPipeline(DumpPipelin
       // r0.w = free
       // r1.x = source depth value
       // r1.y = source stencil value
-      a.OpLdMS(dxbc::Dest::R(1, 0b0010), source_address_src, 0b0011, dxbc::Src::T(1, 1),
-               dxbc::Src::R(0, dxbc::Src::kWWWW));
+      a.OpLdMS(dxbc::Dest::R(1, 0b0010), source_address_src, 0b0011,
+               dxbc::Src::T(1, 1), dxbc::Src::R(0, dxbc::Src::kWWWW));
     }
   } else {
+    if (key.source_scale_native && !key.native_layout &&
+        IsDrawResolutionScaled()) {
+      // Same native source duplication as the multisampled path.
+      a.OpUDiv(dxbc::Dest::R(0, 0b0011), dxbc::Dest::Null(), dxbc::Src::R(0),
+               dxbc::Src::LU(this->draw_resolution_scale_x(),
+                             this->draw_resolution_scale_y(), 1, 1));
+    }
     // Write the LOD index (0) to the register with texture coordinates for
     // loading from the single-sampled source texture.
     // r0.x = X pixel position within the source texture
@@ -5399,8 +5704,8 @@ ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDumpPipeline(DumpPipelin
     // r0.z = sample offset in the EDRAM
     // r0.w = LOD for the texture load (zero)
     // r1 = source texel value
-    a.OpLd(dxbc::Dest::R(1, (1 << source_component_count) - 1), source_address_src, 0b1011,
-           dxbc::Src::T(0, 0));
+    a.OpLd(dxbc::Dest::R(1, (1 << source_component_count) - 1),
+           source_address_src, 0b1011, dxbc::Src::T(0, 0));
     if (key.is_depth) {
       // Load the source stencil to r1.y.
       // r0.x = free
@@ -5409,7 +5714,8 @@ ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDumpPipeline(DumpPipelin
       // r0.w = free
       // r1.x = source depth value
       // r1.y = source stencil value
-      a.OpLd(dxbc::Dest::R(1, 0b0010), source_address_src, 0b1011, dxbc::Src::T(1, 1));
+      a.OpLd(dxbc::Dest::R(1, 0b0010), source_address_src, 0b1011,
+             dxbc::Src::T(1, 1));
     }
   }
 
@@ -5424,7 +5730,8 @@ ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDumpPipeline(DumpPipelin
         // instead of black in the 4D5307E6 clear shader.
         a.OpMul(dxbc::Dest::R(1, 0b0001), dxbc::Src::R(1, dxbc::Src::kXXXX),
                 dxbc::Src::LF(float(0xFFFFFF)));
-        a.OpRoundNE(dxbc::Dest::R(1, 0b0001), dxbc::Src::R(1, dxbc::Src::kXXXX));
+        a.OpRoundNE(dxbc::Dest::R(1, 0b0001),
+                    dxbc::Src::R(1, dxbc::Src::kXXXX));
         a.OpFToU(dxbc::Dest::R(1, 0b0001), dxbc::Src::R(1, dxbc::Src::kXXXX));
         break;
       case xenos::DepthRenderTargetFormat::kD24FS8:
@@ -5433,49 +5740,57 @@ ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDumpPipeline(DumpPipelin
         // When converting the depth in pixel shaders, it's always exact,
         // truncating not to insert additional rounding instructions.
         DxbcShaderTranslator::PreClampedDepthTo20e4(
-            a, 1, 0, 1, 0, 0, 0, !depth_float24_convert_in_pixel_shader() && depth_float24_round(),
+            a, 1, 0, 1, 0, 0, 0,
+            !depth_float24_convert_in_pixel_shader() && depth_float24_round(),
             true);
         break;
     }
     // Combine 24-bit depth and stencil into r1.x.
     a.OpBFI(dxbc::Dest::R(1, 0b0001), dxbc::Src::LU(24), dxbc::Src::LU(8),
-            dxbc::Src::R(1, dxbc::Src::kXXXX), dxbc::Src::R(1, dxbc::Src::kYYYY));
+            dxbc::Src::R(1, dxbc::Src::kXXXX),
+            dxbc::Src::R(1, dxbc::Src::kYYYY));
   } else {
     switch (key.GetColorFormat()) {
-      case xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA:
-        // 8_8_8_8_GAMMA is represented by linear stored in
-        // R16G16B16A16_UNORM.
-        assert_false(source_is_uint);
-        for (uint32_t i = 0; i < 3; ++i) {
-          DxbcShaderTranslator::PreSaturatedLinearToPWLGamma(a, 1, i, 1, i, 0, 0, 0, 1);
-        }
-        a.OpMAd(dxbc::Dest::R(1), dxbc::Src::R(1), dxbc::Src::LF(255.0f), dxbc::Src::LF(0.5f));
-        a.OpFToU(dxbc::Dest::R(1), dxbc::Src::R(1));
-        for (uint32_t i = 1; i < 4; ++i) {
-          a.OpBFI(dxbc::Dest::R(1, 0b0001), dxbc::Src::LU(8), dxbc::Src::LU(i * 8),
-                  dxbc::Src::R(1).Select(i), dxbc::Src::R(1, dxbc::Src::kXXXX));
-        }
-        break;
       case xenos::ColorRenderTargetFormat::k_8_8_8_8:
         if (!source_is_uint) {
-          a.OpMAd(dxbc::Dest::R(1), dxbc::Src::R(1), dxbc::Src::LF(255.0f), dxbc::Src::LF(0.5f));
+          a.OpMAd(dxbc::Dest::R(1), dxbc::Src::R(1), dxbc::Src::LF(255.0f),
+                  dxbc::Src::LF(0.5f));
           a.OpFToU(dxbc::Dest::R(1), dxbc::Src::R(1));
         }
         for (uint32_t i = 1; i < 4; ++i) {
-          a.OpBFI(dxbc::Dest::R(1, 0b0001), dxbc::Src::LU(8), dxbc::Src::LU(i * 8),
-                  dxbc::Src::R(1).Select(i), dxbc::Src::R(1, dxbc::Src::kXXXX));
+          a.OpBFI(dxbc::Dest::R(1, 0b0001), dxbc::Src::LU(8),
+                  dxbc::Src::LU(i * 8), dxbc::Src::R(1).Select(i),
+                  dxbc::Src::R(1, dxbc::Src::kXXXX));
+        }
+        break;
+      case xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA:
+        // 8_8_8_8_GAMMA is represented by linear stored in R16G16B16A16_UNORM.
+        assert_false(source_is_uint);
+        for (uint32_t i = 0; i < 3; ++i) {
+          DxbcShaderTranslator::PreSaturatedLinearToPWLGamma(a, 1, i, 1, i, 0,
+                                                             0, 0, 1);
+        }
+        a.OpMAd(dxbc::Dest::R(1), dxbc::Src::R(1), dxbc::Src::LF(255.0f),
+                dxbc::Src::LF(0.5f));
+        a.OpFToU(dxbc::Dest::R(1), dxbc::Src::R(1));
+        for (uint32_t i = 1; i < 4; ++i) {
+          a.OpBFI(dxbc::Dest::R(1, 0b0001), dxbc::Src::LU(8),
+                  dxbc::Src::LU(i * 8), dxbc::Src::R(1).Select(i),
+                  dxbc::Src::R(1, dxbc::Src::kXXXX));
         }
         break;
       case xenos::ColorRenderTargetFormat::k_2_10_10_10:
       case xenos::ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10:
         if (!source_is_uint) {
-          a.OpMAd(dxbc::Dest::R(1), dxbc::Src::R(1), dxbc::Src::LF(1023.0f, 1023.0f, 1023.0f, 3.0f),
+          a.OpMAd(dxbc::Dest::R(1), dxbc::Src::R(1),
+                  dxbc::Src::LF(1023.0f, 1023.0f, 1023.0f, 3.0f),
                   dxbc::Src::LF(0.5f));
           a.OpFToU(dxbc::Dest::R(1), dxbc::Src::R(1));
         }
         for (uint32_t i = 1; i < 4; ++i) {
-          a.OpBFI(dxbc::Dest::R(1, 0b0001), dxbc::Src::LU(i == 3 ? 2 : 10), dxbc::Src::LU(i * 10),
-                  dxbc::Src::R(1).Select(i), dxbc::Src::R(1, dxbc::Src::kXXXX));
+          a.OpBFI(dxbc::Dest::R(1, 0b0001), dxbc::Src::LU(i == 3 ? 2 : 10),
+                  dxbc::Src::LU(i * 10), dxbc::Src::R(1).Select(i),
+                  dxbc::Src::R(1, dxbc::Src::kXXXX));
         }
         break;
       case xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT:
@@ -5490,22 +5805,26 @@ ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDumpPipeline(DumpPipelin
           // as an internal temporary, then insert them into the result in
           // r1.x.
           DxbcShaderTranslator::UnclampedFloat32To7e3(a, 0, 0, 1, i, 0, 1);
-          a.OpBFI(dxbc::Dest::R(1, 0b0001), dxbc::Src::LU(10), dxbc::Src::LU(i * 10),
-                  dxbc::Src::R(0, dxbc::Src::kXXXX), dxbc::Src::R(1, dxbc::Src::kXXXX));
+          a.OpBFI(dxbc::Dest::R(1, 0b0001), dxbc::Src::LU(10),
+                  dxbc::Src::LU(i * 10), dxbc::Src::R(0, dxbc::Src::kXXXX),
+                  dxbc::Src::R(1, dxbc::Src::kXXXX));
         }
         // Alpha - saturate and convert.
-        a.OpMov(dxbc::Dest::R(1, 0b1000), dxbc::Src::R(1, dxbc::Src::kWWWW), true);
-        a.OpMAd(dxbc::Dest::R(1, 0b1000), dxbc::Src::R(1, dxbc::Src::kWWWW), dxbc::Src::LF(3.0f),
-                dxbc::Src::LF(0.5f));
+        a.OpMov(dxbc::Dest::R(1, 0b1000), dxbc::Src::R(1, dxbc::Src::kWWWW),
+                true);
+        a.OpMAd(dxbc::Dest::R(1, 0b1000), dxbc::Src::R(1, dxbc::Src::kWWWW),
+                dxbc::Src::LF(3.0f), dxbc::Src::LF(0.5f));
         a.OpFToU(dxbc::Dest::R(1, 0b1000), dxbc::Src::R(1, dxbc::Src::kWWWW));
         a.OpBFI(dxbc::Dest::R(1, 0b0001), dxbc::Src::LU(2), dxbc::Src::LU(30),
-                dxbc::Src::R(1, dxbc::Src::kWWWW), dxbc::Src::R(1, dxbc::Src::kXXXX));
+                dxbc::Src::R(1, dxbc::Src::kWWWW),
+                dxbc::Src::R(1, dxbc::Src::kXXXX));
         break;
       case xenos::ColorRenderTargetFormat::k_16_16:
       case xenos::ColorRenderTargetFormat::k_16_16_FLOAT:
         assert_true(source_is_uint);
         a.OpBFI(dxbc::Dest::R(1, 0b0001), dxbc::Src::LU(16), dxbc::Src::LU(16),
-                dxbc::Src::R(1, dxbc::Src::kYYYY), dxbc::Src::R(1, dxbc::Src::kXXXX));
+                dxbc::Src::R(1, dxbc::Src::kYYYY),
+                dxbc::Src::R(1, dxbc::Src::kXXXX));
         break;
       case xenos::ColorRenderTargetFormat::k_16_16_16_16:
       case xenos::ColorRenderTargetFormat::k_16_16_16_16_FLOAT:
@@ -5522,53 +5841,62 @@ ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDumpPipeline(DumpPipelin
   }
 
   // Write the sample to the destination address stored in r0.z.
-  a.OpStoreUAVTyped(dxbc::Dest::U(0, 0), dxbc::Src::R(0, dxbc::Src::kZZZZ), 1,
-                    dxbc::Src::R(1, format_is_64bpp ? 0b0100 : dxbc::Src::kXXXX));
+  a.OpStoreRaw(dxbc::Dest::U(0, 0, format_is_64bpp ? 0b0011 : 0b0001),
+               dxbc::Src::R(0, dxbc::Src::kZZZZ), dxbc::Src::R(1));
 
   a.OpRet();
 
   // Write the shader program length in dwords.
-  built_shader_[shex_position_dwords + 1] = uint32_t(built_shader_.size()) - shex_position_dwords;
+  built_shader_[shex_position_dwords + 1] =
+      uint32_t(built_shader_.size()) - shex_position_dwords;
 
   {
-    auto& blob_header =
-        *reinterpret_cast<dxbc::BlobHeader*>(built_shader_.data() + blob_position_dwords);
+    auto& blob_header = *reinterpret_cast<dxbc::BlobHeader*>(
+        built_shader_.data() + blob_position_dwords);
     blob_header.fourcc = dxbc::BlobHeader::FourCC::kShaderEx;
     blob_position_dwords = uint32_t(built_shader_.size());
-    blob_header.size_bytes = (blob_position_dwords - kBlobHeaderSizeDwords) * sizeof(uint32_t) -
-                             built_shader_[blob_offset_position_dwords++];
+    blob_header.size_bytes =
+        (blob_position_dwords - kBlobHeaderSizeDwords) * sizeof(uint32_t) -
+        built_shader_[blob_offset_position_dwords++];
   }
 
   // ***************************************************************************
   // Statistics
   // ***************************************************************************
 
-  built_shader_[blob_offset_position_dwords] = uint32_t(blob_position_dwords * sizeof(uint32_t));
+  built_shader_[blob_offset_position_dwords] =
+      uint32_t(blob_position_dwords * sizeof(uint32_t));
   uint32_t stat_position_dwords = blob_position_dwords + kBlobHeaderSizeDwords;
-  built_shader_.resize(stat_position_dwords + sizeof(dxbc::Statistics) / sizeof(uint32_t));
-  std::memcpy(built_shader_.data() + stat_position_dwords, &stat, sizeof(dxbc::Statistics));
+  built_shader_.resize(stat_position_dwords +
+                       sizeof(dxbc::Statistics) / sizeof(uint32_t));
+  std::memcpy(built_shader_.data() + stat_position_dwords, &stat,
+              sizeof(dxbc::Statistics));
   {
-    auto& blob_header =
-        *reinterpret_cast<dxbc::BlobHeader*>(built_shader_.data() + blob_position_dwords);
+    auto& blob_header = *reinterpret_cast<dxbc::BlobHeader*>(
+        built_shader_.data() + blob_position_dwords);
     blob_header.fourcc = dxbc::BlobHeader::FourCC::kStatistics;
     blob_position_dwords = uint32_t(built_shader_.size());
-    blob_header.size_bytes = (blob_position_dwords - kBlobHeaderSizeDwords) * sizeof(uint32_t) -
-                             built_shader_[blob_offset_position_dwords++];
+    blob_header.size_bytes =
+        (blob_position_dwords - kBlobHeaderSizeDwords) * sizeof(uint32_t) -
+        built_shader_[blob_offset_position_dwords++];
   }
 
   // ***************************************************************************
   // Container header
   // ***************************************************************************
 
-  uint32_t built_shader_size_bytes = uint32_t(built_shader_.size() * sizeof(uint32_t));
+  uint32_t built_shader_size_bytes =
+      uint32_t(built_shader_.size() * sizeof(uint32_t));
   {
-    auto& container_header = *reinterpret_cast<dxbc::ContainerHeader*>(built_shader_.data());
+    auto& container_header =
+        *reinterpret_cast<dxbc::ContainerHeader*>(built_shader_.data());
     container_header.InitializeIdentification();
     container_header.size_bytes = built_shader_size_bytes;
     container_header.blob_count = kBlobCount;
-    CalculateDXBCChecksum(reinterpret_cast<unsigned char*>(built_shader_.data()),
-                          static_cast<unsigned int>(built_shader_size_bytes),
-                          reinterpret_cast<unsigned int*>(&container_header.hash));
+    CalculateDXBCChecksum(
+        reinterpret_cast<unsigned char*>(built_shader_.data()),
+        static_cast<unsigned int>(built_shader_size_bytes),
+        reinterpret_cast<unsigned int*>(&container_header.hash));
   }
 
   // ***************************************************************************
@@ -5578,12 +5906,14 @@ ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDumpPipeline(DumpPipelin
       command_processor_.GetD3D12Provider().GetDevice(), built_shader_.data(),
       built_shader_size_bytes,
       key.is_depth ? dump_root_signature_depth_ : dump_root_signature_color_);
-  const char* format_name = key.is_depth
-                                ? xenos::GetDepthRenderTargetFormatName(key.GetDepthFormat())
-                                : xenos::GetColorRenderTargetFormatName(key.GetColorFormat());
+  const char* format_name =
+      key.is_depth
+          ? xenos::GetDepthRenderTargetFormatName(key.GetDepthFormat())
+          : xenos::GetColorRenderTargetFormatName(key.GetColorFormat());
   if (pipeline) {
-    std::u16string pipeline_name = rex::string::to_utf16(
-        fmt::format("RT Dump {} {}xMSAA", format_name, uint32_t(1) << uint32_t(key.msaa_samples)));
+    std::u16string pipeline_name =
+        rex::string::to_utf16(fmt::format("RT Dump {} {}xMSAA", format_name,
+                                 uint32_t(1) << uint32_t(key.msaa_samples)));
     pipeline->SetName(reinterpret_cast<LPCWSTR>(pipeline_name.c_str()));
   } else {
     REXGPU_ERROR(
