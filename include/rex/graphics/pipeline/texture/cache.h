@@ -542,7 +542,7 @@ class TextureCache {
   // shader to restore guest integer units from normalized host samples.
   static uint32_t GetIntegerScaleBits(xenos::TextureFormat guest_format,
                                       uint32_t num_format,
-                                      uint32_t host_swizzle,
+                                      uint32_t guest_swizzle,
                                       uint8_t swizzled_signs);
   // Writes the texture data (for base, mips or both - but not neither) from the
   // shared memory or the scaled resolve memory. The shared memory management is
