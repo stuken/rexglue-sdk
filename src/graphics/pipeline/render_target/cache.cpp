@@ -41,6 +41,17 @@ REXCVAR_DEFINE_BOOL(direct_host_resolve, true, "GPU",
                     "Resolve from host render targets directly to shared memory when possible")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_UINT32(
+    draw_resolution_scale_threshold, 0, "GPU",
+    "Surface pitch in pixels at or below render targets skip being upscaled "
+    "by draw_resolution_scale_x/y. 0 disables it.\n"
+    "Small offscreen surfaces like bloom or depth of field buffers often "
+    "break when upscaled and keeping them native avoids that. The pitch "
+    "is compared after alignment to 80 pixel EDRAM tiles, so prefer "
+    "conservative values, only as high as the broken effects need.\n"
+    "Host render targets only.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 namespace rex::graphics {
 
 void RenderTargetCache::GetPSIColorFormatInfo(xenos::ColorRenderTargetFormat format,
@@ -338,6 +349,18 @@ void RenderTargetCache::InitializeCommon() {
   ownership_ranges_.emplace(std::piecewise_construct, std::forward_as_tuple(uint32_t(0)),
                             std::forward_as_tuple(xenos::kEdramTileCount, RenderTargetKey(),
                                                   RenderTargetKey(), RenderTargetKey()));
+
+  if (REXCVAR_GET(draw_resolution_scale_threshold)) {
+    if (GetPath() != Path::kHostRenderTargets) {
+      REXGPU_WARN(
+          "draw_resolution_scale_threshold is only supported by the host "
+          "render target path - ignoring");
+    } else if (!IsDrawResolutionScaled()) {
+      REXGPU_WARN(
+          "draw_resolution_scale_threshold has no effect without "
+          "draw_resolution_scale_x/y above 1 - ignoring");
+    }
+  }
 }
 
 void RenderTargetCache::DestroyAllRenderTargets(bool shutting_down) {
@@ -397,6 +420,50 @@ void RenderTargetCache::BeginFrame() {
   ResetAccumulatedRenderTargets();
 }
 
+bool RenderTargetCache::IsScaleNativeForPitch(
+    uint32_t pitch_tiles_at_32bpp, xenos::MsaaSamples msaa_samples) const {
+  uint32_t threshold = REXCVAR_GET(draw_resolution_scale_threshold);
+  if (!threshold || !IsDrawResolutionScaled() ||
+      GetPath() != Path::kHostRenderTargets) {
+    return false;
+  }
+  uint32_t pitch_pixels_tile_aligned =
+      RenderTargetKey::GetWidth(pitch_tiles_at_32bpp, msaa_samples);
+  return pitch_pixels_tile_aligned != 0 &&
+         pitch_pixels_tile_aligned <= threshold;
+}
+
+bool RenderTargetCache::IsDrawScaleNative() const {
+  auto rb_surface_info = register_file().Get<reg::RB_SURFACE_INFO>();
+  uint32_t msaa_samples_x_log2 =
+      uint32_t(rb_surface_info.msaa_samples >= xenos::MsaaSamples::k4X);
+  uint32_t pitch_tiles_at_32bpp =
+      ((rb_surface_info.surface_pitch << msaa_samples_x_log2) +
+       (xenos::kEdramTileWidthSamples - 1)) /
+      xenos::kEdramTileWidthSamples;
+  return IsScaleNativeForPitch(pitch_tiles_at_32bpp,
+                               rb_surface_info.msaa_samples);
+}
+
+bool RenderTargetCache::IsResolveSourceNativeOnly(
+    uint32_t base, uint32_t row_length, uint32_t rows, uint32_t pitch) const {
+  if (!IsDrawResolutionScaled() || GetPath() != Path::kHostRenderTargets) {
+    return false;
+  }
+  std::vector<ResolveCopyDumpRectangle> rectangles;
+  GetResolveCopyRectanglesToDump(base, row_length, rows, pitch, rectangles);
+  if (rectangles.empty()) {
+    return false;
+  }
+  for (const ResolveCopyDumpRectangle& rectangle : rectangles) {
+    assert_not_null(rectangle.render_target);
+    if (!rectangle.render_target->key().scale_native) {
+      return false;
+    }
+  }
+  return true;
+}
+
 bool RenderTargetCache::Update(bool is_rasterization_done,
                                reg::RB_DEPTHCONTROL normalized_depth_control,
                                uint32_t normalized_color_mask, const Shader& vertex_shader) {
@@ -430,10 +497,12 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
   uint32_t pitch_tiles_at_32bpp =
       ((pitch_pixels << msaa_samples_x_log2) + (xenos::kEdramTileWidthSamples - 1)) /
       xenos::kEdramTileWidthSamples;
+  // Scale class of all the surfaces of this draw.
+  bool scale_native = IsScaleNativeForPitch(pitch_tiles_at_32bpp, msaa_samples);
   if (!interlock_barrier_only) {
     uint32_t pitch_pixels_tile_aligned_scaled =
         pitch_tiles_at_32bpp * (xenos::kEdramTileWidthSamples >> msaa_samples_x_log2) *
-        draw_resolution_scale_x();
+        (scale_native ? 1 : draw_resolution_scale_x());
     uint32_t max_render_target_width = GetMaxRenderTargetWidth();
     if (pitch_pixels_tile_aligned_scaled > max_render_target_width) {
       // TODO(Triang3l): If really needed for some game on some device, clamp
@@ -639,6 +708,7 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
     rt_key.msaa_samples = msaa_samples;
     rt_key.is_depth = rt_bit_index == 0;
     rt_key.resource_format = resource_formats[rt_bit_index];
+    rt_key.scale_native = uint32_t(scale_native);
     if (!interlock_barrier_only) {
       RenderTarget* render_target = GetOrCreateRenderTarget(rt_key);
       if (!render_target) {
