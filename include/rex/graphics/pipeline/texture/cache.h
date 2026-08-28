@@ -594,6 +594,14 @@ class TextureCache {
   // Checks if there are any pages that contain scaled resolve data within the
   // range.
   bool IsRangeScaledResolved(uint32_t start_unscaled, uint32_t length_unscaled);
+  // Whether the mips of a scaled resolve texture must be generated on the host
+  // (the guest did not resolve them into scaled memory itself).
+  bool ScaledResolveMipsNeedGeneration(const Texture& texture) {
+    const TextureKey& key = texture.key();
+    return key.scaled_resolve && key.mip_max_level != 0 &&
+           !IsRangeScaledResolved(key.mip_page << 12,
+                                  texture.GetGuestMipsSize());
+  }
   // Global shared memory invalidation callback for invalidating scaled resolved
   // texture data.
   static void ScaledResolveGlobalWatchCallbackThunk(
