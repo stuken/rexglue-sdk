@@ -3841,6 +3841,13 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
     uint32_t texture_signs_mask = uint32_t(0b11111111) << texture_signs_shift;
     dirty |= (texture_signs_uint & texture_signs_mask) != texture_signs_shifted;
     texture_signs_uint = (texture_signs_uint & ~texture_signs_mask) | texture_signs_shifted;
+    // cache misses here, we're accessing the texture bindings out of order
+    uint32_t texture_integer_scale_bits =
+        texture_cache_->GetActiveIntegerScaleBits(texture_index);
+    dirty |= system_constants_.texture_integer_scale_bits[texture_index] !=
+             texture_integer_scale_bits;
+    system_constants_.texture_integer_scale_bits[texture_index] =
+        texture_integer_scale_bits;
     textures_resolution_scaled |=
         uint32_t(texture_cache_->IsActiveTextureResolutionScaled(texture_index)) << texture_index;
   }

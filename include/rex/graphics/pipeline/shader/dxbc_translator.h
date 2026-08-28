@@ -401,6 +401,14 @@ class DxbcShaderTranslator : public ShaderTranslator {
     // The constant blend factor for the respective modes.
     float edram_blend_constant[4];
 
+    // Integer num_format on fixed textures. Each dword packs the scale needed
+    // to turn normalized host samples back into guest integer values.
+    // bits 0:3 = component_bits - 1
+    // bit 4 = signed
+    // bit 5 = unsigned-biased
+    // Zero means no scale.
+    uint32_t texture_integer_scale_bits[32];
+
    private:
     friend class DxbcShaderTranslator;
 
@@ -452,6 +460,8 @@ class DxbcShaderTranslator : public ShaderTranslator {
       kEdramRTBlendFactorsOps,
 
       kEdramBlendConstant,
+
+      kTextureIntegerScaleBits,
 
       kCount,
     };

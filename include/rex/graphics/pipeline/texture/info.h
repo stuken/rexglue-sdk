@@ -126,6 +126,12 @@ struct FormatInfo {
   uint32_t block_width;
   uint32_t block_height;
   uint32_t bits_per_pixel;
+  // Widths of the individual fixed-point components for integer num_format
+  // fetches (0 if a component doesn't have a meaningful fixed width or the
+  // format isn't a plain fixed-point arrangement). fixed specifies whether the
+  // format consists of such fixed components at all.
+  const uint8_t component_bits[4];
+  const bool fixed;
 
   uint32_t bytes_per_block() const { return block_width * block_height * bits_per_pixel / 8; }
 
