@@ -45,6 +45,22 @@ REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
 REXCVAR_DEFINE_BOOL(occlusion_query_enable, true, "GPU", "Enable host occlusion query handling")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_STRING(occlusion_query, "fake", "GPU",
+                      "Controls hardware occlusion query behavior for EVENT_WRITE_ZPD.\n"
+                      "Used for effects like lens flares, object culling, and auto-exposure.\n"
+                      " fake: Write a fake result without asking the GPU. Safe for most games,\n"
+                      "       though some effects may look slightly wrong. (default)\n"
+                      " fast: Ask the GPU but don't wait for the answer. Writes a cached\n"
+                      "       result immediately and updates it when the GPU catches up.\n"
+                      "       Cached results bias toward visible when guessing.\n"
+                      " fast-alt: Variant of fast mode that keeps cached zero results for\n"
+                      "           unresolved reports. May improve effects relying on precise\n"
+                      "           visibility, but may be less stable for occlusion culling.\n"
+                      " strict: Ask the GPU and wait for the real result before continuing.\n"
+                      "         Most accurate, but may be somewhat less performant.")
+    .allowed({"fake", "fast", "fast-alt", "strict"})
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_STRING(readback_resolve, "none", "GPU",
                       "Controls CPU readback of render-to-texture resolve results.\n"
                       " none: Disable readback (default)\n"
@@ -72,6 +88,34 @@ REXCVAR_DEFINE_BOOL(readback_memexport_fast, true, "GPU",
 REXCVAR_DEFINE_INT32(query_occlusion_fake_sample_count, 1000, "GPU",
                      "Fake sample count for occlusion queries")
     .range(1, 100000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_INT32(occlusion_query_fake_lower_threshold, 80, "GPU",
+                     "Lower end of the fake sample count value written on "
+                     "EVENT_WRITE_ZPD when real occlusion queries are disabled.\n"
+                     "-1 writes nothing, resulting in some games that sit and hang.\n"
+                     "0 means the fake result stays fully occluded.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(occlusion_query_fake_upper_threshold, 100, "GPU",
+                     "Upper end of the fake sample count value written on "
+                     "EVENT_WRITE_ZPD when real occlusion queries are disabled.\n"
+                     "Keep this higher than occlusion_query_fake_lower_threshold.\n"
+                     "Ignored if occlusion_query_fake_lower_threshold is -1.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(occlusion_query_querybatch_range, 0, "GPU",
+                     "Range of fake sample count values to walk for titles using the "
+                     "D3D QueryBatch standard before wrapping back to "
+                     "occlusion_query_fake_lower_threshold.\n"
+                     "This shouldn't be changed from the default value of 0 (disabled) "
+                     "unless necessary for a specific title.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(occlusion_query_saturation, 1.0, "GPU",
+                      "Compress higher occlusion query sample counts before guest writeback.\n"
+                      "This can be useful if effects such as lens flares appear too strong.\n"
+                      "1.0 = default behavior\n"
+                      "0.0 = collapse all nonzero sample counts to 1\n"
+                      "Values around 0.90 are a good starting point for subtle tuning.")
+    .range(0.0, 1.0)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(async_shader_compilation, true, "GPU",
