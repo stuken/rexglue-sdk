@@ -1273,4 +1273,14 @@ ResolveCopyShaderIndex ResolveInfo::GetCopyShader(uint32_t draw_resolution_scale
   return shader;
 }
 
+uint32_t GetResolveDownscalePixelSizeLog2(
+    reg::RB_COPY_DEST_INFO copy_dest_info) {
+  // copy_dest_format holds a xenos::TextureFormat normalized by
+  // GetResolveInfo, and this is the same size derivation that was used for
+  // the destination extent calculation there.
+  const FormatInfo& dest_format_info = *FormatInfo::Get(
+      xenos::TextureFormat(uint32_t(copy_dest_info.copy_dest_format)));
+  return rex::log2_floor(dest_format_info.bits_per_pixel >> 3);
+}
+
 }  // namespace rex::graphics::draw_util

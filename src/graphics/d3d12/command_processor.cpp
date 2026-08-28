@@ -2864,8 +2864,9 @@ bool D3D12CommandProcessor::IssueCopy() {
 
 bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
   uint32_t written_address, written_length;
+  reg::RB_COPY_DEST_INFO copy_dest_info;
   if (!render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_, written_address,
-                                     written_length)) {
+                                     written_length, &copy_dest_info)) {
     return false;
   }
 
@@ -2922,7 +2923,6 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
       return true;
     }
 
-    reg::RB_COPY_DEST_INFO copy_dest_info = register_file_->Get<reg::RB_COPY_DEST_INFO>();
     const FormatInfo* format_info = FormatInfo::Get(uint32_t(copy_dest_info.copy_dest_format));
     uint32_t bits_per_pixel = format_info->bits_per_pixel;
     if (bits_per_pixel != 8 && bits_per_pixel != 16 && bits_per_pixel != 32 &&

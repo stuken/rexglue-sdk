@@ -77,7 +77,9 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   // frame for calling.
   bool Resolve(const memory::Memory& memory, D3D12SharedMemory& shared_memory,
                D3D12TextureCache& texture_cache, uint32_t& written_address_out,
-               uint32_t& written_length_out);
+               uint32_t& written_length_out,
+               reg::RB_COPY_DEST_INFO* copy_dest_info_out = nullptr,
+               bool* written_scaled_out = nullptr);
 
   // For host render targets.
 

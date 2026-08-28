@@ -1161,9 +1161,17 @@ void D3D12RenderTargetCache::WriteEdramUintPow2UAVDescriptor(D3D12_CPU_DESCRIPTO
 
 bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMemory& shared_memory,
                                      D3D12TextureCache& texture_cache,
-                                     uint32_t& written_address_out, uint32_t& written_length_out) {
+                                     uint32_t& written_address_out, uint32_t& written_length_out,
+                                     reg::RB_COPY_DEST_INFO* copy_dest_info_out,
+                                     bool* written_scaled_out) {
   written_address_out = 0;
   written_length_out = 0;
+  if (copy_dest_info_out) {
+    *copy_dest_info_out = reg::RB_COPY_DEST_INFO();
+  }
+  if (written_scaled_out) {
+    *written_scaled_out = false;
+  }
 
   bool draw_resolution_scaled = IsDrawResolutionScaled();
 
@@ -1314,6 +1322,17 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
                                             resolve_info.copy_dest_extent_length);
           written_address_out = resolve_info.copy_dest_extent_start;
           written_length_out = resolve_info.copy_dest_extent_length;
+          if (copy_dest_info_out) {
+            // The destination format in it is normalized by GetResolveInfo to
+            // the xenos::TextureFormat actually used for the copy (in
+            // particular, the depth format instead of the raw guest-specified
+            // one for depth copies) - the same value the destination extent
+            // was calculated for.
+            *copy_dest_info_out = resolve_info.copy_dest_info;
+          }
+          if (written_scaled_out) {
+            *written_scaled_out = draw_resolution_scaled;
+          }
           copied = true;
         }
       } else {

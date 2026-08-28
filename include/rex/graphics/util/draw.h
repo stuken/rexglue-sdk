@@ -551,6 +551,13 @@ struct ResolveInfo {
                                        uint32_t& group_count_x_out,
                                        uint32_t& group_count_y_out) const;
 
+  // Returns log2 of the resolve copy destination texel size in bytes for the
+  // destination info previously returned by a render target cache Resolve (with
+  // the format already normalized to the actual xenos::TextureFormat) - the same
+  // derivation the destination extent was calculated with in GetResolveInfo.
+  friend uint32_t GetResolveDownscalePixelSizeLog2(
+      reg::RB_COPY_DEST_INFO copy_dest_info);
+
   bool IsClearingDepth() const { return rb_copy_control.depth_clear_enable != 0; }
 
   bool IsClearingColor() const {
