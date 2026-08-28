@@ -2342,6 +2342,16 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   }
 
   reg::RB_DEPTHCONTROL normalized_depth_control = draw_util::GetNormalizedDepthControl(regs);
+  uint32_t normalized_color_mask =
+      pixel_shader ? draw_util::GetNormalizedColorMask(regs, pixel_shader->writes_color_targets())
+                   : 0;
+  draw_util::HostDepthPolygonOffset host_depth_polygon_offset;
+  bool apply_host_depth_polygon_offset =
+      pixel_shader && !pixel_shader->writes_depth() &&
+      render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets &&
+      draw_util::GetHostDepthPolygonOffsetIfNeeded(
+          regs, primitive_polygonal, normalized_depth_control, normalized_color_mask,
+          host_depth_polygon_offset);
 
   // Shader modifications.
   uint32_t ps_param_gen_pos = UINT32_MAX;
@@ -2357,13 +2367,11 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   DxbcShaderTranslator::Modification pixel_shader_modification =
       pixel_shader
           ? pipeline_cache_->GetCurrentPixelShaderModification(
-                *pixel_shader, interpolator_mask, ps_param_gen_pos, normalized_depth_control)
+                *pixel_shader, interpolator_mask, ps_param_gen_pos, normalized_depth_control,
+                apply_host_depth_polygon_offset)
           : DxbcShaderTranslator::Modification(0);
 
   // Set up the render targets - this may perform dispatches and draws.
-  uint32_t normalized_color_mask =
-      pixel_shader ? draw_util::GetNormalizedColorMask(regs, pixel_shader->writes_color_targets())
-                   : 0;
   if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
                                     normalized_color_mask, *vertex_shader)) {
     return false;
@@ -2394,7 +2402,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   ID3D12RootSignature* root_signature;
   if (!pipeline_cache_->ConfigurePipeline(
           vertex_shader_translation, pixel_shader_translation, primitive_processing_result,
-          normalized_depth_control, normalized_color_mask, bound_depth_and_color_render_target_bits,
+          normalized_depth_control, normalized_color_mask, apply_host_depth_polygon_offset,
+          bound_depth_and_color_render_target_bits,
           bound_depth_and_color_render_target_formats, &pipeline_handle, &root_signature)) {
     return false;
   }
@@ -2467,7 +2476,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   UpdateSystemConstantValues(memexport_used, primitive_polygonal,
                              primitive_processing_result.line_loop_closing_index,
                              primitive_processing_result.host_shader_index_endian, viewport_info,
-                             used_texture_mask, normalized_depth_control, normalized_color_mask);
+                             used_texture_mask, normalized_depth_control, normalized_color_mask,
+                             apply_host_depth_polygon_offset ? &host_depth_polygon_offset : nullptr);
 
   // Update constant buffers, descriptors and root parameters.
   if (!UpdateBindings(vertex_shader, pixel_shader, root_signature, memexport_used)) {
@@ -3586,7 +3596,8 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
     bool shared_memory_is_uav, bool primitive_polygonal, uint32_t line_loop_closing_index,
     xenos::Endian index_endian, const draw_util::ViewportInfo& viewport_info,
     uint32_t used_texture_mask, reg::RB_DEPTHCONTROL normalized_depth_control,
-    uint32_t normalized_color_mask) {
+    uint32_t normalized_color_mask,
+    const draw_util::HostDepthPolygonOffset* host_depth_polygon_offset) {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
@@ -3852,6 +3863,24 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
       rb_colorcontrol.alpha_to_mask_enable ? (rb_colorcontrol.value >> 24) | (1 << 8) : 0;
   dirty |= system_constants_.alpha_to_mask != alpha_to_mask;
   system_constants_.alpha_to_mask = alpha_to_mask;
+
+  // Shader depth polygon offset for host render target decal draws (nullptr
+  // for pixel shader interlock, which is also where fixed-function offset
+  // isn't used).
+  if (host_depth_polygon_offset) {
+    draw_util::HostDepthPolygonOffset polygon_offset = *host_depth_polygon_offset;
+    float scale_factor = float(std::max(draw_resolution_scale_x, draw_resolution_scale_y));
+    polygon_offset.front_scale *= scale_factor;
+    polygon_offset.back_scale *= scale_factor;
+    dirty |= system_constants_.edram_poly_offset_front_scale != polygon_offset.front_scale;
+    system_constants_.edram_poly_offset_front_scale = polygon_offset.front_scale;
+    dirty |= system_constants_.edram_poly_offset_front_offset != polygon_offset.front_offset;
+    system_constants_.edram_poly_offset_front_offset = polygon_offset.front_offset;
+    dirty |= system_constants_.edram_poly_offset_back_scale != polygon_offset.back_scale;
+    system_constants_.edram_poly_offset_back_scale = polygon_offset.back_scale;
+    dirty |= system_constants_.edram_poly_offset_back_offset != polygon_offset.back_offset;
+    system_constants_.edram_poly_offset_back_offset = polygon_offset.back_offset;
+  }
 
   uint32_t edram_tile_dwords_scaled = xenos::kEdramTileWidthSamples *
                                       xenos::kEdramTileHeightSamples *

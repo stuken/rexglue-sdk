@@ -229,6 +229,22 @@ inline bool DoesCoverageDependOnAlpha(reg::RB_COLORCONTROL rb_colorcontrol) {
          rb_colorcontrol.alpha_to_mask_enable;
 }
 
+struct HostDepthPolygonOffset {
+  float front_scale = 0.0f;
+  float front_offset = 0.0f;
+  float back_scale = 0.0f;
+  float back_offset = 0.0f;
+};
+
+// Detects a narrow type of coplanar redraws that tend to Z-fight when the depth
+// bias is applied via host fixed function polygon offset, like static decals in
+// UE3 and Halo engine titles. Host space offsets are computed so that the depth
+// bias is applied via shader depth output instead.
+bool GetHostDepthPolygonOffsetIfNeeded(
+    const RegisterFile& regs, bool primitive_polygonal,
+    reg::RB_DEPTHCONTROL normalized_depth_control,
+    uint32_t normalized_color_mask, HostDepthPolygonOffset& polygon_offset_out);
+
 // Whether the pixel shader can be disabled on the host to speed up depth
 // pre-passes and shadowmaps. The shader must have its ucode analyzed. If
 // IsRasterizationPotentiallyDone, this shouldn't be called, and assumed false
