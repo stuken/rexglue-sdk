@@ -2506,28 +2506,97 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToROV() {
           // Need to do min/max for color.
           a_.OpElse();
           {
-            // Extract the color min (0) or max (1) bit to temp.x
-            // temp.x = whether min or max should be used for color.
-            a_.OpAnd(temp_x_dest, rt_blend_factors_ops_src, dxbc::Src::LU(1 << 5));
-            // Check if need to do min or max for color.
-            // temp.x = free.
+            // Note: Unlike Vulkan/D3D12 fixed-function blend which ignores
+            // factors for MIN/MAX, the Xbox 360 applies blend factors before
+            // min/max.
+            uint32_t blend_src_temp = PushSystemTemp();
+            dxbc::Dest blend_src_temp_rgb_dest(dxbc::Dest::R(blend_src_temp, 0b0111));
+            dxbc::Src blend_src_temp_src(dxbc::Src::R(blend_src_temp));
+
+            // Apply source color factor for min/max.
+            // Extract the source color factor to temp.x.
+            a_.OpAnd(temp_x_dest, rt_blend_factors_ops_src, dxbc::Src::LU((1 << 5) - 1));
             a_.OpIf(true, temp_x_src);
             {
-              // Choose max of the colors without applying the factors to
-              // color_temp.xyz.
-              // color_temp.xyz = blended color.
-              a_.OpMax(color_temp_rgb_dest, dxbc::Src::R(system_temps_color_[i]), color_temp_src);
+              a_.OpSwitch(temp_x_src);
+              ROV_HandleColorBlendFactorCases(system_temps_color_[i], color_temp, blend_src_temp);
+              a_.OpEndSwitch();
+              // Check if fixed-point and needs clamping.
+              a_.OpAnd(temp_x_dest, rt_format_flags_src,
+                       dxbc::Src::LU(RenderTargetCache::kPSIColorFormatFlag_FixedPointColor));
+              a_.OpIf(true, temp_x_src);
+              {
+                a_.OpMax(blend_src_temp_rgb_dest, blend_src_temp_src, rt_clamp_vec_src.Select(0));
+                a_.OpMin(blend_src_temp_rgb_dest, blend_src_temp_src, rt_clamp_vec_src.Select(2));
+              }
+              a_.OpEndIf();
+              // Multiply source by factor.
+              a_.OpMul(blend_src_temp_rgb_dest, dxbc::Src::R(system_temps_color_[i]),
+                       blend_src_temp_src);
+              // Clamp result if fixed-point.
+              a_.OpIf(true, temp_x_src);
+              {
+                a_.OpMax(blend_src_temp_rgb_dest, blend_src_temp_src, rt_clamp_vec_src.Select(0));
+                a_.OpMin(blend_src_temp_rgb_dest, blend_src_temp_src, rt_clamp_vec_src.Select(2));
+              }
+              a_.OpEndIf();
             }
-            // Need to do min.
+            a_.OpElse();
+            { a_.OpMov(blend_src_temp_rgb_dest, dxbc::Src::LF(0.0f)); }
+            a_.OpEndIf();
+
+            // Apply destination color factor for min/max.
+            uint32_t blend_dest_temp = PushSystemTemp();
+            dxbc::Dest blend_dest_temp_rgb_dest(dxbc::Dest::R(blend_dest_temp, 0b0111));
+            dxbc::Src blend_dest_temp_src(dxbc::Src::R(blend_dest_temp));
+
+            // Extract the destination color factor to temp.x.
+            a_.OpUBFE(temp_x_dest, dxbc::Src::LU(5), dxbc::Src::LU(8), rt_blend_factors_ops_src);
+            a_.OpIf(true, temp_x_src);
+            {
+              a_.OpSwitch(temp_x_src);
+              ROV_HandleColorBlendFactorCases(system_temps_color_[i], color_temp, blend_dest_temp);
+              a_.OpEndSwitch();
+              // Check if fixed-point and needs clamping.
+              a_.OpAnd(temp_x_dest, rt_format_flags_src,
+                       dxbc::Src::LU(RenderTargetCache::kPSIColorFormatFlag_FixedPointColor));
+              a_.OpIf(true, temp_x_src);
+              {
+                a_.OpMax(blend_dest_temp_rgb_dest, blend_dest_temp_src, rt_clamp_vec_src.Select(0));
+                a_.OpMin(blend_dest_temp_rgb_dest, blend_dest_temp_src, rt_clamp_vec_src.Select(2));
+              }
+              a_.OpEndIf();
+              // Multiply destination by factor.
+              a_.OpMul(blend_dest_temp_rgb_dest, color_temp_src, blend_dest_temp_src);
+              // Clamp result if fixed-point.
+              a_.OpIf(true, temp_x_src);
+              {
+                a_.OpMax(blend_dest_temp_rgb_dest, blend_dest_temp_src, rt_clamp_vec_src.Select(0));
+                a_.OpMin(blend_dest_temp_rgb_dest, blend_dest_temp_src, rt_clamp_vec_src.Select(2));
+              }
+              a_.OpEndIf();
+            }
+            a_.OpElse();
+            { a_.OpMov(blend_dest_temp_rgb_dest, dxbc::Src::LF(0.0f)); }
+            a_.OpEndIf();
+
+            // Now do min or max on the factored values.
+            // Extract the color min (0) or max (1) bit to temp.x.
+            a_.OpAnd(temp_x_dest, rt_blend_factors_ops_src, dxbc::Src::LU(1 << 5));
+            a_.OpIf(true, temp_x_src);
+            {
+              // MAX: color_temp.xyz = max(src * srcFactor, dst * dstFactor)
+              a_.OpMax(color_temp_rgb_dest, blend_src_temp_src, blend_dest_temp_src);
+            }
             a_.OpElse();
             {
-              // Choose min of the colors without applying the factors to
-              // color_temp.xyz.
-              // color_temp.xyz = blended color.
-              a_.OpMin(color_temp_rgb_dest, dxbc::Src::R(system_temps_color_[i]), color_temp_src);
+              // MIN: color_temp.xyz = min(src * srcFactor, dst * dstFactor)
+              a_.OpMin(color_temp_rgb_dest, blend_src_temp_src, blend_dest_temp_src);
             }
-            // Close the min or max check.
             a_.OpEndIf();
+
+            PopSystemTemp();  // blend_dest_temp
+            PopSystemTemp();  // blend_src_temp
           }
           // Close the color factor blending or min/max check.
           a_.OpEndIf();
@@ -2687,29 +2756,92 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToROV() {
           // Need to do min/max for alpha.
           a_.OpElse();
           {
-            // Extract the alpha min (0) or max (1) bit to temp.x.
-            // temp.x = whether min or max should be used for alpha.
-            a_.OpAnd(temp_x_dest, rt_blend_factors_ops_src, dxbc::Src::LU(1 << 21));
-            // Check if need to do min or max for alpha.
-            // temp.x = free.
+            // Note: Unlike Vulkan/D3D12 fixed-function blend which ignores
+            // factors for MIN/MAX, the Xbox 360 applies blend factors before
+            // min/max.
+            // We'll use temp.x for source alpha (factored) and temp.y for
+            // destination alpha (factored).
+
+            // Apply source alpha factor for min/max.
+            // Extract the source alpha factor to temp.x (bits 16-20).
+            a_.OpUBFE(temp_x_dest, dxbc::Src::LU(5), dxbc::Src::LU(16), rt_blend_factors_ops_src);
             a_.OpIf(true, temp_x_src);
             {
-              // Choose max of the alphas without applying the factors to
-              // color_temp.w.
-              // color_temp.w = blended alpha.
-              a_.OpMax(color_temp_a_dest, dxbc::Src::R(system_temps_color_[i], dxbc::Src::kWWWW),
-                       color_temp_a_src);
+              a_.OpSwitch(temp_x_src);
+              ROV_HandleAlphaBlendFactorCases(system_temps_color_[i], color_temp, temp, 0);
+              a_.OpEndSwitch();
+              // Check if fixed-point and needs clamping.
+              uint32_t alpha_is_fixed_temp = PushSystemTemp();
+              a_.OpAnd(dxbc::Dest::R(alpha_is_fixed_temp, 0b0001), rt_format_flags_src,
+                       dxbc::Src::LU(RenderTargetCache::kPSIColorFormatFlag_FixedPointAlpha));
+              a_.OpIf(true, dxbc::Src::R(alpha_is_fixed_temp, dxbc::Src::kXXXX));
+              {
+                a_.OpMax(temp_x_dest, temp_x_src, rt_clamp_vec_src.Select(1));
+                a_.OpMin(temp_x_dest, temp_x_src, rt_clamp_vec_src.Select(3));
+              }
+              a_.OpEndIf();
+              // Multiply source alpha by factor.
+              a_.OpMul(temp_x_dest, dxbc::Src::R(system_temps_color_[i], dxbc::Src::kWWWW),
+                       temp_x_src);
+              // Clamp result if fixed-point.
+              a_.OpIf(true, dxbc::Src::R(alpha_is_fixed_temp, dxbc::Src::kXXXX));
+              PopSystemTemp();  // alpha_is_fixed_temp
+              {
+                a_.OpMax(temp_x_dest, temp_x_src, rt_clamp_vec_src.Select(1));
+                a_.OpMin(temp_x_dest, temp_x_src, rt_clamp_vec_src.Select(3));
+              }
+              a_.OpEndIf();
             }
-            // Need to do min.
+            a_.OpElse();
+            { a_.OpMov(temp_x_dest, dxbc::Src::LF(0.0f)); }
+            a_.OpEndIf();
+
+            // Apply destination alpha factor for min/max.
+            // Extract the destination alpha factor to temp.y (bits 24-28).
+            a_.OpUBFE(temp_y_dest, dxbc::Src::LU(5), dxbc::Src::LU(24), rt_blend_factors_ops_src);
+            a_.OpIf(true, temp_y_src);
+            {
+              a_.OpSwitch(temp_y_src);
+              ROV_HandleAlphaBlendFactorCases(system_temps_color_[i], color_temp, temp, 1);
+              a_.OpEndSwitch();
+              // Check if fixed-point and needs clamping.
+              uint32_t alpha_is_fixed_temp2 = PushSystemTemp();
+              a_.OpAnd(dxbc::Dest::R(alpha_is_fixed_temp2, 0b0001), rt_format_flags_src,
+                       dxbc::Src::LU(RenderTargetCache::kPSIColorFormatFlag_FixedPointAlpha));
+              a_.OpIf(true, dxbc::Src::R(alpha_is_fixed_temp2, dxbc::Src::kXXXX));
+              {
+                a_.OpMax(temp_y_dest, temp_y_src, rt_clamp_vec_src.Select(1));
+                a_.OpMin(temp_y_dest, temp_y_src, rt_clamp_vec_src.Select(3));
+              }
+              a_.OpEndIf();
+              // Multiply destination alpha by factor.
+              a_.OpMul(temp_y_dest, color_temp_a_src, temp_y_src);
+              // Clamp result if fixed-point.
+              a_.OpIf(true, dxbc::Src::R(alpha_is_fixed_temp2, dxbc::Src::kXXXX));
+              PopSystemTemp();  // alpha_is_fixed_temp2
+              {
+                a_.OpMax(temp_y_dest, temp_y_src, rt_clamp_vec_src.Select(1));
+                a_.OpMin(temp_y_dest, temp_y_src, rt_clamp_vec_src.Select(3));
+              }
+              a_.OpEndIf();
+            }
+            a_.OpElse();
+            { a_.OpMov(temp_y_dest, dxbc::Src::LF(0.0f)); }
+            a_.OpEndIf();
+
+            // Now do min or max on the factored alpha values.
+            // Extract the alpha min (0) or max (1) bit to color_temp.w.
+            a_.OpAnd(color_temp_a_dest, rt_blend_factors_ops_src, dxbc::Src::LU(1 << 21));
+            a_.OpIf(true, color_temp_a_src);
+            {
+              // MAX: color_temp.w = max(src * srcFactor, dst * dstFactor)
+              a_.OpMax(color_temp_a_dest, temp_x_src, temp_y_src);
+            }
             a_.OpElse();
             {
-              // Choose min of the alphas without applying the factors to
-              // color_temp.w.
-              // color_temp.w = blended alpha.
-              a_.OpMin(color_temp_a_dest, dxbc::Src::R(system_temps_color_[i], dxbc::Src::kWWWW),
-                       color_temp_a_src);
+              // MIN: color_temp.w = min(src * srcFactor, dst * dstFactor)
+              a_.OpMin(color_temp_a_dest, temp_x_src, temp_y_src);
             }
-            // Close the min or max check.
             a_.OpEndIf();
           }
           // Close the alpha factor blending or min/max check.
