@@ -1414,10 +1414,9 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
   }
   // TODO(Triang3l): Use a single 512 MB shared memory binding if possible.
   // TODO(Triang3l): Scaled resolve buffer bindings.
-  // Aligning because if the data for a vector in a storage buffer is provided
-  // partially, the value read may still be (0, 0, 0, 0), and small (especially
-  // linear) textures won't be loaded correctly.
-  uint32_t source_length_alignment = UINT32_C(1) << load_shader_info.source_bpe_log2;
+  // Align (primarily the last row of linear textures) because shaders use up
+  // to 16-byte loads for multiple blocks at once.
+  uint32_t source_length_alignment = UINT32_C(16);
   VkDescriptorSet descriptor_set_source_base = VK_NULL_HANDLE;
   VkDescriptorSet descriptor_set_source_mips = VK_NULL_HANDLE;
   VkDescriptorBufferInfo write_descriptor_set_source_base_buffer_info;
@@ -1433,8 +1432,7 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
     uint64_t source_base_range;
     if (texture_key.scaled_resolve) {
       if (!GetScaledResolveRange(source_base_start_unscaled, vulkan_texture.GetGuestBaseSize(),
-                                 load_shader_info.source_bpe_log2, source_base_start,
-                                 source_base_range)) {
+                                 4, source_base_start, source_base_range)) {
         return false;
       }
       write_descriptor_set_source_base_buffer_info.buffer = scaled_resolve_buffer_;
@@ -1473,8 +1471,7 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
     uint64_t source_mips_range;
     if (texture_key.scaled_resolve) {
       if (!GetScaledResolveRange(source_mips_start_unscaled, vulkan_texture.GetGuestMipsSize(),
-                                 load_shader_info.source_bpe_log2, source_mips_start,
-                                 source_mips_range)) {
+                                 4, source_mips_start, source_mips_range)) {
         return false;
       }
       write_descriptor_set_source_mips_buffer_info.buffer = scaled_resolve_buffer_;

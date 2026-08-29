@@ -174,6 +174,7 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   };
   ID3D12DescriptorHeap* edram_buffer_descriptor_heap_ = nullptr;
   D3D12_CPU_DESCRIPTOR_HANDLE edram_buffer_descriptor_heap_start_;
+  D3D12_GPU_VIRTUAL_ADDRESS edram_buffer_gpu_address_ = 0;
 
   // Resolve copying root signature and pipelines.
   // Parameter 0 - draw_util::ResolveCopyShaderConstants or its ::DestRelative.

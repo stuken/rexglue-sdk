@@ -1198,10 +1198,10 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
       if (draw_resolution_scaled) {
         if (!texture_cache.GetScaledResolveRange(
                 resolve_info.copy_dest_base, copy_dest_range_unscaled,
-                copy_shader_info.dest_bpe_log2, copy_dest_base, copy_dest_range_length) ||
+                2, copy_dest_base, copy_dest_range_length) ||
             !texture_cache.GetScaledResolveRange(
                 resolve_info.copy_dest_extent_start, resolve_info.copy_dest_extent_length,
-                copy_shader_info.dest_bpe_log2, copy_dest_use_start, copy_dest_use_length)) {
+                2, copy_dest_use_start, copy_dest_use_length)) {
           REXGPU_ERROR(
               "VulkanRenderTargetCache: Failed to map scaled resolve "
               "destination range (base={:08X}, length={:08X})",
@@ -1214,7 +1214,7 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
       bool copy_dest_committed;
       if (draw_resolution_scaled) {
         copy_dest_committed = texture_cache.CommitScaledResolveRange(
-            resolve_info.copy_dest_base, copy_dest_range_unscaled, copy_shader_info.dest_bpe_log2);
+            resolve_info.copy_dest_base, copy_dest_range_unscaled, 2);
       } else {
         copy_dest_committed = shared_memory.RequestRange(resolve_info.copy_dest_extent_start,
                                                          resolve_info.copy_dest_extent_length);
