@@ -1199,11 +1199,11 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
     // If everything owning the source is native, copy at 1x1 into shared
     // memory.
     bool copy_native = false;
+    uint32_t dump_base = 0;
+    uint32_t dump_row_length_used = 0;
+    uint32_t dump_rows = 0;
+    uint32_t dump_pitch = 0;
     if (GetPath() == Path::kHostRenderTargets) {
-      uint32_t dump_base;
-      uint32_t dump_row_length_used;
-      uint32_t dump_rows;
-      uint32_t dump_pitch;
       resolve_info.GetCopyEdramTileSpan(dump_base, dump_row_length_used, dump_rows, dump_pitch);
       copy_native =
           IsResolveSourceNativeOnly(dump_base, dump_row_length_used, dump_rows, dump_pitch);
@@ -1229,8 +1229,8 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
       // Native copies write to shared memory at 1x1 - the direct path targets
       // the scaled resolve buffer, so only use it for scaled copies.
       bool direct_resolved = false;
-      if (GetPath() == Path::kHostRenderTargets && !copy_native) {
-        if (REXCVAR_GET(direct_host_resolve)) {
+      if (GetPath() == Path::kHostRenderTargets) {
+        if (!copy_native && REXCVAR_GET(direct_host_resolve)) {
           direct_resolved =
               TryResolveCopyDirectly(resolve_info, copy_shader, draw_resolution_scaled);
           if (direct_resolved) {
@@ -1241,12 +1241,10 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
         }
         if (!direct_resolved) {
           // Dump the current contents of the render targets owning the affected
-          // range to edram_buffer_.
-          uint32_t dump_base;
-          uint32_t dump_row_length_used;
-          uint32_t dump_rows;
-          uint32_t dump_pitch;
-          resolve_info.GetCopyEdramTileSpan(dump_base, dump_row_length_used, dump_rows, dump_pitch);
+          // range to edram_buffer_. This is required for native copies as well -
+          // the native copy shader reads edram_buffer_ directly, and in the host
+          // render target path its contents are stale unless dumped from the
+          // host render targets here.
           if (!DumpRenderTargets(dump_base, dump_row_length_used, dump_rows, dump_pitch,
                                  copy_native)) {
             REXGPU_ERROR("D3D12RenderTargetCache: Failed to dump host render targets for resolve");

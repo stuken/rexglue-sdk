@@ -1153,18 +1153,39 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
   // Copying.
   bool copied = false;
   if (resolve_info.copy_dest_extent_length) {
+    // If everything owning the source is native, copy at 1x1 into shared
+    // memory.
+    bool copy_native = false;
+    uint32_t dump_base = 0;
+    uint32_t dump_row_length_used = 0;
+    uint32_t dump_rows = 0;
+    uint32_t dump_pitch = 0;
+    if (GetPath() == Path::kHostRenderTargets) {
+      resolve_info.GetCopyEdramTileSpan(dump_base, dump_row_length_used, dump_rows, dump_pitch);
+      copy_native =
+          IsResolveSourceNativeOnly(dump_base, dump_row_length_used, dump_rows, dump_pitch);
+      if (copy_native) {
+        // Redo the resolve info at 1x1 so the scale-dependent fields match
+        // what the unscaled copy shaders expect.
+        if (!draw_util::GetResolveInfo(register_file(), memory, 1, 1,
+                                       IsFixedRG16TruncatedToMinus1To1(),
+                                       IsFixedRGBA16TruncatedToMinus1To1(), resolve_info)) {
+          return false;
+        }
+      }
+    }
     draw_util::ResolveCopyShaderConstants copy_shader_constants;
     uint32_t copy_group_count_x, copy_group_count_y;
-    draw_util::ResolveCopyShaderIndex copy_shader =
-        resolve_info.GetCopyShader(draw_resolution_scale_x(), draw_resolution_scale_y(),
-                                   copy_shader_constants, copy_group_count_x, copy_group_count_y);
+    draw_util::ResolveCopyShaderIndex copy_shader = resolve_info.GetCopyShader(
+        copy_native ? 1 : draw_resolution_scale_x(), copy_native ? 1 : draw_resolution_scale_y(),
+        copy_shader_constants, copy_group_count_x, copy_group_count_y);
     assert_true(copy_group_count_x && copy_group_count_y);
     if (copy_shader != draw_util::ResolveCopyShaderIndex::kUnknown) {
       const draw_util::ResolveCopyShaderInfo& copy_shader_info =
           draw_util::resolve_copy_shader_info[size_t(copy_shader)];
       bool direct_resolved = false;
       if (GetPath() == Path::kHostRenderTargets) {
-        if (REXCVAR_GET(direct_host_resolve)) {
+        if (!copy_native && REXCVAR_GET(direct_host_resolve)) {
           direct_resolved =
               TryResolveCopyDirectly(resolve_info, copy_shader, draw_resolution_scaled);
           if (direct_resolved) {
@@ -1175,21 +1196,18 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
         }
         if (!direct_resolved) {
           // Dump the current contents of the render targets owning the affected
-          // range to edram_buffer_.
-          uint32_t dump_base;
-          uint32_t dump_row_length_used;
-          uint32_t dump_rows;
-          uint32_t dump_pitch;
-          resolve_info.GetCopyEdramTileSpan(dump_base, dump_row_length_used, dump_rows, dump_pitch);
-          // scale_native is always 0 on Vulkan (no per-draw native-class
-          // resolve copies), so the dump always uses the scaled layout.
+          // range to edram_buffer_. This is required for native copies as well -
+          // the native copy shader reads edram_buffer_ directly.
           if (!DumpRenderTargets(dump_base, dump_row_length_used, dump_rows, dump_pitch,
-                                 false)) {
+                                 copy_native)) {
             REXGPU_ERROR("VulkanRenderTargetCache: Failed to dump host render targets for resolve");
             return false;
           }
         }
       }
+      // Whether the data goes to the scaled resolve address space rather than
+      // shared memory (native resolves due to a scale threshold don't).
+      const bool copy_dest_scaled = draw_resolution_scaled && !copy_native;
 
       uint32_t copy_dest_range_unscaled = resolve_info.copy_dest_extent_start -
                                           resolve_info.copy_dest_base +
@@ -1198,7 +1216,7 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
       uint64_t copy_dest_range_length = copy_dest_range_unscaled;
       uint64_t copy_dest_use_start = resolve_info.copy_dest_extent_start;
       uint64_t copy_dest_use_length = resolve_info.copy_dest_extent_length;
-      if (draw_resolution_scaled) {
+      if (copy_dest_scaled) {
         if (!texture_cache.GetScaledResolveRange(
                 resolve_info.copy_dest_base, copy_dest_range_unscaled,
                 2, copy_dest_base, copy_dest_range_length) ||
@@ -1215,7 +1233,7 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
 
       // Make sure there is memory to write to.
       bool copy_dest_committed;
-      if (draw_resolution_scaled) {
+      if (copy_dest_scaled) {
         copy_dest_committed = texture_cache.CommitScaledResolveRange(
             resolve_info.copy_dest_base, copy_dest_range_unscaled, 2);
       } else {
@@ -1235,7 +1253,7 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
         // with resolution scaling on.
         const bool use_persistent_dest =
             texture_cache.shared_memory_persistent_descriptor_set() != VK_NULL_HANDLE &&
-            !draw_resolution_scaled;
+            !copy_dest_scaled;
         VkDescriptorSet descriptor_set_dest =
             use_persistent_dest
                 ? texture_cache.shared_memory_persistent_descriptor_set()
@@ -1245,7 +1263,7 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
         if (descriptor_set_dest != VK_NULL_HANDLE) {
           // Write the destination descriptor.
           VkDescriptorBufferInfo write_descriptor_set_dest_buffer_info;
-          write_descriptor_set_dest_buffer_info.buffer = draw_resolution_scaled
+          write_descriptor_set_dest_buffer_info.buffer = copy_dest_scaled
                                                              ? texture_cache.scaled_resolve_buffer()
                                                              : shared_memory.buffer();
           write_descriptor_set_dest_buffer_info.offset = copy_dest_base;
@@ -1266,7 +1284,7 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
           }
 
           // Submit the resolve.
-          if (draw_resolution_scaled) {
+          if (copy_dest_scaled) {
             texture_cache.UseScaledResolveBufferForWrite(copy_dest_use_start, copy_dest_use_length);
           } else {
             shared_memory.Use(VulkanSharedMemory::Usage::kComputeWrite,
@@ -1282,7 +1300,7 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
           command_buffer.CmdVkBindDescriptorSets(
               VK_PIPELINE_BIND_POINT_COMPUTE, resolve_copy_pipeline_layout_, 0,
               uint32_t(rex::countof(descriptor_sets)), descriptor_sets, 0, nullptr);
-          if (draw_resolution_scaled) {
+          if (copy_dest_scaled) {
             command_buffer.CmdVkPushConstants(
                 resolve_copy_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                 sizeof(copy_shader_constants.dest_relative), &copy_shader_constants.dest_relative);
@@ -1301,9 +1319,13 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
           command_processor_.SubmitBarriers(true);
           command_buffer.CmdVkDispatch(copy_group_count_x, copy_group_count_y, 1);
 
-          // Invalidate textures and mark the range as scaled if needed.
+          // Invalidate textures and mark the range as scaled if needed -
+          // only if that's where the data actually went (native resolves due
+          // to a scale threshold, and unscaled draws, write to shared memory
+          // at 1x).
           texture_cache.MarkRangeAsResolved(resolve_info.copy_dest_extent_start,
-                                            resolve_info.copy_dest_extent_length, true);
+                                            resolve_info.copy_dest_extent_length,
+                                            copy_dest_scaled);
           written_address_out = resolve_info.copy_dest_extent_start;
           written_length_out = resolve_info.copy_dest_extent_length;
           copied = true;
