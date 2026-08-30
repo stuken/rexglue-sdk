@@ -5936,9 +5936,11 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
           stencil_ref_mask_back_reg = XE_GPU_REG_RB_STENCILREFMASK_BF;
         } else {
           // Choose the back face values only if drawing only back faces.
-          stencil_ref_mask_front_reg = regs.Get<reg::PA_SU_SC_MODE_CNTL>().cull_front
-                                           ? XE_GPU_REG_RB_STENCILREFMASK_BF
-                                           : XE_GPU_REG_RB_STENCILREFMASK;
+          auto pa_su_sc_mode_cntl = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
+          stencil_ref_mask_front_reg =
+              (pa_su_sc_mode_cntl.cull_front && !pa_su_sc_mode_cntl.cull_back)
+                  ? XE_GPU_REG_RB_STENCILREFMASK_BF
+                  : XE_GPU_REG_RB_STENCILREFMASK;
           stencil_ref_mask_back_reg = stencil_ref_mask_front_reg;
         }
       } else {
