@@ -26,6 +26,15 @@ namespace rex::graphics {
 
 class SpirvShaderTranslator : public ShaderTranslator {
  public:
+
+  // Static versions usable outside the translator (host-generated transfer and
+  // dump shaders), with the builder and the GLSL std 450 ext instruction
+  // passed explicitly. Unless pre_saturated is true, inputs are clamped to
+  // [0, 1] (NaN to 0).
+  static spv::Id PWLGammaToLinear(SpirvBuilder* builder_, spv::Id value, bool pre_saturated,
+                                  spv::Id ext_inst_glsl_std_450);
+  static spv::Id LinearToPWLGamma(SpirvBuilder* builder_, spv::Id value, bool pre_saturated,
+                                  spv::Id ext_inst_glsl_std_450);
   union Modification {
     // If anything in this is structure is changed in a way not compatible with
     // the previous layout, invalidate the pipeline storages by increasing this
