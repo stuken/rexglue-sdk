@@ -14,6 +14,7 @@
 #include <cstring>
 #include <sstream>
 #include <utility>
+#include <vector>
 
 #include <rex/assert.h>
 #include <rex/cvar.h>
@@ -3133,6 +3134,33 @@ void D3D12CommandProcessor::LogDeviceRemovalDiagnostics(ID3D12Device* device, HR
   REXGPU_ERROR("D3D12 device removed: HRESULT 0x{:08X} - {}", static_cast<unsigned>(reason),
                reason_str);
 
+  // Drain the debug layer / GPU-based validation message queue - otherwise the
+  // errors that explain the removal are never reported anywhere.
+  {
+    Microsoft::WRL::ComPtr<ID3D12InfoQueue> info_queue;
+    if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&info_queue)))) {
+      uint64_t message_count = info_queue->GetNumStoredMessages();
+      if (message_count == 0) {
+        REXGPU_ERROR("D3D12 debug layer: no messages queued at device removal");
+      }
+      for (uint64_t i = 0; i < message_count; ++i) {
+        SIZE_T message_size = 0;
+        if (FAILED(info_queue->GetMessageA(i, nullptr, &message_size)) || message_size == 0) {
+          continue;
+        }
+        std::vector<uint8_t> message_bytes(message_size);
+        auto* message = reinterpret_cast<D3D12_MESSAGE*>(message_bytes.data());
+        if (SUCCEEDED(info_queue->GetMessageA(i, message, &message_size))) {
+          REXGPU_ERROR("D3D12 [{}] [{}] [{}] [{}]", uint32_t(message->Category),
+                       uint32_t(message->Severity), uint32_t(message->ID),
+                       message->pDescription ? message->pDescription : "");
+        }
+      }
+    } else {
+      REXGPU_ERROR("D3D12 debug layer info queue not available (ID3D12InfoQueryInterface failed)");
+    }
+  }
+
   Microsoft::WRL::ComPtr<ID3D12DeviceRemovedExtendedData> dred;
   if (FAILED(device->QueryInterface(IID_PPV_ARGS(&dred)))) {
     return;
@@ -3161,6 +3189,18 @@ void D3D12CommandProcessor::LogDeviceRemovalDiagnostics(ID3D12Device* device, HR
   D3D12_DRED_PAGE_FAULT_OUTPUT page_fault = {};
   if (SUCCEEDED(dred->GetPageFaultAllocationOutput(&page_fault)) && page_fault.PageFaultVA != 0) {
     REXGPU_ERROR("DRED page fault at VA 0x{:016X}", page_fault.PageFaultVA);
+    for (const D3D12_DRED_ALLOCATION_NODE* node = page_fault.pHeadExistingAllocationNode; node;
+         node = node->pNext) {
+      REXGPU_ERROR("DRED page fault existing allocation: {} (type {})",
+                   node->ObjectNameA ? node->ObjectNameA : "(unnamed)",
+                   uint32_t(node->AllocationType));
+    }
+    for (const D3D12_DRED_ALLOCATION_NODE* node = page_fault.pHeadRecentFreedAllocationNode; node;
+         node = node->pNext) {
+      REXGPU_ERROR("DRED page fault recently freed allocation: {} (type {})",
+                   node->ObjectNameA ? node->ObjectNameA : "(unnamed)",
+                   uint32_t(node->AllocationType));
+    }
   }
 }
 

@@ -41,6 +41,7 @@ REXCVAR_DECLARE(std::string, resolution);
 #if REX_HAS_D3D12
 REXCVAR_DECLARE(bool, d3d12_debug);
 REXCVAR_DECLARE(bool, d3d12_break_on_error);
+REXCVAR_DECLARE(bool, d3d12_gpu_based_validation);
 REXCVAR_DECLARE(bool, d3d12_break_on_warning);
 REXCVAR_DECLARE(int32_t, d3d12_adapter);
 REXCVAR_DECLARE(int32_t, d3d12_queue_priority);

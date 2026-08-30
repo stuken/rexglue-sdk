@@ -26,6 +26,12 @@ REXCVAR_DEFINE_BOOL(d3d12_debug, false, "UI/D3D12", "Enable Direct3D 12 and DXGI
 REXCVAR_DEFINE_BOOL(d3d12_break_on_error, false, "UI/D3D12",
                     "Break on Direct3D 12 validation errors");
 
+REXCVAR_DEFINE_BOOL(d3d12_gpu_based_validation, false, "UI/D3D12",
+                    "Enable Direct3D 12 GPU-based validation (slow, catches "
+                    "out-of-bounds and malformed resource access at the GPU "
+                    "level)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
 REXCVAR_DEFINE_BOOL(d3d12_break_on_warning, false, "UI/D3D12",
                     "Break on Direct3D 12 validation warnings");
 
@@ -217,11 +223,20 @@ bool D3D12Provider::Initialize() {
   }
 
   // Enable the debug layer.
-  bool debug = REXCVAR_GET(d3d12_debug);
+  bool debug = REXCVAR_GET(d3d12_debug) || REXCVAR_GET(d3d12_gpu_based_validation);
   if (debug) {
     ID3D12Debug* debug_interface;
     if (SUCCEEDED(pfn_d3d12_get_debug_interface_(IID_PPV_ARGS(&debug_interface)))) {
       debug_interface->EnableDebugLayer();
+      if (REXCVAR_GET(d3d12_gpu_based_validation)) {
+        Microsoft::WRL::ComPtr<ID3D12Debug1> debug_interface1;
+        if (SUCCEEDED(debug_interface->QueryInterface(IID_PPV_ARGS(&debug_interface1)))) {
+          debug_interface1->SetEnableGPUBasedValidation(TRUE);
+          REXLOG_INFO("Direct3D 12 GPU-based validation enabled");
+        } else {
+          REXLOG_WARN("Failed to enable Direct3D 12 GPU-based validation");
+        }
+      }
       debug_interface->Release();
     } else {
       REXLOG_WARN("Failed to enable the Direct3D 12 debug layer");
