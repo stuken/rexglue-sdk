@@ -1868,6 +1868,9 @@ bool VulkanCommandProcessor::SetupContext() {
 
   // Just not to expose uninitialized memory.
   std::memset(&system_constants_, 0, sizeof(system_constants_));
+  // ZPD FSI counter uses UINT32_MAX as its skip sentinel outside query draws.
+  system_constants_.zpd_fsi_counter_index = UINT32_MAX;
+  zpd_fsi_counter_index_force_update_ = true;
 
   return true;
 }
@@ -4785,10 +4788,10 @@ bool VulkanCommandProcessor::IsZPDQueryPoolReady() const {
   if (!zpd_query_pool_needs_fsi_counter_) {
     return true;
   }
-  // TODO: The SPIR-V translator does not accumulate FSI counter samples yet,
-  // so ROV titles fall back to the fake path until the FSI counter index
-  // system constant and the shader-side accumulation land.
-  return false;
+  VkDeviceSize fsi_counter_range = sizeof(uint32_t) * zpd_host_query_pool_->capacity();
+  return zpd_host_query_pool_->fsi_initialized() &&
+         zpd_fsi_counter_descriptor_buffer_ == zpd_host_query_pool_->fsi_counter_buffer() &&
+         zpd_fsi_counter_descriptor_range_ == fsi_counter_range;
 }
 
 bool VulkanCommandProcessor::CanOpenZPDQuery() const {
@@ -6521,6 +6524,19 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
         system_constants_.edram_blend_constant[3] != regs.Get<float>(XE_GPU_REG_RB_BLEND_ALPHA);
     system_constants_.edram_blend_constant[3] = regs.Get<float>(XE_GPU_REG_RB_BLEND_ALPHA);
   }
+
+  // FSI ZPD counter.
+  uint32_t zpd_fsi_counter_index = UINT32_MAX;
+  if (render_target_cache_ &&
+      render_target_cache_->GetPath() == RenderTargetCache::Path::kPixelShaderInterlock &&
+      zpd_active_query_index_ != UINT32_MAX && zpd_active_query_is_fsi_ && zpd_host_query_pool_ &&
+      zpd_host_query_pool_->fsi_initialized()) {
+    zpd_fsi_counter_index = zpd_active_query_index_;
+  }
+  dirty |= zpd_fsi_counter_index_force_update_ ||
+           system_constants_.zpd_fsi_counter_index != zpd_fsi_counter_index;
+  system_constants_.zpd_fsi_counter_index = zpd_fsi_counter_index;
+  zpd_fsi_counter_index_force_update_ = false;
 
   if (dirty) {
     current_constant_buffers_up_to_date_ &=

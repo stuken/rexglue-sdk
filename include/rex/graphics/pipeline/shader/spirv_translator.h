@@ -308,6 +308,10 @@ class SpirvShaderTranslator : public ShaderTranslator {
     // The constant blend factor for the respective modes.
     float edram_blend_constant[4];
 
+    // Index of the ZPD FSI counter slot for the currently open query segment,
+    // UINT32_MAX if no segment is open.
+    uint32_t zpd_fsi_counter_index;
+
     // Tessellation helper shader constants.
     uint32_t vertex_index_min;
     uint32_t vertex_index_max;
@@ -727,6 +731,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // Updates main_fsi_sample_mask_. Must be called outside non-uniform control
   // flow because of taking derivatives of the fragment depth.
   void FSI_DepthStencilTest(spv::Id msaa_samples, bool sample_mask_potentially_narrowed_previouly);
+  void FSI_AddPassedMSAASamplesToZPD();
   // Returns the first and the second 32 bits as two uints.
   std::array<spv::Id, 2> FSI_ClampAndPackColor(spv::Id color_float4, spv::Id format_with_flags);
   std::array<spv::Id, 4> FSI_UnpackColor(std::array<spv::Id, 2> color_packed,
@@ -885,6 +890,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
     kSystemConstantEdramRTKeepMask,
     kSystemConstantEdramRTClamp,
     kSystemConstantEdramBlendConstant,
+    kSystemConstantZpdFsiCounterIndex,
   };
   spv::Id uniform_system_constants_;
   spv::Id uniform_float_constants_;
@@ -893,6 +899,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
 
   spv::Id buffers_shared_memory_;
   spv::Id buffer_edram_;
+  spv::Id buffer_zpd_fsi_counter_;
 
   // Not using combined images and samplers because
   // maxPerStageDescriptorSamplers is often lower than
