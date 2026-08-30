@@ -2138,6 +2138,13 @@ void VulkanCommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
                                                   6);
     }
     InvalidateVertexBufferResidency((index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0) / 2);
+  } else if ((index >= XE_GPU_REG_PA_CL_UCP_0_X && index <= XE_GPU_REG_PA_CL_UCP_5_W) ||
+             index == XE_GPU_REG_PA_CL_CLIP_CNTL) {
+    // User clip planes are packed into the system constants on Vulkan - keep
+    // the bound system constant buffer stale until the next draw re-uploads
+    // them.
+    current_constant_buffers_up_to_date_ &=
+        ~(UINT32_C(1) << SpirvShaderTranslator::kConstantBufferSystem);
   }
 }
 
