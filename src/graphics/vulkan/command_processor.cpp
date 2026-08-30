@@ -1835,11 +1835,20 @@ bool VulkanCommandProcessor::SetupContext() {
 
   VkPipelineLayoutCreateInfo resolve_downscale_layout_create_info = {};
   resolve_downscale_layout_create_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-  VkDescriptorSetLayout resolve_downscale_set_layout =
+  // The downscale compute shader takes the source and the destination as two
+  // separate storage buffer descriptor sets (set 0 and set 1, binding 0 in
+  // each), not two bindings of a single set - a pipeline layout that doesn't
+  // cover the shader's set 1 makes vkCreateComputePipelines undefined (AMDVLK
+  // crashes in its shader compiler instead of returning an error).
+  VkDescriptorSetLayout resolve_downscale_set_layouts[] = {
       descriptor_set_layouts_single_transient_[size_t(
-          SingleTransientDescriptorLayout::kStorageBufferPairCompute)];
-  resolve_downscale_layout_create_info.setLayoutCount = 1;
-  resolve_downscale_layout_create_info.pSetLayouts = &resolve_downscale_set_layout;
+          SingleTransientDescriptorLayout::kStorageBufferCompute)],
+      descriptor_set_layouts_single_transient_[size_t(
+          SingleTransientDescriptorLayout::kStorageBufferCompute)],
+  };
+  resolve_downscale_layout_create_info.setLayoutCount =
+      uint32_t(rex::countof(resolve_downscale_set_layouts));
+  resolve_downscale_layout_create_info.pSetLayouts = resolve_downscale_set_layouts;
   VkPushConstantRange resolve_downscale_push_constant_range = {};
   resolve_downscale_push_constant_range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
   resolve_downscale_push_constant_range.offset = 0;
@@ -4558,9 +4567,11 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
       return true;
     }
 
-    VkDescriptorSet descriptor_set = AllocateSingleTransientDescriptor(
-        SingleTransientDescriptorLayout::kStorageBufferPairCompute);
-    if (descriptor_set == VK_NULL_HANDLE) {
+    VkDescriptorSet descriptor_sets[2] = {
+        AllocateSingleTransientDescriptor(SingleTransientDescriptorLayout::kStorageBufferCompute),
+        AllocateSingleTransientDescriptor(SingleTransientDescriptorLayout::kStorageBufferCompute),
+    };
+    if (descriptor_sets[0] == VK_NULL_HANDLE || descriptor_sets[1] == VK_NULL_HANDLE) {
       return true;
     }
 
@@ -4575,8 +4586,8 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
     VkWriteDescriptorSet descriptor_writes[2] = {};
     for (uint32_t i = 0; i < 2; ++i) {
       descriptor_writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-      descriptor_writes[i].dstSet = descriptor_set;
-      descriptor_writes[i].dstBinding = i;
+      descriptor_writes[i].dstSet = descriptor_sets[i];
+      descriptor_writes[i].dstBinding = 0;
       descriptor_writes[i].descriptorCount = 1;
       descriptor_writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
       descriptor_writes[i].pBufferInfo = &buffer_infos[i];
@@ -4615,8 +4626,8 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
                                                 VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(constants),
                                                 &constants);
     deferred_command_buffer_.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE,
-                                                     resolve_downscale_pipeline_layout_, 0, 1,
-                                                     &descriptor_set, 0, nullptr);
+                                                     resolve_downscale_pipeline_layout_, 0, 2,
+                                                     descriptor_sets, 0, nullptr);
     deferred_command_buffer_.CmdVkDispatch(tile_count, 1, 1);
 
     VkBufferMemoryBarrier downscale_barrier = {};
