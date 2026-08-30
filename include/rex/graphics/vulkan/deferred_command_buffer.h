@@ -274,6 +274,16 @@ class DeferredCommandBuffer {
   }
 
   // pNext of all barriers must be null.
+  void CmdVkFillBuffer(VkBuffer dst_buffer, VkDeviceSize dst_offset, VkDeviceSize size,
+                       uint32_t data) {
+    auto& args = *reinterpret_cast<ArgsVkFillBuffer*>(
+        WriteCommand(Command::kVkFillBuffer, sizeof(ArgsVkFillBuffer)));
+    args.dst_buffer = dst_buffer;
+    args.dst_offset = dst_offset;
+    args.size = size;
+    args.data = data;
+  }
+
   void CmdVkPipelineBarrier(VkPipelineStageFlags src_stage_mask,
                             VkPipelineStageFlags dst_stage_mask, VkDependencyFlags dependency_flags,
                             uint32_t memory_barrier_count, const VkMemoryBarrier* memory_barriers,
@@ -364,6 +374,7 @@ class DeferredCommandBuffer {
     kVkCopyBuffer,
     kVkCopyBufferToImage,
     kVkCopyQueryPoolResults,
+    kVkFillBuffer,
     kVkDispatch,
     kVkDraw,
     kVkDrawIndexed,
@@ -492,6 +503,13 @@ class DeferredCommandBuffer {
     VkDeviceSize dst_offset;
     VkDeviceSize stride;
     VkQueryResultFlags flags;
+  };
+
+  struct ArgsVkFillBuffer {
+    VkBuffer dst_buffer;
+    VkDeviceSize dst_offset;
+    VkDeviceSize size;
+    uint32_t data;
   };
 
   struct ArgsVkDispatch {

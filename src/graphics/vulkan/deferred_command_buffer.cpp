@@ -163,6 +163,12 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
                                       args.stride, args.flags);
       } break;
 
+      case Command::kVkFillBuffer: {
+        auto& args = *reinterpret_cast<const ArgsVkFillBuffer*>(stream);
+        dfn.vkCmdFillBuffer(command_buffer, args.dst_buffer, args.dst_offset, args.size,
+                            args.data);
+      } break;
+
       case Command::kVkDispatch: {
         auto& args = *reinterpret_cast<const ArgsVkDispatch*>(stream);
         dfn.vkCmdDispatch(command_buffer, args.group_count_x, args.group_count_y,

@@ -666,10 +666,9 @@ bool VulkanCommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuff
   }
 
   auto write_fallback_result = [sample_counts]() -> bool {
-    auto fake_sample_count = REXCVAR_GET(query_occlusion_fake_sample_count);
-    if (fake_sample_count < 0) {
-      return true;
-    }
+    // Legacy fallback path; the retired query_occlusion_fake_sample_count
+    // cvar's default of 1000 is used until the shared ZPD pool lands here.
+    uint32_t fake_sample_count = 1000;
     bool is_end_via_z_pass =
         sample_counts->ZPass_A == kQueryFinished || sample_counts->ZPass_B == kQueryFinished;
     bool is_end_via_z_fail =
