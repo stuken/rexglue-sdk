@@ -125,15 +125,24 @@ uint xe_swap_16_in_32(uint value) {
   return ((value & 0x0000FFFFu) << 16u) | (value >> 16u);
 }
 
+// Matches SpirvShaderTranslator::EndianSwap32Uint: 8-in-16 for endian 1,
+// 8-in-32 (full byte reverse) for endian 2, 16-in-32 only for endian 3.
+uint xe_endian_swap32(uint value, uint endian) {
+  if (endian == 1u) {
+    return xe_swap_8_in_16(value);
+  }
+  if (endian == 2u) {
+    return xe_swap_8_in_16(xe_swap_16_in_32(value));
+  }
+  if (endian == 3u) {
+    return xe_swap_16_in_32(value);
+  }
+  return value;
+}
+
 void main() {
   uint value = uint(gl_VertexIndex);
-  uint endian = xe_system_cbuffer.xe_vertex_index_endian;
-  if (endian == 1u || endian == 2u || endian == 3u) {
-    value = xe_swap_8_in_16(value);
-  }
-  if (endian == 2u || endian == 3u) {
-    value = xe_swap_16_in_32(value);
-  }
+  value = xe_endian_swap32(value, xe_system_cbuffer.xe_vertex_index_endian);
   value = uint(int(value) + xe_system_cbuffer.xe_vertex_base_index);
   value &= 0x00FFFFFFu;
   value = max(value, xe_system_cbuffer.xe_vertex_index_min);
@@ -159,15 +168,24 @@ uint xe_swap_16_in_32(uint value) {
   return ((value & 0x0000FFFFu) << 16u) | (value >> 16u);
 }
 
+// Matches SpirvShaderTranslator::EndianSwap32Uint: 8-in-16 for endian 1,
+// 8-in-32 (full byte reverse) for endian 2, 16-in-32 only for endian 3.
+uint xe_endian_swap32(uint value, uint endian) {
+  if (endian == 1u) {
+    return xe_swap_8_in_16(value);
+  }
+  if (endian == 2u) {
+    return xe_swap_8_in_16(xe_swap_16_in_32(value));
+  }
+  if (endian == 3u) {
+    return xe_swap_16_in_32(value);
+  }
+  return value;
+}
+
 void main() {
   uint value = uint(gl_VertexIndex);
-  uint endian = xe_system_cbuffer.xe_vertex_index_endian;
-  if (endian == 1u || endian == 2u || endian == 3u) {
-    value = xe_swap_8_in_16(value);
-  }
-  if (endian == 2u || endian == 3u) {
-    value = xe_swap_16_in_32(value);
-  }
+  value = xe_endian_swap32(value, xe_system_cbuffer.xe_vertex_index_endian);
   float tessellation_factor = float(value) + 1.0;
   tessellation_factor = max(
       tessellation_factor, xe_system_cbuffer.xe_tessellation_factor_range_min);
