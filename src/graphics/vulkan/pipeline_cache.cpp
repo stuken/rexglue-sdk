@@ -750,6 +750,28 @@ void VulkanPipelineCache::ShutdownShaderStorage() {
   shader_storage_title_id_ = 0;
 }
 
+void VulkanPipelineCache::AwaitPipelineCompletion() {
+  if (creation_threads_.empty()) {
+    return;
+  }
+
+  bool await_creation_completion_event;
+  {
+    std::lock_guard<std::mutex> lock(creation_request_lock_);
+    // The queue is empty because of CreateQueuedPipelinesOnProcessorThread,
+    // only check in-flight creation by worker threads.
+    await_creation_completion_event = creation_threads_busy_ != 0;
+    if (await_creation_completion_event) {
+      creation_completion_event_->Reset();
+      creation_completion_set_event_ = true;
+    }
+  }
+  if (await_creation_completion_event) {
+    creation_request_cond_.notify_one();
+    rex::thread::Wait(creation_completion_event_.get(), false);
+  }
+}
+
 void VulkanPipelineCache::EndSubmission() {
   if (shader_storage_file_flush_needed_ || pipeline_storage_file_flush_needed_) {
     {

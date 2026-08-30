@@ -94,6 +94,11 @@ class VulkanPipelineCache {
       VulkanRenderTargetCache::RenderPassKey render_pass_key, VkPipeline& pipeline_out,
       const PipelineLayoutProvider*& pipeline_layout_out, void** pipeline_handle_out = nullptr);
   bool IsCreatingPipelines() const;
+
+  // Waits for any pipeline creation needed by the current draw path to finish
+  // before state is consumed. This was added so strict ZPD query paths stop
+  // racing pipeline compilation and then blocking work on incomplete state.
+  void AwaitPipelineCompletion();
   void GetPipelineAndLayoutByHandle(void* handle, VkPipeline& pipeline_out,
                                     const PipelineLayoutProvider*& pipeline_layout_out,
                                     bool* is_placeholder_out = nullptr) const;

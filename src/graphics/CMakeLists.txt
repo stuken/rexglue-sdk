@@ -52,6 +52,7 @@ set(REXGPU_XENOS_VULKAN_SOURCES
     vulkan/shader.cpp
     vulkan/shared_memory.cpp
     vulkan/texture_cache.cpp
+    vulkan/zpd_query_pool.cpp
 )
 
 # D3D12 backend

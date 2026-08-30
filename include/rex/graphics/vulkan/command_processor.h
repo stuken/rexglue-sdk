@@ -31,6 +31,7 @@
 #include <rex/graphics/vulkan/graphics_system.h>
 #include <rex/graphics/vulkan/pipeline_cache.h>
 #include <rex/graphics/vulkan/primitive_processor.h>
+#include <rex/graphics/vulkan/zpd_query_pool.h>
 #include <rex/graphics/vulkan/render_target_cache.h>
 #include <rex/graphics/vulkan/shader.h>
 #include <rex/graphics/vulkan/shared_memory.h>
@@ -250,8 +251,6 @@ class VulkanCommandProcessor : public CommandProcessor {
 
   void WriteRegister(uint32_t index, uint32_t value) override;
   void WriteRegistersFromMem(uint32_t start_index, uint32_t* base, uint32_t num_registers) override;
-  bool ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* reader, uint32_t packet,
-                                          uint32_t count) override;
 
   void OnGammaRamp256EntryTableValueWritten() override;
   void OnGammaRampPWLValueWritten() override;
@@ -432,14 +431,45 @@ class VulkanCommandProcessor : public CommandProcessor {
   void SplitPendingBarrier();
 
   void DestroyScratchBuffer();
-  bool InitializeOcclusionQueryResources();
-  void ShutdownOcclusionQueryResources();
-  bool BeginGuestOcclusionQuery(uint32_t sample_count_address);
-  bool EndGuestOcclusionQuery(uint32_t sample_count_address);
-  bool AcquireOcclusionQueryIndex(uint32_t& host_index_out);
-  void DisableHostOcclusionQueries();
-  uint64_t NormalizeOcclusionSamples(uint64_t samples) const;
-  void WriteGuestOcclusionResult(uint32_t sample_count_address, uint64_t samples);
+
+  // ZPD occlusion queries backend.
+  // vkCmdBeginQuery is only valid inside a render pass, so segments split at
+  // pass end and resume at the next pass begin. If BEGIN fires outside a
+  // pass, segment_pending_begin waits for the next. Outside a render pass,
+  // DiscardZPDQuery defers the slot release until the submission completes.
+  // FSI queries clear a dedicated counter with vkCmdFillBuffer, so they may
+  // need to open before a pass begins or split an active pass around the
+  // clear.
+  void EnsureZPDQueryResources() override;
+  void ShutdownZPDQueryResources() override {
+    zpd_resolves_in_flight_.clear();
+    zpd_deferred_releases_.clear();
+    zpd_active_query_index_ = UINT32_MAX;
+    zpd_active_query_generation_ = 0;
+    zpd_active_query_is_fsi_ = false;
+    zpd_query_pool_needs_fsi_counter_ = false;
+    zpd_fsi_counter_index_force_update_ = true;
+    if (zpd_host_query_pool_) {
+      zpd_host_query_pool_->Shutdown();
+    }
+  }
+
+  bool IsZPDQueryPoolReady() const override;
+  bool CanOpenZPDQuery() const override;
+
+  QueryOpenResult OpenZPDQuery(ReportHandle report_handle,
+                               bool can_close_submission) override;
+  bool CloseZPDQuery(ReportHandle report_handle,
+                     uint64_t& out_submission) override;
+  bool DiscardZPDQuery() override;
+  void PumpQueryResolves() override;
+  bool AwaitQueryResolve(ReportHandle report_handle,
+                         uint64_t wait_for_submission) override;
+
+  void PollCompletedSubmission() override;
+
+  void RecordZPDResolveBatch();
+
   void InvalidateAllVertexBufferResidency();
   void InvalidateVertexBufferResidency(uint32_t vfetch_index);
   void InvalidateVertexBufferResidencyRange(uint32_t first_vfetch, uint32_t last_vfetch);
@@ -728,19 +758,38 @@ class VulkanCommandProcessor : public CommandProcessor {
   bool scratch_buffer_used_ = false;
 
   static constexpr uint32_t kMaxOcclusionQueries = 8192;
-  VkQueryPool occlusion_query_pool_ = VK_NULL_HANDLE;
-  VkBuffer occlusion_query_readback_buffer_ = VK_NULL_HANDLE;
-  VkDeviceMemory occlusion_query_readback_memory_ = VK_NULL_HANDLE;
-  uint32_t occlusion_query_readback_memory_type_ = UINT32_MAX;
-  VkDeviceSize occlusion_query_readback_memory_size_ = 0;
-  uint8_t* occlusion_query_readback_mapping_ = nullptr;
-  uint32_t occlusion_query_cursor_ = 0;
-  bool occlusion_query_resources_available_ = false;
-  struct ActiveOcclusionQuery {
-    uint32_t sample_count_address = 0;
-    uint32_t host_index = UINT32_MAX;
-    bool valid = false;
-  } active_occlusion_query_;
+
+  // ZPD occlusion queries backend.
+  struct PendingQueryResolve {
+    uint64_t submission = 0;
+    uint32_t query_index = UINT32_MAX;
+    uint32_t query_generation = 0;
+    uint32_t scale_area = 1;
+    bool uses_fsi_counter = false;
+    ReportHandle report_handle = kInvalidReportHandle;
+  };
+  uint32_t zpd_active_query_index_ = UINT32_MAX;
+  uint32_t zpd_active_query_generation_ = 0;
+  bool zpd_active_query_is_fsi_ = false;
+  bool zpd_query_pool_needs_fsi_counter_ = false;
+  bool zpd_fsi_counter_index_force_update_ = true;
+  std::deque<PendingQueryResolve> zpd_resolves_in_flight_;
+  // Fallback buffer for the EDRAM descriptor set binding 2.
+  VkBuffer zpd_fsi_counter_sink_buffer_ = VK_NULL_HANDLE;
+  VkDeviceMemory zpd_fsi_counter_sink_buffer_memory_ = VK_NULL_HANDLE;
+  // Currently installed binding 2 buffer.
+  VkBuffer zpd_fsi_counter_descriptor_buffer_ = VK_NULL_HANDLE;
+  VkDeviceSize zpd_fsi_counter_descriptor_range_ = 0;
+  std::unique_ptr<VulkanZPDQueryPool> zpd_host_query_pool_;
+  // Needed by resolve normalization.
+  uint32_t zpd_draw_resolution_scale_x_ = 1;
+  uint32_t zpd_draw_resolution_scale_y_ = 1;
+  struct DeferredQueryRelease {
+    uint64_t submission = 0;
+    uint32_t query_index = UINT32_MAX;
+    uint32_t query_generation = 0;
+  };
+  std::deque<DeferredQueryRelease> zpd_deferred_releases_;
   struct VertexBufferState {
     uint32_t address = UINT32_MAX;
     uint32_t size = UINT32_MAX;
