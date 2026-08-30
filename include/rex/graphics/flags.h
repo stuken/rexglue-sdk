@@ -82,6 +82,7 @@ REXCVAR_DECLARE(bool, use_fuzzy_alpha_epsilon);
 
 // GPU Shader Translation
 REXCVAR_DECLARE(std::string, dump_shaders);
+REXCVAR_DECLARE(bool, spirv_disable_rounding_mode_rte);
 REXCVAR_DECLARE(std::string, swap_post_effect);
 
 #if REX_HAS_VULKAN

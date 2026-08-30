@@ -1967,7 +1967,8 @@ VkShaderModule VulkanPipelineCache::GetGeometryShader(GeometryShaderKey key) {
   bool denorm_flush_to_zero_float32 = device_properties.shaderDenormFlushToZeroFloat32;
   bool signed_zero_inf_nan_preserve_float32 =
       device_properties.shaderSignedZeroInfNanPreserveFloat32;
-  bool rounding_mode_rte_float32 = device_properties.shaderRoundingModeRTEFloat32;
+  bool rounding_mode_rte_float32 = device_properties.shaderRoundingModeRTEFloat32 &&
+                                   !REXCVAR_GET(spirv_disable_rounding_mode_rte);
   if (spirv_version < spv::Spv_1_4) {
     if (denorm_flush_to_zero_float32 || signed_zero_inf_nan_preserve_float32 ||
         rounding_mode_rte_float32) {
