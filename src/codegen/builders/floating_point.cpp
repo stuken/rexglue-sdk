@@ -283,14 +283,16 @@ bool build_fres(BuilderContext& ctx) {
 
 bool build_frsqrte(BuilderContext& ctx) {
   ctx.emit_set_flush_mode(false);
-  // NOTE: xenia keeps this in full double precision (RSqrt(LoadFPR(frB)), no
-  // ToSingle) and its x64 backend implements the real hardware estimate via a
-  // lookup table (X64HelperEmitter::EmitFrsqrteHelper), including the non-IEEE
-  // mode and NaN/denormal edge cases. This is a plain double-precision
-  // approximation instead - more accurate than the ~5-bit hardware estimate,
-  // but not bit-exact with either the console or xenia. Left as-is: unlike fres
-  // there is no cheap expression that gets closer.
-  ctx.println("\t{}.f64 = 1.0 / sqrt({}.f64);", ctx.f(ctx.insn.operands[0]),
+  // frsqrte is an intentionally low-precision estimate (the architecture only
+  // guarantees 1/32), and titles are sensitive to the difference, so this uses
+  // the hardware lookup-table estimate rather than an accurate 1/sqrt.
+  //
+  // The non-IEEE mode argument is left at its default: ReXGlue's FPSCR tracks
+  // only the rounding mode and flush bits (storeFromGuest masks with
+  // kRoundMask), so the guest's non-IEEE bit - which would flush denormal
+  // inputs to zero - is not modelled. Denormals therefore take the normalizing
+  // path, matching xenia with that mode clear.
+  ctx.println("\t{}.f64 = rex::ppc::frsqrte({}.f64);", ctx.f(ctx.insn.operands[0]),
               ctx.f(ctx.insn.operands[1]));
   return true;
 }

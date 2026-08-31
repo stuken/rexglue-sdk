@@ -13,6 +13,7 @@
 
 #pragma once
 
+#include <bit>
 #include <climits>
 #include <cmath>
 #include <cstring>
@@ -443,6 +444,90 @@ inline simde__m128 simde_mm_vmsum4fp(simde__m128 a, simde__m128 b) {
   sum += double(av[1]) * double(bv[1]);
   sum += double(av[0]) * double(bv[0]);
   return simde_mm_vmsum_finish_(sum);
+}
+
+//=============================================================================
+// frsqrte - PowerPC Reciprocal Square Root Estimate
+//=============================================================================
+// The PowerPC frsqrte is deliberately a low-precision estimate: the
+// architecture only requires the result to be within 1/32 (about 3.125%) of
+// 1/sqrt(x), and the Xenon implements it with a small lookup table. Titles do
+// notice the difference - computing an accurate 1/sqrt instead makes some
+// games behave subtly differently - so this reproduces the hardware estimate,
+// ported from xenia's X64HelperEmitter::EmitFrsqrteHelper.
+//
+// The estimate keeps 4 bits of the significand: the table is indexed by the
+// low bit of the biased exponent (which selects between the [1,2) and [2,4)
+// mantissa ranges) together with the top 3 mantissa bits, and the result
+// exponent is 1022 - floor((exponent - 1023) / 2).
+//
+// non_java_mode corresponds to the guest FPSCR non-IEEE mode bit: when set,
+// denormal inputs are flushed to zero (and therefore return infinity) rather
+// than being normalized.
+
+inline const unsigned char* frsqrte_table() {
+  static constexpr unsigned char kTable[16] = {241u, 216u, 192u, 168u, 152u, 136u, 128u, 112u,
+                                               96u,  76u,  60u,  48u,  32u,  24u,  16u,  8u};
+  return kTable;
+}
+
+inline double frsqrte(double x, bool non_java_mode = false) {
+  constexpr uint64_t kExponent = 0x7FF0000000000000ull;
+  constexpr uint64_t kMantissa = 0x000FFFFFFFFFFFFFull;
+  constexpr uint64_t kSign = 0x8000000000000000ull;
+  constexpr uint64_t kDefaultNaN = 0x7FF8000000000000ull;
+
+  uint64_t bits;
+  std::memcpy(&bits, &x, sizeof(bits));
+
+  auto from_bits = [](uint64_t value) {
+    double result;
+    std::memcpy(&result, &value, sizeof(result));
+    return result;
+  };
+
+  // Non-IEEE mode flushes denormal inputs to zero, which then return infinity.
+  bool is_zero = false;
+  if (non_java_mode && (bits << 12) != 0 && (bits & kExponent) == 0) {
+    bits &= kSign;
+    is_zero = true;
+  }
+  if (!is_zero && (bits << 1) == 0) {
+    is_zero = true;
+  }
+  if (is_zero) {
+    // +-0 -> +-infinity (division by zero).
+    return from_bits((bits & kSign) | kExponent);
+  }
+
+  if ((~bits & kExponent) == 0) {
+    if (bits == kExponent) {
+      return 0.0;  // +infinity -> +0
+    }
+    if ((bits << 12) != 0) {
+      return from_bits(bits | kDefaultNaN);  // NaN -> quieted NaN
+    }
+    return from_bits(kDefaultNaN);  // -infinity -> default NaN
+  }
+  if (x < 0.0) {
+    return from_bits(kDefaultNaN);  // negative -> default NaN
+  }
+
+  uint32_t exponent = uint32_t((bits >> 52) & 2047u);
+  uint64_t mantissa = bits & kMantissa;
+  if (mantissa != 0 && exponent == 0) {
+    // Normalize the denormal so the table index sees a leading 1.
+    int leading_zeros = std::countl_zero(mantissa);
+    mantissa <<= uint32_t(leading_zeros - 11);
+    exponent = uint32_t(12 - leading_zeros);
+  }
+
+  uint32_t index = uint32_t(mantissa >> 49) & 7u;
+  index |= (exponent * 8u) & 8u;
+  index ^= 8u;
+  uint32_t result_exponent = 1022u - ((exponent - 1023u) >> 1);
+  return from_bits((uint64_t(result_exponent & 0xFFFu) << 52) |
+                   (uint64_t(frsqrte_table()[index]) << 44));
 }
 
 }  // namespace rex::ppc
