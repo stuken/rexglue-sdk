@@ -393,6 +393,58 @@ inline simde__m128i simde_mm_sllv_epi8(simde__m128i a, simde__m128i count) {
   return simde_mm_packus_epi16(r_lo, r_hi);
 }
 
+//=============================================================================
+// Vector Dot Products (vmsum3fp128 / vmsum4fp128)
+//=============================================================================
+// The Xbox 360 accumulates vmsum products in higher precision than float32, so
+// a plain host float32 dot product can differ from the guest result by one bit.
+// Xenia keeps a float64 accumulation for this reason, and maps a float32
+// overflow of the (finite) float64 sum to the canonical quiet NaN while
+// preserving infinities and NaNs that came from the inputs themselves.
+//
+// Note the guest-to-host element reversal used throughout this project: guest
+// element i lives at host lane 3-i, so the 3-element form sums host lanes
+// 3, 2, 1 (guest x, y, z) and ignores host lane 0 (guest w).
+
+inline simde__m128 simde_mm_vmsum_finish_(double sum) {
+  float result = float(sum);
+  // A dot product of four float32 values cannot overflow float64, so a float32
+  // overflow happened exactly when the float64 sum is finite but its float32
+  // conversion is not.
+  if (!std::isfinite(result) && std::isfinite(sum)) {
+    uint32_t qnan = 0x7FC00000u;
+    float qnan_f;
+    std::memcpy(&qnan_f, &qnan, sizeof(qnan_f));
+    result = qnan_f;
+  }
+  return simde_mm_set1_ps(result);
+}
+
+// 3-element dot product (guest x, y, z = host lanes 3, 2, 1).
+inline simde__m128 simde_mm_vmsum3fp(simde__m128 a, simde__m128 b) {
+  alignas(16) float av[4];
+  alignas(16) float bv[4];
+  simde_mm_store_ps(av, a);
+  simde_mm_store_ps(bv, b);
+  double sum = double(av[3]) * double(bv[3]);
+  sum += double(av[2]) * double(bv[2]);
+  sum += double(av[1]) * double(bv[1]);
+  return simde_mm_vmsum_finish_(sum);
+}
+
+// 4-element dot product.
+inline simde__m128 simde_mm_vmsum4fp(simde__m128 a, simde__m128 b) {
+  alignas(16) float av[4];
+  alignas(16) float bv[4];
+  simde_mm_store_ps(av, a);
+  simde_mm_store_ps(bv, b);
+  double sum = double(av[3]) * double(bv[3]);
+  sum += double(av[2]) * double(bv[2]);
+  sum += double(av[1]) * double(bv[1]);
+  sum += double(av[0]) * double(bv[0]);
+  return simde_mm_vmsum_finish_(sum);
+}
+
 }  // namespace rex::ppc
 
 //=============================================================================

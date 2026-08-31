@@ -34,6 +34,18 @@ constexpr float kPack2101010_Max10 = std::bit_cast<float>(0x404001FFu);
 constexpr float kPack2101010_Min2 = std::bit_cast<float>(0x40400000u);
 constexpr float kPack2101010_Max2 = std::bit_cast<float>(0x40400003u);
 
+//=============================================================================
+// Pack/Unpack Constants (NORMPACKED64 - 4:20:20:20 format)
+//=============================================================================
+// XYZ are signed 20-bit fields in 3.0+X form, saturated to -524287..524287
+// (the most negative value is reserved as the overflow/NaN slot on unpack).
+// W is an unsigned 4-bit field in 3.0+w form, saturated to 0..15.
+
+constexpr float kPack4202020_Min20 = std::bit_cast<float>(0x40380001u);
+constexpr float kPack4202020_Max20 = std::bit_cast<float>(0x4047FFFFu);
+constexpr float kPack4202020_Min4 = std::bit_cast<float>(0x40400000u);
+constexpr float kPack4202020_Max4 = std::bit_cast<float>(0x4040000Fu);
+
 namespace rex::ppc {
 
 //=============================================================================
