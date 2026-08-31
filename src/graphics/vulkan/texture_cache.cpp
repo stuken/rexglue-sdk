@@ -1579,13 +1579,13 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
     }
     const texture_util::TextureGuestLayout::Level& level_guest_layout =
         is_base ? guest_layout.base : guest_layout.mips[level];
-    uint32_t level_guest_pitch = level_guest_layout.row_pitch_bytes;
-    if (texture_key.tiled) {
-      // Shaders expect pitch in blocks for tiled textures.
-      level_guest_pitch /= bytes_per_block;
-      assert_zero(level_guest_pitch & (xenos::kTextureTileWidthHeight - 1));
-    }
-    load_constants.guest_pitch_aligned = level_guest_pitch;
+    // Shaders expect the guest pitch in blocks for both the tiled and the
+    // linear paths - XeTextureLoadSourceAddress shifts the linear block index by
+    // bytes_per_block_log2 after multiplying by the pitch, so passing bytes here
+    // would scale rows by bytes_per_block (compacting the image vertically).
+    load_constants.guest_pitch_aligned = level_guest_layout.row_pitch_bytes / bytes_per_block;
+    assert_true(!texture_key.tiled ||
+                !(load_constants.guest_pitch_aligned & (xenos::kTextureTileWidthHeight - 1)));
     load_constants.guest_z_stride_block_rows_aligned = level_guest_layout.z_slice_stride_block_rows;
     assert_true(!is_3d_tiling || !(load_constants.guest_z_stride_block_rows_aligned &
                                    (xenos::kTextureTileWidthHeight - 1)));
@@ -1716,8 +1716,9 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
 
       const HostLayout& level_host_layout = is_base ? host_layout_base : host_layout_mips[level];
       load_constants_float_convert.guest_offset = uint32_t(level_host_layout.offset_bytes);
-      load_constants_float_convert.guest_pitch_aligned =
-          load_shader_info_float_convert->bytes_per_host_block * level_host_layout.x_pitch_blocks;
+      // The source pitch is in blocks (the shader shifts by the block size
+      // itself); only the destination pitch is in bytes.
+      load_constants_float_convert.guest_pitch_aligned = level_host_layout.x_pitch_blocks;
       load_constants_float_convert.guest_z_stride_block_rows_aligned =
           level_host_layout.y_pitch_blocks;
       load_constants_float_convert.host_offset = uint32_t(level_host_layout.offset_bytes);

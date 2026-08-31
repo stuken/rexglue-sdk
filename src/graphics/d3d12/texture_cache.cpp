@@ -1780,13 +1780,13 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
     }
     const texture_util::TextureGuestLayout::Level& level_guest_layout =
         is_base ? guest_layout.base : guest_layout.mips[level];
-    uint32_t level_guest_pitch = level_guest_layout.row_pitch_bytes;
-    if (texture_key.tiled) {
-      // Shaders expect pitch in blocks for tiled textures.
-      level_guest_pitch /= bytes_per_block;
-      assert_zero(level_guest_pitch & (xenos::kTextureTileWidthHeight - 1));
-    }
-    load_constants.guest_pitch_aligned = level_guest_pitch;
+    // Shaders expect the guest pitch in blocks for both the tiled and the
+    // linear paths - XeTextureLoadSourceAddress shifts the linear block index by
+    // bytes_per_block_log2 after multiplying by the pitch, so passing bytes here
+    // would scale rows by bytes_per_block (compacting the image vertically).
+    load_constants.guest_pitch_aligned = level_guest_layout.row_pitch_bytes / bytes_per_block;
+    assert_true(!texture_key.tiled ||
+                !(load_constants.guest_pitch_aligned & (xenos::kTextureTileWidthHeight - 1)));
     load_constants.guest_z_stride_block_rows_aligned = level_guest_layout.z_slice_stride_block_rows;
     assert_true(!is_3d_tiling || !(load_constants.guest_z_stride_block_rows_aligned &
                                    (xenos::kTextureTileWidthHeight - 1)));
