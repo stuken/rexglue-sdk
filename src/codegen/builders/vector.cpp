@@ -133,10 +133,17 @@ bool build_vrefp(BuilderContext& ctx) {
 }
 
 bool build_vrsqrtefp(BuilderContext& ctx) {
-  // TODO: see if we can use rsqrt safely
+  // vrsqrtefp is an estimate with a 1/4096 bound, evaluated by the hardware
+  // through a coefficient interpolation that ignores the low 9 mantissa bits.
+  // Computing an accurate 1/sqrt here is measurably different, so use the
+  // hardware estimate (see rex::ppc::vrsqrte).
+  //
+  // Non-Java mode is left at its default (true), matching the console and
+  // xenia: denormal inputs are flushed to zero. ReXGlue does not model the
+  // guest VSCR NJ bit, and vector code already runs with the host in
+  // flush-to-zero mode, so this is consistent with the surrounding behavior.
   ctx.emit_set_flush_mode(true);
-  ctx.emit_vec_fp_unary_expr(
-      "simde_mm_div_ps(simde_mm_set1_ps(1), simde_mm_sqrt_ps(simde_mm_load_ps({vA}.f32)))");
+  ctx.emit_vec_fp_unary_expr("rex::ppc::simde_mm_vrsqrtefp(simde_mm_load_ps({vA}.f32))");
   return true;
 }
 

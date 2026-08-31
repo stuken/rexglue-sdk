@@ -13,6 +13,7 @@
 
 #pragma once
 
+#include <array>
 #include <bit>
 #include <climits>
 #include <cmath>
@@ -528,6 +529,144 @@ inline double frsqrte(double x, bool non_java_mode = false) {
   uint32_t result_exponent = 1022u - ((exponent - 1023u) >> 1);
   return from_bits((uint64_t(result_exponent & 0xFFFu) << 52) |
                    (uint64_t(frsqrte_table()[index]) << 44));
+}
+
+//=============================================================================
+// vrsqrtefp - VMX Vector Reciprocal Square Root Estimate
+//=============================================================================
+// Like frsqrte, the VMX estimate is intentionally imprecise, but to a tighter
+// bound: 1/4096 rather than 1/32. The hardware evaluates a piecewise-linear
+// interpolation over 32 coefficients, indexed by the low exponent bit and the
+// top 4 mantissa bits, and ignores the low 9 mantissa bits entirely.
+//
+// Ported from xenia's X64HelperEmitter::EmitScalarVRsqrteHelper. Because the
+// low 9 mantissa bits are ignored, the remaining 14 mantissa bits plus the low
+// exponent bit fully determine the result for positive normals, so those 32768
+// cases are precomputed once into a table (as xenia does via
+// GetNormalVRsqrteTable) and the interpolation only runs for denormals.
+//
+// non_java_mode corresponds to the guest VSCR NJ bit and defaults to true, as
+// on the console and in xenia: denormal inputs are flushed to zero and return
+// a signed infinity. With it clear, denormals are normalized and interpolated.
+
+// The hardware coefficient table (xenia XMMVRsqrteTableStart).
+inline const uint32_t* vrsqrte_coefficient_table() {
+  static constexpr uint32_t kCoefficients[32] = {
+      0x568B4FD, 0x4F3AF97, 0x48DAAA5, 0x435A618, 0x3E7A1E4, 0x3A29DFE, 0x3659A5C, 0x32E96F8,
+      0x2FC93CA, 0x2D090CE, 0x2A88DFE, 0x2838B57, 0x26188D4, 0x2438673, 0x2268431, 0x20B820B,
+      0x3D27FFA, 0x3807C29, 0x33878AA, 0x2F97572, 0x2C27279, 0x2926FB7, 0x2666D26, 0x23F6AC0,
+      0x21D6881, 0x1FD6665, 0x1E16468, 0x1C76287, 0x1AF60C1, 0x1995F12, 0x1855D79, 0x1735BF4};
+  return kCoefficients;
+}
+
+// Evaluate the coefficient interpolation. unbiased_exponent is the input
+// exponent minus the bias - its low bit selects the [1,2) or [2,4) coefficient
+// half, and the assembly's "xor 16" accounts for that bit being inverted
+// relative to the biased exponent. result_exponent is the already-halved output
+// exponent.
+inline uint32_t vrsqrte_interpolate(int32_t result_exponent, int32_t unbiased_exponent,
+                                   uint32_t mantissa) {
+  uint32_t index = ((uint32_t(unbiased_exponent) << 4) & 16u) ^ 16u;
+  index |= mantissa >> 19;
+  const uint32_t coefficient = vrsqrte_coefficient_table()[index];
+  uint32_t estimate =
+      ((coefficient << 10) & 0x3FFFC00u) - (((mantissa >> 9) & 1023u) * (coefficient >> 16));
+  if (!(estimate & 0x02000000u)) {
+    // Renormalize and fold the shift into the output exponent.
+    const uint32_t leading_zeros = uint32_t(std::countl_zero(estimate & 0x1FFFFFFu));
+    result_exponent += 6 - int32_t(leading_zeros);
+    estimate <<= leading_zeros - 6;
+  }
+  if ((estimate & 5u) && (estimate & 2u)) {
+    estimate += 4u;  // round
+  }
+  return uint32_t((result_exponent << 23) + 0x3F800000) | ((estimate >> 2) & 0x7FFFFFu);
+}
+
+// Precomputed results for every positive normal input (14 mantissa bits and the
+// low exponent bit), canonicalized to exponents 126/127.
+inline const uint32_t* vrsqrte_normal_table() {
+  static const std::array<uint32_t, 1u << 15> kTable = [] {
+    std::array<uint32_t, 1u << 15> table;
+    for (uint32_t index = 0; index < table.size(); ++index) {
+      const uint32_t exponent_parity = index >> 14;
+      const uint32_t canonical_exponent = 126u + exponent_parity;
+      // Matches xenia's canonicalization: the stored value assumes an output
+      // exponent of 0 and is adjusted by the caller for the real exponent.
+      table[index] = vrsqrte_interpolate(0, int32_t(canonical_exponent) - 127,
+                                         (index & 0x3FFFu) << 9);
+    }
+    return table;
+  }();
+  return kTable.data();
+}
+
+inline float vrsqrte(float x, bool non_java_mode = true) {
+  constexpr uint32_t kDefaultNaN = 0x7FC00000u;
+  constexpr uint32_t kPosInf = 0x7F800000u;
+  constexpr uint32_t kNegInf = 0xFF800000u;
+
+  uint32_t bits;
+  std::memcpy(&bits, &x, sizeof(bits));
+
+  auto from_bits = [](uint32_t value) {
+    float result;
+    std::memcpy(&result, &value, sizeof(result));
+    return result;
+  };
+
+  // Positive normals - the common case - come straight from the table, with the
+  // input exponent folded into the result.
+  if (uint32_t(bits - 0x00800000u) <= 0x7EFFFFFEu) {
+    const uint32_t value = vrsqrte_normal_table()[(bits >> 9) & 0x7FFFu];
+    return from_bits(uint32_t(int32_t(value) - ((int32_t(bits >> 24) - 63) << 23)));
+  }
+
+  const uint32_t mantissa = bits & 0x7FFFFFu;
+  if (bits == kNegInf) {
+    return from_bits(kDefaultNaN);
+  }
+  if ((bits & 0x7F800000u) == 0 && mantissa != 0) {
+    // Denormal input.
+    if (non_java_mode) {
+      // Flushed to zero, so the result is a signed infinity.
+      return from_bits((bits >> 31) ? kNegInf : kPosInf);
+    }
+    if ((bits & 0x7FFFFFFFu) == 0x400000u) {
+      // Oddball denormal singled out by the hardware.
+      return from_bits((bits >> 31) ? kDefaultNaN : 0x5F34FD00u);
+    }
+    if (bits >> 31) {
+      return from_bits(kDefaultNaN);
+    }
+    const uint32_t leading_zeros = uint32_t(std::countl_zero(mantissa));
+    const uint32_t normalized = (bits << (leading_zeros - 8)) & 0x7FFFFEu;
+    // The assembly derives the halved output exponent from the biased value
+    // (9 - leading_zeros) and indexes the coefficients with the unbiased one.
+    const int32_t biased_exponent = 9 - int32_t(leading_zeros);
+    return from_bits(vrsqrte_interpolate((127 - biased_exponent) >> 1,
+                                         -118 - int32_t(leading_zeros), normalized));
+  }
+  if ((bits << 1) == 0) {
+    return from_bits((bits >> 31) ? kNegInf : kPosInf);  // +-0 -> +-infinity
+  }
+  if ((bits & 0x7F800000u) == 0x7F800000u) {
+    if (mantissa != 0) {
+      return from_bits(bits | 0x400000u);  // NaN -> quieted
+    }
+    return (bits >> 31) ? from_bits(kDefaultNaN) : 0.0f;  // -inf -> NaN, +inf -> +0
+  }
+  return from_bits(kDefaultNaN);  // negative normal
+}
+
+// Vector form: vrsqrtefp applies the estimate to each lane independently.
+inline simde__m128 simde_mm_vrsqrtefp(simde__m128 a, bool non_java_mode = true) {
+  alignas(16) float lanes[4];
+  simde_mm_store_ps(lanes, a);
+  for (size_t i = 0; i < 4; ++i) {
+    lanes[i] = vrsqrte(lanes[i], non_java_mode);
+  }
+  return simde_mm_load_ps(lanes);
 }
 
 }  // namespace rex::ppc
