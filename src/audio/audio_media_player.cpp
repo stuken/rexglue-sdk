@@ -73,6 +73,11 @@ AudioMediaPlayer::AudioMediaPlayer(rex::system::KernelState* kernel_state)
   }
   worker_running_.store(true, std::memory_order_relaxed);
   worker_thread_ = rex::thread::Thread::Create({}, [this]() { WorkerThreadMain(); });
+  if (!worker_thread_) {
+    REXAPU_ERROR("AudioMediaPlayer: failed to create the XMP worker thread - XMP disabled");
+    worker_running_.store(false, std::memory_order_relaxed);
+    return;
+  }
   worker_thread_->set_name("XMP Audio Media Player");
 }
 
@@ -88,8 +93,11 @@ AudioMediaPlayer::~AudioMediaPlayer() {
 
 void AudioMediaPlayer::Play(Song* song) {
   if (!worker_thread_) {
-    return;  // XMP playback disabled via the enable_xmp cvar
+    REXAPU_WARN("AudioMediaPlayer: Play() called for '{}' but XMP is disabled (enable_xmp=false)",
+               rex::string::to_utf8(song->name));
+    return;
   }
+  REXAPU_INFO("AudioMediaPlayer: Play() called for song '{}'", rex::string::to_utf8(song->name));
   Stop();
   {
     auto lock = global_critical_region_.Acquire();
@@ -298,12 +306,18 @@ void AudioMediaPlayer::SubmitPendingFrame() {
 }
 
 void AudioMediaPlayer::PlaySong(Song* song) {
+  REXAPU_INFO("AudioMediaPlayer: worker picked up song '{}' (path='{}', format={}, volume={:g})",
+             rex::string::to_utf8(song->name), rex::string::to_utf8(song->file_path),
+             static_cast<uint32_t>(song->format), volume_.load(std::memory_order_relaxed));
+
   std::vector<uint8_t> file_data = LoadSongToMemory(kernel_state_, song->file_path);
   if (file_data.empty()) {
     REXAPU_WARN("AudioMediaPlayer: failed to load song file '{}' for playback",
                rex::string::to_utf8(song->file_path));
     return;
   }
+  REXAPU_INFO("AudioMediaPlayer: loaded {} bytes for '{}'", file_data.size(),
+             rex::string::to_utf8(song->file_path));
 
   if (!EnsureDriver()) {
     REXAPU_ERROR("AudioMediaPlayer: failed to create an audio driver for XMP playback");
@@ -364,6 +378,7 @@ void AudioMediaPlayer::PlayMp3Data(const std::vector<uint8_t>& file_data) {
   data += id3_skip;
   data_size -= id3_skip;
 
+  size_t decoded_frame_count = 0;
   auto decode_frame_to_pending = [&](const AVFrame* decoded) {
     std::vector<float> left, right;
     left.reserve(decoded->nb_samples);
@@ -375,6 +390,11 @@ void AudioMediaPlayer::PlayMp3Data(const std::vector<uint8_t>& file_data) {
     if (left.empty()) {
       return;
     }
+    if (decoded_frame_count == 0) {
+      REXAPU_INFO("AudioMediaPlayer: MP3 decoding audio ({} Hz, {} channel(s), volume={:g})",
+                 decoded->sample_rate, decoded->channels, volume_.load(std::memory_order_relaxed));
+    }
+    ++decoded_frame_count;
     const float vol = volume_.load(std::memory_order_relaxed);
     if (vol != 1.0f) {
       for (float& s : left) s *= vol;
@@ -434,6 +454,10 @@ void AudioMediaPlayer::PlayMp3Data(const std::vector<uint8_t>& file_data) {
     }
   }
 
+  REXAPU_INFO(
+      "AudioMediaPlayer: MP3 playback ended ({} frames decoded, stopped={})",
+      decoded_frame_count, song_should_stop_.load(std::memory_order_relaxed));
+
   av_frame_free(&frame);
   av_packet_free(&packet);
   av_parser_close(parser);
@@ -450,6 +474,11 @@ void AudioMediaPlayer::PlayWmaData(const std::vector<uint8_t>& file_data) {
     return;
   }
   const AsfDemuxer::AudioInfo& info = demuxer.audio_info();
+  REXAPU_INFO(
+      "AudioMediaPlayer: found WMA stream (format_tag={:#06x}, {} Hz, {} channel(s), "
+      "block_align={}, extradata={} bytes)",
+      info.format_tag, info.sample_rate, info.channels, info.block_align,
+      info.extra_data.size());
 
   AVCodecID codec_id;
   switch (info.format_tag) {
@@ -501,6 +530,7 @@ void AudioMediaPlayer::PlayWmaData(const std::vector<uint8_t>& file_data) {
   AVFrame* frame = av_frame_alloc();
   std::vector<uint8_t> compressed_frame;
 
+  size_t decoded_frame_count = 0;
   auto decode_frame_to_pending = [&](const AVFrame* decoded) {
     std::vector<float> left, right;
     left.reserve(decoded->nb_samples);
@@ -512,6 +542,11 @@ void AudioMediaPlayer::PlayWmaData(const std::vector<uint8_t>& file_data) {
     if (left.empty()) {
       return;
     }
+    if (decoded_frame_count == 0) {
+      REXAPU_INFO("AudioMediaPlayer: WMA decoding audio (volume={:g})",
+                 volume_.load(std::memory_order_relaxed));
+    }
+    ++decoded_frame_count;
     const float vol = volume_.load(std::memory_order_relaxed);
     if (vol != 1.0f) {
       for (float& s : left) s *= vol;
@@ -562,6 +597,10 @@ void AudioMediaPlayer::PlayWmaData(const std::vector<uint8_t>& file_data) {
       decode_frame_to_pending(frame);
     }
   }
+
+  REXAPU_INFO(
+      "AudioMediaPlayer: WMA playback ended ({} frames decoded, stopped={})",
+      decoded_frame_count, song_should_stop_.load(std::memory_order_relaxed));
 
   av_frame_free(&frame);
   av_packet_free(&packet);
