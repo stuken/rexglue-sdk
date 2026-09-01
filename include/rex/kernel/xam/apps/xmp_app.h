@@ -94,6 +94,7 @@ class XmpApp : public system::xam::App {
   static const uint32_t kMsgPlaybackBehaviorChanged = 0x0A000002;
   static const uint32_t kMsgPlaybackControllerChanged = 0x0A000003;
   static const uint32_t kMsgTitlePlaylistContentChanged = 0x8A000005;
+  static const uint32_t kMsgDashInitChanged = 0x8A000009;
 
   void OnStateChanged();
 

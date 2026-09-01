@@ -437,6 +437,20 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
 
       return X_E_SUCCESS;
     }
+    case 0x00070025: {
+      // XMPCreateUserPlaylistEnumerator
+      // For whatever reason buffer_length is 0 in this case. Xenia doesn't
+      // implement a real enumerator here either - just acknowledges the call.
+      struct {
+        rex::be<uint32_t> xmp_client;
+        rex::be<uint32_t> flags;
+        rex::be<uint32_t> object_ptr;
+      }* args = memory_->TranslateVirtual<decltype(args)>(buffer_ptr);
+
+      REXKRNL_DEBUG("XMPCreateUserPlaylistEnumerator({:08X}, {:08X}, {:08X})",
+                    uint32_t(args->xmp_client), uint32_t(args->flags), uint32_t(args->object_ptr));
+      return X_E_SUCCESS;
+    }
     case 0x00070029: {
       // XMPGetPlaybackBehavior
       assert_true(!buffer_length || buffer_length == 16);
@@ -465,6 +479,47 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       }
       return X_E_SUCCESS;
     }
+    case 0x0007002B: {
+      // XMPGetMediaSources - called on the NXE and Kinect dashboard after
+      // clicking on the picture, video, and music library.
+      constexpr uint32_t kMaxSourcesForMediaPlayer = 10;
+      assert_true(!buffer_length || buffer_length == 20);
+      struct {
+        rex::be<uint32_t> xmp_client;
+        rex::be<uint32_t> get_connected_sources_only;
+        rex::be<uint32_t> media_resources_ptr;
+        rex::be<uint32_t> max_source;
+        rex::be<uint32_t> sources_returned_ptr;
+      }* args = memory_->TranslateVirtual<decltype(args)>(buffer_ptr);
+      static_assert_size(decltype(*args), 20);
+
+      REXKRNL_DEBUG(
+          "XMPGetMediaSources({:08X}, {:08X}, {:08X}, {:08X}, {:08X}), unimplemented",
+          uint32_t(args->xmp_client), uint32_t(args->get_connected_sources_only),
+          uint32_t(args->media_resources_ptr), uint32_t(args->max_source),
+          uint32_t(args->sources_returned_ptr));
+
+      if (!args->sources_returned_ptr) {
+        return X_E_INVALIDARG;
+      }
+      if (!args->media_resources_ptr) {
+        memory::store_and_swap<uint32_t>(memory_->TranslateVirtual(args->sources_returned_ptr),
+                                         kMaxSourcesForMediaPlayer);
+        return X_E_SUCCESS;
+      }
+      if (uint32_t(args->max_source) < kMaxSourcesForMediaPlayer) {
+        return 0x80070008;
+      }
+      for (uint32_t i = 0; i < kMaxSourcesForMediaPlayer; ++i) {
+        // Some 0xB4-byte struct, but no idea what it is (matches xenia).
+        auto entry = memory_->TranslateVirtual(args->media_resources_ptr + (i * 0xB4));
+        std::memset(entry, 0, 0x28);
+        memory::store_and_swap<uint32_t>(entry, i);
+      }
+      // We're returning 0, which means there is no source of media available.
+      memory::store_and_swap<uint32_t>(memory_->TranslateVirtual(args->sources_returned_ptr), 0);
+      return X_E_SUCCESS;
+    }
     case 0x0007002E: {
       assert_true(!buffer_length || buffer_length == 12);
       // Query of size for XamAlloc - the result of the alloc is passed to
@@ -482,10 +537,82 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
                                        4 + uint32_t(args->song_count) * 128);
       return X_E_SUCCESS;
     }
+    case 0x0007002F: {
+      // XMPDashInit - called on the start up of all dashboard versions before Kinect.
+      assert_true(!buffer_length || buffer_length == 24);
+      struct {
+        rex::be<uint32_t> xmp_client;
+        rex::be<uint32_t> buffer_ptr;
+        rex::be<uint32_t> buffer_length;
+        rex::be<uint32_t> unk1;
+        rex::be<uint32_t> unk2;
+        rex::be<uint32_t> storage_ptr;
+      }* args = memory_->TranslateVirtual<decltype(args)>(buffer_ptr);
+      static_assert_size(decltype(*args), 24);
+
+      REXKRNL_DEBUG(
+          "XMPDashInit({:08X}, {:08X}, {:08X}, {:08X}, {:08X}, {:08X}), unimplemented",
+          uint32_t(args->xmp_client), uint32_t(args->buffer_ptr), uint32_t(args->buffer_length),
+          uint32_t(args->unk1), uint32_t(args->unk2), uint32_t(args->storage_ptr));
+      kernel_state_->BroadcastNotification(kMsgDashInitChanged, 1);
+      return X_E_SUCCESS;
+    }
+    case 0x00070031: {
+      // XMPGetNumSongsInTitlePlaylist
+      assert_true(!buffer_length || buffer_length == 12);
+      struct {
+        rex::be<uint32_t> xmp_client;
+        rex::be<uint32_t> playlist_ptr;
+        rex::be<uint32_t> song_count_ptr;
+      }* args = memory_->TranslateVirtual<decltype(args)>(buffer_ptr);
+      static_assert_size(decltype(*args), 12);
+
+      REXKRNL_DEBUG("XMPGetNumSongsInTitlePlaylist({:08X}, {:08X}, {:08X}), unimplemented",
+                    uint32_t(args->xmp_client), uint32_t(args->playlist_ptr),
+                    uint32_t(args->song_count_ptr));
+      if (!args->playlist_ptr || !args->song_count_ptr) {
+        return X_E_INVALIDARG;
+      }
+      memory::store_and_swap<uint32_t>(memory_->TranslateVirtual(args->song_count_ptr), 0);
+      return X_E_SUCCESS;
+    }
     case 0x0007003D: {
       // XMPCaptureOutput - hooks a callback into the playback pipeline for
       // e.g. music visualization; no-op until real XMP playback exists.
       REXKRNL_DEBUG("XMPCaptureOutput(...) - stub, no playback backend to capture from");
+      return X_E_SUCCESS;
+    }
+    case 0x00070044: {
+      // XMPSetMediaSourceWorkspace - called on the start up of all dashboard
+      // versions before Kinect. Xenia's own implementation is a no-op too.
+      assert_true(!buffer_length || buffer_length == 16);
+      struct {
+        rex::be<uint32_t> xmp_client;
+        rex::be<uint32_t> workspace_type;
+        rex::be<uint32_t> storage_ptr;
+        rex::be<uint32_t> storage_length;
+      }* args = memory_->TranslateVirtual<decltype(args)>(buffer_ptr);
+      static_assert_size(decltype(*args), 16);
+
+      REXKRNL_DEBUG(
+          "XMPSetMediaSourceWorkspace({:08X}, {:08X}, {:08X}, {:08X}), unimplemented",
+          uint32_t(args->xmp_client), uint32_t(args->workspace_type), uint32_t(args->storage_ptr),
+          uint32_t(args->storage_length));
+      return X_E_SUCCESS;
+    }
+    case 0x00070053: {
+      // XMPGetDashInitState - called on the blades dashboard after clicking on
+      // the picture or video library.
+      struct {
+        rex::be<uint32_t> xmp_client;
+        rex::be<uint32_t> dash_init_state_ptr;
+      }* args = memory_->TranslateVirtual<decltype(args)>(buffer_ptr);
+
+      REXKRNL_DEBUG("XMPGetDashInitState({:08X}, {:08X})", uint32_t(args->xmp_client),
+                    uint32_t(args->dash_init_state_ptr));
+      // Matches xenia: this state is never actually set anywhere, so it's
+      // always 0 upstream too.
+      memory::store_and_swap<uint32_t>(memory_->TranslateVirtual(args->dash_init_state_ptr), 0);
       return X_E_SUCCESS;
     }
   }
