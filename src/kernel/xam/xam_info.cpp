@@ -329,6 +329,28 @@ u32 XamSwapDisc_entry(u32 disc_number) {
   return X_STATUS_SUCCESS;
 }
 
+u32 XamIsChildAccountSignedIn_entry() {
+  // ReXGlue has no parental-control/child-account concept, so the single
+  // signed-in profile is never a child account.
+  return 0;
+}
+
+u32 XamGetDvrStorage_entry(mapped_u32 dvr_storage, mapped_u32 used_dvr_storage,
+                           mapped_u32 hdd_unused_space) {
+  // Matches xenia's own stub: DVR (game-recording) storage isn't modeled here.
+  if (dvr_storage) {
+    *dvr_storage = 0;
+  }
+  if (used_dvr_storage) {
+    *used_dvr_storage = 0;
+  }
+  return X_ERROR_SUCCESS;
+}
+
+u32 XamSetDvrStorage_entry(u32 dvr_storage_size, mapped_void overlapped_ptr) {
+  return X_ERROR_SUCCESS;
+}
+
 }  // namespace xam
 }  // namespace kernel
 }  // namespace rex
@@ -363,3 +385,6 @@ REX_EXPORT(__imp__XamFree, rex::kernel::xam::XamFree_entry)
 REX_EXPORT(__imp__XamQueryLiveHiveW, rex::kernel::xam::XamQueryLiveHiveW_entry)
 REX_EXPORT(__imp__XamLoaderGetDvdTrayState, rex::kernel::xam::XamLoaderGetDvdTrayState_entry)
 REX_EXPORT(__imp__XamSwapDisc, rex::kernel::xam::XamSwapDisc_entry)
+REX_EXPORT(__imp__XamIsChildAccountSignedIn, rex::kernel::xam::XamIsChildAccountSignedIn_entry)
+REX_EXPORT(__imp__XamGetDvrStorage, rex::kernel::xam::XamGetDvrStorage_entry)
+REX_EXPORT(__imp__XamSetDvrStorage, rex::kernel::xam::XamSetDvrStorage_entry)

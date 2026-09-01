@@ -104,6 +104,11 @@ void XNotifyPositionUI_entry(u32 position) {
   // Ignored.
 }
 
+u32 XNotifyBroadcast_entry(u32 notification, u32 data) {
+  REX_KERNEL_STATE()->BroadcastNotification(static_cast<XNotificationID>(notification), data);
+  return X_ERROR_SUCCESS;
+}
+
 }  // namespace xam
 }  // namespace kernel
 }  // namespace rex
@@ -114,8 +119,8 @@ REX_EXPORT(__imp__XamNotifyCreateListenerInternal,
 REX_EXPORT(__imp__XNotifyGetNext, rex::kernel::xam::XNotifyGetNext_entry)
 REX_EXPORT(__imp__XNotifyDelayUI, rex::kernel::xam::XNotifyDelayUI_entry)
 REX_EXPORT(__imp__XNotifyPositionUI, rex::kernel::xam::XNotifyPositionUI_entry)
+REX_EXPORT(__imp__XNotifyBroadcast, rex::kernel::xam::XNotifyBroadcast_entry)
 
-REX_EXPORT_STUB(__imp__XNotifyBroadcast);
 REX_EXPORT_STUB(__imp__XNotifyQueueUI);
 REX_EXPORT_STUB(__imp__XNotifyQueueUIEx);
 REX_EXPORT_STUB(__imp__XNotifyRegisterArea);
