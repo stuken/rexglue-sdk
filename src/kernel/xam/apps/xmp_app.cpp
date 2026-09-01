@@ -426,17 +426,29 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       struct {
         rex::be<uint32_t> xmp_client;
         rex::be<uint32_t> controller;
-        rex::be<uint32_t> playback_client;
+        rex::be<uint32_t> controller_locked;
       }* args = memory_->TranslateVirtual<decltype(args)>(buffer_ptr);
       static_assert_size(decltype(*args), 12);
 
       assert_true((args->xmp_client == 0x00000002 && args->controller == 0x00000000) ||
                   (args->xmp_client == 0x00000000 && args->controller == 0x00000001));
       REXKRNL_DEBUG("XMPSetPlaybackController({:08X}, {:08X})", uint32_t(args->controller),
-                    uint32_t(args->playback_client));
+                    uint32_t(args->controller_locked));
 
-      playback_client_ = PlaybackClient(uint32_t(args->playback_client));
-      kernel_state_->BroadcastNotification(kMsgPlaybackControllerChanged, !args->playback_client);
+      // xmp_client==Game(2) && controller==Game(0) means the title is
+      // claiming playback control (what a game does before playing its own
+      // title playlist); xmp_client==Dash(0) && controller==User(1) means
+      // the system dashboard is - those are the only two combinations the
+      // assert above allows. This directly gates XMPPlayTitlePlaylist below
+      // (it silently no-ops while playback_client_ == kSystem), so reading
+      // the wrong field here (as this used to, by misreading the third field
+      // - actually a "locked" bool, not a client id - as if it were one)
+      // silently blocked all title-driven playback whenever a title claimed
+      // control this way, which XMP custom-soundtrack titles routinely do.
+      playback_client_ =
+          args->xmp_client == 0x00000002 ? PlaybackClient::kTitle : PlaybackClient::kSystem;
+      kernel_state_->BroadcastNotification(kMsgPlaybackControllerChanged,
+                                           playback_client_ == PlaybackClient::kTitle);
       return X_E_SUCCESS;
     }
     case 0x0007001B: {
@@ -452,7 +464,12 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       assert_true(args->xmp_client == 0x00000002);
       REXKRNL_DEBUG("XMPGetPlaybackController({:08X}, {:08X}, {:08X})", uint32_t(args->xmp_client),
                     uint32_t(args->controller_ptr), uint32_t(args->locked_ptr));
-      memory::store_and_swap<uint32_t>(memory_->TranslateVirtual(args->controller_ptr), 0);
+      // Report the real controller (Game=0/Dash=2) matching playback_client_
+      // instead of always claiming Game; "locked" isn't tracked separately
+      // from playback_client_ here, so it's always reported unlocked.
+      const uint32_t controller_value = playback_client_ == PlaybackClient::kTitle ? 0 : 2;
+      memory::store_and_swap<uint32_t>(memory_->TranslateVirtual(args->controller_ptr),
+                                       controller_value);
       memory::store_and_swap<uint32_t>(memory_->TranslateVirtual(args->locked_ptr), 0);
 
       if (!XThread::GetCurrentThread()->main_thread()) {
