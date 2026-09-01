@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cstring>
 
+#include <rex/audio/asf_demuxer.h>
 #include <rex/audio/audio_driver.h>
 #include <rex/audio/audio_system.h>
 #include <rex/filesystem.h>
@@ -283,15 +284,6 @@ void AudioMediaPlayer::SubmitPendingFrame() {
 }
 
 void AudioMediaPlayer::PlaySong(Song* song) {
-  if (song->format != Song::Format::kMp3) {
-    REXAPU_WARN(
-        "AudioMediaPlayer: '{}' isn't MP3 (format={}) - WMA playback needs an "
-        "ASF container demuxer that isn't implemented yet (only the raw WMA "
-        "codec is vendored); skipping playback.",
-        rex::string::to_utf8(song->name), static_cast<uint32_t>(song->format));
-    return;
-  }
-
   std::vector<uint8_t> file_data = LoadSongToMemory(kernel_state_, song->file_path);
   if (file_data.empty()) {
     REXAPU_WARN("AudioMediaPlayer: failed to load song file '{}' for playback",
@@ -304,6 +296,27 @@ void AudioMediaPlayer::PlaySong(Song* song) {
     return;
   }
 
+  resample_in_left_.clear();
+  resample_in_right_.clear();
+  resample_pos_ = 0.0;
+  pending_left_.clear();
+  pending_right_.clear();
+
+  switch (song->format) {
+    case Song::Format::kMp3:
+      PlayMp3Data(file_data);
+      break;
+    case Song::Format::kWma:
+      PlayWmaData(file_data);
+      break;
+    default:
+      REXAPU_WARN("AudioMediaPlayer: unknown song format {} for '{}' - skipping playback",
+                 static_cast<uint32_t>(song->format), rex::string::to_utf8(song->name));
+      break;
+  }
+}
+
+void AudioMediaPlayer::PlayMp3Data(const std::vector<uint8_t>& file_data) {
   const AVCodec* codec = avcodec_find_decoder(AV_CODEC_ID_MP3);
   if (!codec) {
     REXAPU_ERROR("AudioMediaPlayer: MP3 decoder not available in this build");
@@ -330,12 +343,6 @@ void AudioMediaPlayer::PlaySong(Song* song) {
 
   AVPacket* packet = av_packet_alloc();
   AVFrame* frame = av_frame_alloc();
-
-  resample_in_left_.clear();
-  resample_in_right_.clear();
-  resample_pos_ = 0.0;
-  pending_left_.clear();
-  pending_right_.clear();
 
   const uint8_t* data = file_data.data();
   size_t data_size = file_data.size();
@@ -416,6 +423,134 @@ void AudioMediaPlayer::PlaySong(Song* song) {
   av_frame_free(&frame);
   av_packet_free(&packet);
   av_parser_close(parser);
+  avcodec_free_context(&av_context);
+}
+
+void AudioMediaPlayer::PlayWmaData(const std::vector<uint8_t>& file_data) {
+  AsfDemuxer demuxer;
+  if (!demuxer.Open(file_data.data(), file_data.size())) {
+    REXAPU_WARN(
+        "AudioMediaPlayer: couldn't find a playable WMA audio stream in this "
+        "file (not a valid ASF file, no audio stream, or an unsupported "
+        "codec - only WMAv2/WMAPro are vendored)");
+    return;
+  }
+  const AsfDemuxer::AudioInfo& info = demuxer.audio_info();
+
+  AVCodecID codec_id;
+  switch (info.format_tag) {
+    case 0x0161:
+      codec_id = AV_CODEC_ID_WMAV2;
+      break;
+    case 0x0162:
+      codec_id = AV_CODEC_ID_WMAPRO;
+      break;
+    default:
+      // AsfDemuxer::Open() only succeeds for the two tags above, so this is
+      // unreachable in practice - kept as a defensive fallback.
+      REXAPU_WARN("AudioMediaPlayer: unsupported WMA format tag {:#06x}", info.format_tag);
+      return;
+  }
+
+  const AVCodec* codec = avcodec_find_decoder(codec_id);
+  if (!codec) {
+    REXAPU_ERROR("AudioMediaPlayer: WMA decoder not available in this build");
+    return;
+  }
+  AVCodecContext* av_context = avcodec_alloc_context3(codec);
+  if (!av_context) {
+    return;
+  }
+  // Unlike MP3, the WMA decoders can't derive these from the bitstream - they
+  // come straight from the ASF Stream Properties Object's WAVEFORMATEX-shaped
+  // type-specific data (see asf_demuxer.cpp).
+  av_context->sample_rate = static_cast<int>(info.sample_rate);
+  av_context->channels = info.channels;
+  av_context->bit_rate = static_cast<int64_t>(info.avg_bytes_per_sec) * 8;
+  av_context->block_align = info.block_align;
+  if (!info.extra_data.empty()) {
+    av_context->extradata =
+        static_cast<uint8_t*>(av_mallocz(info.extra_data.size() + AV_INPUT_BUFFER_PADDING_SIZE));
+    if (av_context->extradata) {
+      std::memcpy(av_context->extradata, info.extra_data.data(), info.extra_data.size());
+      av_context->extradata_size = static_cast<int>(info.extra_data.size());
+    }
+  }
+
+  if (avcodec_open2(av_context, codec, nullptr) < 0) {
+    REXAPU_ERROR("AudioMediaPlayer: failed to open WMA decoder");
+    avcodec_free_context(&av_context);
+    return;
+  }
+
+  AVPacket* packet = av_packet_alloc();
+  AVFrame* frame = av_frame_alloc();
+  std::vector<uint8_t> compressed_frame;
+
+  auto decode_frame_to_pending = [&](const AVFrame* decoded) {
+    std::vector<float> left, right;
+    left.reserve(decoded->nb_samples);
+    right.reserve(decoded->nb_samples);
+    ForEachDecodedSample(decoded, [&](float l, float r) {
+      left.push_back(l);
+      right.push_back(r);
+    });
+    if (left.empty()) {
+      return;
+    }
+    const float vol = volume_.load(std::memory_order_relaxed);
+    if (vol != 1.0f) {
+      for (float& s : left) s *= vol;
+      for (float& s : right) s *= vol;
+    }
+    const int sample_rate = decoded->sample_rate > 0 ? decoded->sample_rate : kOutputSampleRate;
+    AppendDecoded(left.data(), right.data(), left.size(), sample_rate);
+  };
+
+  while (!song_should_stop_.load(std::memory_order_relaxed)) {
+    while (state_.load(std::memory_order_relaxed) == State::kPaused &&
+          !song_should_stop_.load(std::memory_order_relaxed)) {
+      rex::thread::Sleep(std::chrono::milliseconds(20));
+    }
+    if (song_should_stop_.load(std::memory_order_relaxed)) {
+      break;
+    }
+
+    if (!demuxer.ReadNextFrame(&compressed_frame)) {
+      break;  // end of the audio stream, or an unrecoverable parse error
+    }
+    if (compressed_frame.empty()) {
+      continue;
+    }
+
+    av_packet_unref(packet);
+    packet->data = compressed_frame.data();
+    packet->size = static_cast<int>(compressed_frame.size());
+    if (avcodec_send_packet(av_context, packet) < 0) {
+      continue;
+    }
+
+    while (!song_should_stop_.load(std::memory_order_relaxed)) {
+      const int ret = avcodec_receive_frame(av_context, frame);
+      if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+        break;
+      }
+      if (ret < 0) {
+        break;
+      }
+      decode_frame_to_pending(frame);
+    }
+  }
+
+  if (!song_should_stop_.load(std::memory_order_relaxed)) {
+    avcodec_send_packet(av_context, nullptr);
+    while (avcodec_receive_frame(av_context, frame) >= 0) {
+      decode_frame_to_pending(frame);
+    }
+  }
+
+  av_frame_free(&frame);
+  av_packet_free(&packet);
   avcodec_free_context(&av_context);
 }
 

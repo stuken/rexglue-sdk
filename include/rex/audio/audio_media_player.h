@@ -97,6 +97,11 @@ class AudioMediaPlayer {
  private:
   void WorkerThreadMain();
   void PlaySong(Song* song);
+  // One decode/feed loop per supported compressed format - see
+  // audio_media_player.cpp and asf_demuxer.h for why WMA needs its own
+  // container-level demuxing step where MP3 doesn't.
+  void PlayMp3Data(const std::vector<uint8_t>& file_data);
+  void PlayWmaData(const std::vector<uint8_t>& file_data);
   static std::vector<uint8_t> LoadSongToMemory(rex::system::KernelState* kernel_state,
                                                 const std::u16string& file_path);
 
