@@ -93,9 +93,12 @@ X_HRESULT XmpApp::XMPCreateTitlePlaylist(uint32_t songs_ptr, uint32_t song_count
                                      playlist->handle);
   }
 
-  auto global_lock = global_critical_region_.Acquire();
-  playlists_.insert({playlist->handle, playlist.get()});
-  playlist.release();
+  {
+    auto global_lock = global_critical_region_.Acquire();
+    playlists_.insert({playlist->handle, playlist.get()});
+    playlist.release();
+  }
+  kernel_state_->BroadcastNotification(kMsgTitlePlaylistContentChanged, 0);
   return X_E_SUCCESS;
 }
 
@@ -340,7 +343,25 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       }* args = memory_->TranslateVirtual<decltype(args)>(buffer_ptr);
       static_assert_size(decltype(*args), 12);
 
-      auto info = memory_->TranslateVirtual(args->info_ptr);
+      // Matches xenia's XMP_SONGINFO layout exactly (handle, 0x23C padding,
+      // then five 40-char16 string fields, then three trailing uint32s).
+      constexpr uint32_t kMaxSongMetadataStringLength = 40;
+      struct SongInfo {
+        rex::be<X_HANDLE> handle;
+        uint8_t unknown[0x23C];
+        rex::be<char16_t> title[kMaxSongMetadataStringLength];
+        rex::be<char16_t> artist[kMaxSongMetadataStringLength];
+        rex::be<char16_t> album[kMaxSongMetadataStringLength];
+        rex::be<char16_t> album_artist[kMaxSongMetadataStringLength];
+        rex::be<char16_t> genre[kMaxSongMetadataStringLength];
+        rex::be<uint32_t> track_number;
+        rex::be<uint32_t> duration;
+        rex::be<uint32_t> song_format;
+        rex::be<uint32_t> unknown_1;
+      };
+      static_assert_size(SongInfo, 0x3E0);
+
+      auto info = memory_->TranslateVirtual<SongInfo*>(args->info_ptr);
       assert_true(args->xmp_client == 0x00000002);
       assert_zero(args->unk_ptr);
       REXKRNL_ERROR("XMPGetInfo?({:08X}, {:08X})", uint32_t(args->unk_ptr),
@@ -349,15 +370,16 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
         return X_E_FAIL;
       }
       auto& song = active_playlist_->songs[active_song_index_];
-      memory::store_and_swap<uint32_t>(info + 0, song->handle);
-      memory::store_and_swap<std::u16string>(info + 4 + 572 + 0, song->name);
-      memory::store_and_swap<std::u16string>(info + 4 + 572 + 40, song->artist);
-      memory::store_and_swap<std::u16string>(info + 4 + 572 + 80, song->album);
-      memory::store_and_swap<std::u16string>(info + 4 + 572 + 120, song->album_artist);
-      memory::store_and_swap<std::u16string>(info + 4 + 572 + 160, song->genre);
-      memory::store_and_swap<uint32_t>(info + 4 + 572 + 200, song->track_number);
-      memory::store_and_swap<uint32_t>(info + 4 + 572 + 204, song->duration_ms);
-      memory::store_and_swap<uint32_t>(info + 4 + 572 + 208, static_cast<uint32_t>(song->format));
+      std::memset(info, 0, sizeof(SongInfo));
+      info->handle = song->handle;
+      memory::store_and_swap<std::u16string>(info->title, song->name);
+      memory::store_and_swap<std::u16string>(info->artist, song->artist);
+      memory::store_and_swap<std::u16string>(info->album, song->album);
+      memory::store_and_swap<std::u16string>(info->album_artist, song->album_artist);
+      memory::store_and_swap<std::u16string>(info->genre, song->genre);
+      info->track_number = song->track_number;
+      info->duration = song->duration_ms;
+      info->song_format = static_cast<uint32_t>(song->format);
       return X_E_SUCCESS;
     }
     case 0x00070013: {
@@ -461,10 +483,10 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       return X_E_SUCCESS;
     }
     case 0x0007003D: {
-      // XMPCaptureOutput - not sure how this works :/
-      REXKRNL_DEBUG("XMPCaptureOutput(...)");
-      assert_always("XMP output not unimplemented");
-      return X_E_FAIL;
+      // XMPCaptureOutput - hooks a callback into the playback pipeline for
+      // e.g. music visualization; no-op until real XMP playback exists.
+      REXKRNL_DEBUG("XMPCaptureOutput(...) - stub, no playback backend to capture from");
+      return X_E_SUCCESS;
     }
   }
   REXKRNL_ERROR(
