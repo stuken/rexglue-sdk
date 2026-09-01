@@ -17,6 +17,7 @@
 #include <rex/audio/asf_demuxer.h>
 #include <rex/audio/audio_driver.h>
 #include <rex/audio/audio_system.h>
+#include <rex/cvar.h>
 #include <rex/filesystem.h>
 #include <rex/logging.h>
 #include <rex/memory/utils.h>
@@ -24,6 +25,9 @@
 #include <rex/string.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xtypes.h>
+
+REXCVAR_DEFINE_BOOL(enable_xmp, true, "Audio",
+                    "Enables XMP (custom soundtrack) playback.");
 
 extern "C" {
 #if REX_COMPILER_MSVC
@@ -60,6 +64,13 @@ size_t SkipId3v2Tag(const uint8_t* data, size_t size) {
 
 AudioMediaPlayer::AudioMediaPlayer(rex::system::KernelState* kernel_state)
     : kernel_state_(kernel_state), memory_(kernel_state->memory()) {
+  if (!REXCVAR_GET(enable_xmp)) {
+    // worker_thread_ stays null; Play() below checks for that and no-ops,
+    // so every other method's existing early-out guards keep working
+    // unchanged (Stop() is only a no-op when idle-with-nothing-pending,
+    // which is exactly the state XMP starts in and stays in when disabled).
+    return;
+  }
   worker_running_.store(true, std::memory_order_relaxed);
   worker_thread_ = rex::thread::Thread::Create({}, [this]() { WorkerThreadMain(); });
   worker_thread_->set_name("XMP Audio Media Player");
@@ -76,6 +87,9 @@ AudioMediaPlayer::~AudioMediaPlayer() {
 }
 
 void AudioMediaPlayer::Play(Song* song) {
+  if (!worker_thread_) {
+    return;  // XMP playback disabled via the enable_xmp cvar
+  }
   Stop();
   {
     auto lock = global_critical_region_.Acquire();
