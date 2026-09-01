@@ -11,6 +11,7 @@
 
 #include <rex/kernel/init.h>
 #include <rex/kernel/xam/apps/app.h>
+#include <rex/kernel/xam/apps/messenger_app.h>
 #include <rex/kernel/xam/apps/xgi_app.h>
 #include <rex/kernel/xam/apps/xlivebase_app.h>
 #include <rex/kernel/xam/apps/xmp_app.h>
@@ -28,6 +29,7 @@ void InitializeKernel(Runtime* runtime, system::KernelState* kernel_state) {
   app_mgr->RegisterApp(std::make_unique<xam::apps::XgiApp>(kernel_state));
   app_mgr->RegisterApp(std::make_unique<xam::apps::XLiveBaseApp>(kernel_state));
   app_mgr->RegisterApp(std::make_unique<xam::apps::XamApp>(kernel_state));
+  app_mgr->RegisterApp(std::make_unique<xam::apps::MessengerApp>(kernel_state));
 
   kernel_state->LoadKernelModule<xboxkrnl::XboxkrnlModule>();
   kernel_state->LoadKernelModule<xam::XamModule>();

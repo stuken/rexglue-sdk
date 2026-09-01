@@ -12,6 +12,7 @@
 #include <rex/kernel/xam/apps/app.h>
 #include <rex/logging.h>
 #include <rex/system/kernel_state.h>
+#include <rex/system/xam/content_device.h>
 #include <rex/system/xenumerator.h>
 #include <rex/thread.h>
 
@@ -60,27 +61,42 @@ X_HRESULT XamApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       uint32_t item_count = 0;
       auto result = e->WriteItems(data->buffer_ptr, buffer, &item_count);
 
-      if (result == X_ERROR_SUCCESS && item_count >= 1) {
-        if (data->length_ptr) {
-          auto length_ptr = memory_->TranslateVirtual<be<uint32_t>*>(data->length_ptr);
-          *length_ptr = 1;
-        }
-        return X_E_SUCCESS;
+      if (data->length_ptr) {
+        auto length_ptr = memory_->TranslateVirtual<be<uint32_t>*>(data->length_ptr);
+        *length_ptr = item_count;
       }
-      return X_E_NO_MORE_FILES;
+
+      return X_HRESULT_FROM_WIN32(result);
     }
     case 0x00020021: {
+      // XContentQueryVolumeDeviceType
       struct message_data {
-        char unk_00[64];
-        rex::be<uint32_t> unk_40;  // KeGetCurrentProcessType() < 1 ? 1 : 0
-        rex::be<uint32_t> unk_44;  // ? output_ptr ?
-        rex::be<uint32_t> unk_48;  // ? overlapped_ptr ?
+        char root_name[64];
+        rex::be<uint32_t> is_title_process;  // KeGetCurrentProcessType() < 1 ? 1 : 0
+        rex::be<uint32_t> device_type_ptr;   // output
+        rex::be<uint32_t> overlapped_ptr;
       }* data = reinterpret_cast<message_data*>(buffer);
       assert_true(buffer_length == sizeof(message_data));
-      auto unk = memory_->TranslateVirtual<rex::be<uint32_t>*>(data->unk_44);
-      *unk = 0;
-      REXKRNL_DEBUG("XamApp(0x00020021)('{}', {:08X}, {:08X}, {:08X})", data->unk_00,
-                    (uint32_t)data->unk_40, (uint32_t)data->unk_44, (uint32_t)data->unk_48);
+
+      std::string target;
+      if (!kernel_state_->file_system()->FindSymbolicLink(std::string(data->root_name) + ':',
+                                                           target)) {
+        return X_E_INVALIDARG;
+      }
+
+      // Only content-package volumes answer this query. ReXGlue always mounts
+      // content under \Device\Content\<n>\ (see ContentPackage) and that
+      // mount is always host-directory-backed, never a disc/ODD volume.
+      if (!target.starts_with("\\Device\\Content\\")) {
+        return X_E_INVALIDARG;
+      }
+
+      auto device_type_ptr = memory_->TranslateVirtual<rex::be<uint32_t>*>(data->device_type_ptr);
+      *device_type_ptr = static_cast<uint32_t>(DeviceType::HDD);
+
+      REXKRNL_DEBUG("XamApp(0x00020021)('{}', {:08X}, {:08X}, {:08X})", data->root_name,
+                    (uint32_t)data->is_title_process, (uint32_t)data->device_type_ptr,
+                    (uint32_t)data->overlapped_ptr);
       return X_E_SUCCESS;
     }
     case 0x00021012: {
@@ -88,15 +104,24 @@ X_HRESULT XamApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       return X_E_SUCCESS;
     }
     case 0x00022005: {
+      // XTitleGetDeploymentType
       struct message_data {
-        rex::be<uint32_t> unk_00;  // ? output_ptr ?
-        rex::be<uint32_t> unk_04;  // ? value/jump to? ?
+        rex::be<uint32_t> deployment_type_ptr;  // output
+        rex::be<uint32_t> overlapped_ptr;
       }* data = reinterpret_cast<message_data*>(buffer);
       assert_true(buffer_length == sizeof(message_data));
-      auto unk = memory_->TranslateVirtual<rex::be<uint32_t>*>(data->unk_00);
-      auto adr = *unk;
-      REXKRNL_DEBUG("XamApp(0x00022005)(%.8X, %.8X)", (uint32_t)data->unk_00,
-                    (uint32_t)data->unk_04);
+
+      // ReXGlue always runs a locally-compiled title directly - there's no
+      // disc-streaming / background-download distinction to report, so this
+      // is always "installed to HDD" (matches xenia's
+      // XDeploymentType::kInstalledToHDD, value 1).
+      constexpr uint32_t kXDeploymentTypeInstalledToHDD = 1;
+      auto deployment_type_ptr =
+          memory_->TranslateVirtual<rex::be<uint32_t>*>(data->deployment_type_ptr);
+      *deployment_type_ptr = kXDeploymentTypeInstalledToHDD;
+
+      REXKRNL_DEBUG("XamApp(0x00022005)(%.8X, %.8X)", (uint32_t)data->deployment_type_ptr,
+                    (uint32_t)data->overlapped_ptr);
       return X_E_SUCCESS;
     }
   }

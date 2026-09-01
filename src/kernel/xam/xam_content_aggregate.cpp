@@ -79,8 +79,8 @@ void AddODDContentTest(object_ref<XStaticEnumerator<XCONTENT_AGGREGATE_DATA>> e,
   }
 }
 
-u32 XamContentAggregateCreateEnumerator_entry(u64 xuid, u32 device_id, u32 content_type, u32 unk3,
-                                              mapped_u32 handle_out) {
+u32 XamContentAggregateCreateEnumerator_entry(u64 xuid, u32 device_id, u32 content_type,
+                                              u32 title_id, mapped_u32 handle_out) {
   assert_not_null(handle_out);
 
   auto device_info = device_id == 0 ? nullptr : GetDummyDeviceInfo(device_id);
@@ -104,18 +104,21 @@ u32 XamContentAggregateCreateEnumerator_entry(u64 xuid, u32 device_id, u32 conte
 
   if (!device_info || device_info->device_type == DeviceType::HDD) {
     // Fetch any alternate title IDs defined in the XEX header
-    // (used by games to load saves from other titles, etc)
-    std::vector<uint32_t> title_ids{kCurrentlyRunningTitleId};
+    // (used by games to load saves from other titles, etc). If the caller
+    // passed an explicit title_id, honor it (lets a title cross-query
+    // another title's content, e.g. shared-save/sequel lookups); otherwise
+    // default to whatever's currently running.
+    std::vector<uint32_t> title_ids{title_id ? title_id : kCurrentlyRunningTitleId};
     auto exe_module = REX_KERNEL_STATE()->GetExecutableModule();
     if (exe_module && exe_module->xex_module()) {
       const auto& alt_ids = exe_module->xex_module()->opt_alternate_title_ids();
       std::copy(alt_ids.cbegin(), alt_ids.cend(), std::back_inserter(title_ids));
     }
 
-    for (auto& title_id : title_ids) {
+    for (auto& tid : title_ids) {
       // Get user-specific content
       auto content_datas = REX_KERNEL_STATE()->content_manager()->ListContent(
-          static_cast<uint32_t>(DummyDeviceId::HDD), xuid, content_type_enum, title_id);
+          static_cast<uint32_t>(DummyDeviceId::HDD), xuid, content_type_enum, tid);
       for (const auto& content_data : content_datas) {
         auto item = e->AppendItem();
         assert_not_null(item);
@@ -127,7 +130,7 @@ u32 XamContentAggregateCreateEnumerator_entry(u64 xuid, u32 device_id, u32 conte
       // Also get common content (xuid=0)
       if (userxuid != 0) {
         auto common_datas = REX_KERNEL_STATE()->content_manager()->ListContent(
-            static_cast<uint32_t>(DummyDeviceId::HDD), 0, content_type_enum, title_id);
+            static_cast<uint32_t>(DummyDeviceId::HDD), 0, content_type_enum, tid);
         for (const auto& content_data : common_datas) {
           auto item = e->AppendItem();
           assert_not_null(item);

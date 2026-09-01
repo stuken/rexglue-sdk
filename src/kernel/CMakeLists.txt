@@ -27,6 +27,7 @@ set(REXKERNEL_SOURCES
     xam/apps/xgi_app.cpp
     xam/apps/xlivebase_app.cpp
     xam/apps/xmp_app.cpp
+    xam/apps/messenger_app.cpp
 
     # XBDM subsystem - provides __imp__Xbdm* symbols
     xbdm/xbdm_module.cpp

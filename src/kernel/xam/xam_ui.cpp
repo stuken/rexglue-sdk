@@ -265,9 +265,10 @@ class MessageBoxDialog : public XamDialog {
 };
 
 // https://www.se7ensins.com/forums/threads/working-xshowmessageboxui.844116/
-u32 XamShowMessageBoxUI_entry(u32 user_index, mapped_wstring title_ptr, mapped_wstring text_ptr,
-                              u32 button_count, mapped_u32 button_ptrs, u32 active_button,
-                              u32 flags, mapped_u32 result_ptr, mapped_void overlapped) {
+static u32 XamShowMessageBoxUiImpl(u32 user_index, mapped_wstring title_ptr,
+                                   mapped_wstring text_ptr, u32 button_count,
+                                   mapped_u32 button_ptrs, u32 active_button, u32 flags,
+                                   mapped_u32 result_ptr, mapped_void overlapped) {
   REXKRNL_DEBUG(
       "XamShowMessageBoxUI({:08X}, {:08X}, {:08X}, {:08X}, {:08X}, {:08X}, {:08X}, {:08X}, {:08X})",
       uint32_t(user_index), title_ptr.guest_address(), text_ptr.guest_address(),
@@ -292,6 +293,9 @@ u32 XamShowMessageBoxUI_entry(u32 user_index, mapped_wstring title_ptr, mapped_w
         REX_KERNEL_MEMORY()->TranslateVirtual(button_ptr));
     buttons.push_back(rex::string::to_utf8(button));
   }
+  if (buttons.empty()) {
+    buttons.push_back("OK");
+  }
 
   X_RESULT result;
   if (REXCVAR_GET(headless)) {
@@ -302,6 +306,9 @@ u32 XamShowMessageBoxUI_entry(u32 user_index, mapped_wstring title_ptr, mapped_w
     };
     result = xeXamDispatchHeadless(run, overlapped.guest_address());
   } else {
+    if (xeXamIsUIActive()) {
+      return X_ERROR_ACCESS_DENIED;
+    }
     // TODO(benvanik): setup icon states.
     switch (flags & 0xF) {
       case 0:
@@ -337,6 +344,13 @@ u32 XamShowMessageBoxUI_entry(u32 user_index, mapped_wstring title_ptr, mapped_w
     }
   }
   return result;
+}
+
+u32 XamShowMessageBoxUI_entry(u32 user_index, mapped_wstring title_ptr, mapped_wstring text_ptr,
+                              u32 button_count, mapped_u32 button_ptrs, u32 active_button,
+                              u32 flags, mapped_u32 result_ptr, mapped_void overlapped) {
+  return XamShowMessageBoxUiImpl(user_index, title_ptr, text_ptr, button_count, button_ptrs,
+                                 active_button, flags, result_ptr, overlapped);
 }
 
 class KeyboardInputDialog : public XamDialog {
@@ -446,6 +460,9 @@ u32 XamShowKeyboardUI_entry(u32 user_index, u32 flags, mapped_wstring default_te
     };
     result = xeXamDispatchHeadless(run, overlapped.guest_address());
   } else {
+    if (xeXamIsUIActive()) {
+      return X_ERROR_ACCESS_DENIED;
+    }
     auto close = [buffer, buffer_length](KeyboardInputDialog* dialog, uint32_t& extended_error,
                                          uint32_t& length) -> X_RESULT {
       if (dialog->cancelled()) {
@@ -550,14 +567,12 @@ u32 XamShowCommunitySessionsUI_entry(u32 r3, u32 r4) {
   return X_ERROR_FUNCTION_FAILED;
 }
 
-uint32_t XamShowMessageBoxUIEx_entry() {
-  // TODO(tomc): implement properly
-  static bool warned = false;
-  if (!warned) {
-    REXKRNL_WARN("[STUB] XamShowMessageBoxUIEx - not implemented");
-    warned = true;
-  }
-  return 0;
+u32 XamShowMessageBoxUIEx_entry(u32 user_index, mapped_wstring title_ptr, mapped_wstring text_ptr,
+                                u32 button_count, mapped_u32 button_ptrs, u32 active_button,
+                                u32 flags, u32 unknown_unused, mapped_u32 result_ptr,
+                                mapped_void overlapped) {
+  return XamShowMessageBoxUiImpl(user_index, title_ptr, text_ptr, button_count, button_ptrs,
+                                 active_button, flags, result_ptr, overlapped);
 }
 
 }  // namespace xam

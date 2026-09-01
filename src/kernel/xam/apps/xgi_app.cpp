@@ -54,7 +54,6 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       return X_E_SUCCESS;
     }
     case 0x000B0008: {
-      // Raw dump so we can confirm the actual buffer layout the game sends.
       uint32_t raw0 = buffer_length >= 4 ? memory::load_and_swap<uint32_t>(buffer + 0) : 0;
       uint32_t raw4 = buffer_length >= 8 ? memory::load_and_swap<uint32_t>(buffer + 4) : 0;
       REXKRNL_INFO("XGIUserWriteAchievements called: buf_len={} raw[0]={:08X} raw[4]={:08X}",
@@ -64,8 +63,9 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       uint32_t achievement_count = raw0;
       uint32_t achievements_ptr = raw4;
 
-      // Empirically confirmed from log: each entry is {u32 padding/user_index, u32 id, ...}.
-      // The achievement ID sits at offset 4, not 0. Stride 8 covers the observed fields.
+      // Matches xenia's XGI_WRITEACHIEVEMENT{num_achievements, achievements_ptr}
+      // pointing at an array of X_USER_ACHIEVEMENT{user_index, achievement_id}
+      // entries (id at offset 4, stride 8).
       constexpr uint32_t kEntryIdOffset = 4;
       constexpr uint32_t kEntryStride = 8;
       constexpr uint32_t kMaxAchievements = 1000;

@@ -40,6 +40,11 @@ X_HRESULT XLiveBaseApp::DispatchMessageSync(uint32_t message, uint32_t buffer_pt
     case 0x00058006: {
       assert_true(!buffer_length || buffer_length == 4);
       REXKRNL_DEBUG("XLiveBaseGetNatType({:08X})", buffer_ptr);
+      // Deliberately always reports an open NAT (xenia instead returns
+      // X_ONLINE_E_LOGON_NOT_LOGGED_ON here), consistent with this dispatch
+      // always faking a signed-on/LAN-capable state elsewhere in this switch
+      // (see 0x00058004 and the XPresenceInitialize workaround). Games that
+      // gate matchmaking eligibility on this value will see it as open.
       memory::store_and_swap<uint32_t>(buffer + 0, 1);  // XONLINE_NAT_OPEN
       return X_E_SUCCESS;
     }
