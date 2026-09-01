@@ -4,6 +4,7 @@
 add_library(rexaudio OBJECT
     
     audio_driver.cpp
+    audio_media_player.cpp
     audio_system.cpp
     downmix.cpp
     xma_context.cpp

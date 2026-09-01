@@ -9,6 +9,9 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <algorithm>
+
+#include <rex/audio/audio_media_player.h>
 #include <rex/kernel/xam/apps/xmp_app.h>
 #include <rex/logging.h>
 #include <rex/system/xthread.h>
@@ -33,7 +36,10 @@ XmpApp::XmpApp(KernelState* kernel_state)
       active_playlist_(nullptr),
       active_song_index_(0),
       next_playlist_handle_(1),
-      next_song_handle_(1) {}
+      next_song_handle_(1),
+      media_player_(std::make_unique<rex::audio::AudioMediaPlayer>(kernel_state)) {}
+
+XmpApp::~XmpApp() = default;
 
 X_HRESULT XmpApp::XMPGetStatus(uint32_t state_ptr) {
   if (!XThread::GetCurrentThread()->main_thread()) {
@@ -137,11 +143,24 @@ X_HRESULT XmpApp::XMPPlayTitlePlaylist(uint32_t playlist_handle, uint32_t song_h
     return X_E_SUCCESS;
   }
 
-  // Start playlist?
-  REXKRNL_WARN("Playlist playback not supported");
+  if (playlist->songs.empty()) {
+    return X_E_FAIL;
+  }
+
   active_playlist_ = playlist;
   active_song_index_ = 0;
+  if (song_handle) {
+    auto it = std::find_if(playlist->songs.begin(), playlist->songs.end(),
+                           [song_handle](const std::unique_ptr<Song>& song) {
+                             return song->handle == song_handle;
+                           });
+    if (it != playlist->songs.end()) {
+      active_song_index_ = static_cast<int>(std::distance(playlist->songs.begin(), it));
+    }
+  }
+
   state_ = State::kPlaying;
+  media_player_->Play(playlist->songs[active_song_index_].get());
   OnStateChanged();
   kernel_state_->BroadcastNotification(kMsgPlaybackBehaviorChanged, 1);
   return X_E_SUCCESS;
@@ -151,6 +170,7 @@ X_HRESULT XmpApp::XMPContinue() {
   REXKRNL_DEBUG("XMPContinue()");
   if (state_ == State::kPaused) {
     state_ = State::kPlaying;
+    media_player_->Continue();
   }
   OnStateChanged();
   return X_E_SUCCESS;
@@ -159,6 +179,7 @@ X_HRESULT XmpApp::XMPContinue() {
 X_HRESULT XmpApp::XMPStop(uint32_t unk) {
   assert_zero(unk);
   REXKRNL_DEBUG("XMPStop({:08X})", unk);
+  media_player_->Stop();
   active_playlist_ = nullptr;  // ?
   active_song_index_ = 0;
   state_ = State::kIdle;
@@ -170,6 +191,7 @@ X_HRESULT XmpApp::XMPPause() {
   REXKRNL_DEBUG("XMPPause()");
   if (state_ == State::kPlaying) {
     state_ = State::kPaused;
+    media_player_->Pause();
   }
   OnStateChanged();
   return X_E_SUCCESS;
@@ -182,6 +204,7 @@ X_HRESULT XmpApp::XMPNext() {
   }
   state_ = State::kPlaying;
   active_song_index_ = (active_song_index_ + 1) % active_playlist_->songs.size();
+  media_player_->Play(active_playlist_->songs[active_song_index_].get());
   OnStateChanged();
   return X_E_SUCCESS;
 }
@@ -197,6 +220,7 @@ X_HRESULT XmpApp::XMPPrevious() {
   } else {
     --active_song_index_;
   }
+  media_player_->Play(active_playlist_->songs[active_song_index_].get());
   OnStateChanged();
   return X_E_SUCCESS;
 }
@@ -301,6 +325,7 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       assert_true(args->xmp_client == 0x00000002);
       REXKRNL_DEBUG("XMPSetVolume({:g})", float(args->value));
       volume_ = args->value;
+      media_player_->SetVolume(volume_);
       return X_E_SUCCESS;
     }
     case 0x0007000D: {

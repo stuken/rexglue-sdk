@@ -48,6 +48,15 @@ class AudioSystem : public system::IAudioSystem {
   void UnregisterClient(size_t index);
   void SubmitFrame(size_t index, uint32_t samples_ptr);
 
+  // Creates an independent driver instance that isn't part of the 8-slot
+  // guest-callback client table used by RegisterClient/SubmitFrame(index,...)
+  // (which XAudioRegisterRenderDriverClient's guest-driven pump loop owns).
+  // For a host-driven playback source with its own worker thread - e.g. the
+  // XMP audio backend - that pushes frames on its own schedule rather than
+  // being pumped via a guest callback.
+  X_STATUS CreateStandaloneDriver(rex::thread::Semaphore* semaphore, AudioDriver** out_driver);
+  void DestroyStandaloneDriver(AudioDriver* driver);
+
   bool Save(stream::ByteStream* stream);
   bool Restore(stream::ByteStream* stream);
 

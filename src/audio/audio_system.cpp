@@ -276,6 +276,18 @@ void AudioSystem::SubmitFrame(size_t index, uint32_t samples_ptr) {
   (clients_[index].driver)->SubmitFrame(samples_ptr);
 }
 
+X_STATUS AudioSystem::CreateStandaloneDriver(rex::thread::Semaphore* semaphore,
+                                             AudioDriver** out_driver) {
+  // `index` is only meaningful to RegisterClient's own clients_[] slot
+  // bookkeeping; SDLAudioSystem::CreateDriver (the only real implementation)
+  // ignores it, so kMaximumClientCount is a safe sentinel meaning "no slot".
+  return CreateDriver(kMaximumClientCount, semaphore, out_driver);
+}
+
+void AudioSystem::DestroyStandaloneDriver(AudioDriver* driver) {
+  DestroyDriver(driver);
+}
+
 void AudioSystem::UnregisterClient(size_t index) {
   SCOPE_profile_cpu_f("apu");
 

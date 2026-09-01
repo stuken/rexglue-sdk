@@ -19,6 +19,10 @@
 #include <rex/system/xam/app_manager.h>
 #include <rex/thread/mutex.h>
 
+namespace rex::audio {
+class AudioMediaPlayer;
+}  // namespace rex::audio
+
 namespace rex {
 namespace kernel {
 namespace xam {
@@ -71,6 +75,7 @@ class XmpApp : public system::xam::App {
   };
 
   explicit XmpApp(system::KernelState* kernel_state);
+  ~XmpApp() override;
 
   X_HRESULT XMPGetStatus(uint32_t status_ptr);
 
@@ -111,6 +116,12 @@ class XmpApp : public system::xam::App {
   std::unordered_map<uint32_t, Playlist*> playlists_;
   uint32_t next_playlist_handle_;
   uint32_t next_song_handle_;
+
+  // Real playback backend (decode + mix + output) for whichever song
+  // active_playlist_/active_song_index_ currently point at. See
+  // audio_media_player.h for why this is a separate class rather than
+  // inline in XmpApp.
+  std::unique_ptr<rex::audio::AudioMediaPlayer> media_player_;
 };
 
 }  // namespace apps
