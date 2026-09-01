@@ -310,6 +310,21 @@ void AudioMediaPlayer::PlaySong(Song* song) {
              rex::string::to_utf8(song->name), rex::string::to_utf8(song->file_path),
              static_cast<uint32_t>(song->format), volume_.load(std::memory_order_relaxed));
 
+  // A title that has never set a real volume - or explicitly asks for
+  // exactly 0.0 - is asking for "whatever the system default is": on real
+  // hardware/xenia this reads a persisted XCONFIG_USER_MUSIC_VOLUME setting
+  // (see xe::apu::AudioMediaPlayer::Play()'s `if (volume_ == 0.0f) { volume_
+  // = xconfig()->ReadSetting(...); }`). RexGlue has no persisted user-
+  // settings store yet (that's the GPD/profile rewrite tracked separately in
+  // XAM_PORT_AUDIT.md), so full volume is used as the closest available
+  // default rather than staying silent - confirmed via PGR3 logs setting
+  // volume to 0.0 once at boot and never raising it again, which would
+  // otherwise permanently silence every song for the rest of the session.
+  if (volume_.load(std::memory_order_relaxed) == 0.0f) {
+    volume_.store(1.0f, std::memory_order_relaxed);
+    REXAPU_INFO("AudioMediaPlayer: volume was 0 (no real value set yet) - defaulting to 1.0");
+  }
+
   std::vector<uint8_t> file_data = LoadSongToMemory(kernel_state_, song->file_path);
   if (file_data.empty()) {
     REXAPU_WARN("AudioMediaPlayer: failed to load song file '{}' for playback",

@@ -311,6 +311,11 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
 
       assert_true(args->xmp_client == 0x00000002);
       REXKRNL_DEBUG("XMPGetVolume({:08X})", uint32_t(args->volume_ptr));
+      // Read back from media_player_ rather than the local volume_ - it may
+      // have substituted a real default for an explicit 0.0 (see
+      // AudioMediaPlayer::PlaySong), and this keeps a single source of truth
+      // instead of a game seeing a stale 0 while audio actually plays.
+      volume_ = media_player_->GetVolume();
       memory::store_and_swap<float>(memory_->TranslateVirtual(args->volume_ptr), volume_);
       return X_E_SUCCESS;
     }
