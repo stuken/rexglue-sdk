@@ -289,13 +289,20 @@ void AudioMediaPlayer::SubmitPendingFrame() {
   // than stalling the worker thread forever on a stuck/dead driver.
   rex::thread::Wait(driver_semaphore_.get(), false, std::chrono::milliseconds(500));
 
+  // Applied here (at the final ~5.3ms output-frame granularity) rather than
+  // where samples are decoded (~20-40ms MP3/WMA frame granularity) so an
+  // in-flight XMPSetVolume call - e.g. a game's music volume slider - takes
+  // effect on already-decoded-but-not-yet-submitted samples too, not just
+  // audio decoded after the call.
+  const float vol = volume_.load(std::memory_order_relaxed);
+
   uint8_t* host_ptr = memory_->TranslateVirtual(frame_guest_ptr_);
   std::memset(host_ptr, 0, kOutputChannels * kSamplesPerChannel * sizeof(float));
   float* channel0 = reinterpret_cast<float*>(host_ptr) + 0 * kSamplesPerChannel;
   float* channel1 = reinterpret_cast<float*>(host_ptr) + 1 * kSamplesPerChannel;
   for (size_t i = 0; i < kSamplesPerChannel; ++i) {
-    rex::memory::store_and_swap<float>(&channel0[i], pending_left_[i]);
-    rex::memory::store_and_swap<float>(&channel1[i], pending_right_[i]);
+    rex::memory::store_and_swap<float>(&channel0[i], pending_left_[i] * vol);
+    rex::memory::store_and_swap<float>(&channel1[i], pending_right_[i] * vol);
   }
   // Channels 2-5 (fc, lf, bl, br) are left silent (already zeroed above).
 
@@ -410,11 +417,8 @@ void AudioMediaPlayer::PlayMp3Data(const std::vector<uint8_t>& file_data) {
                  decoded->sample_rate, decoded->channels, volume_.load(std::memory_order_relaxed));
     }
     ++decoded_frame_count;
-    const float vol = volume_.load(std::memory_order_relaxed);
-    if (vol != 1.0f) {
-      for (float& s : left) s *= vol;
-      for (float& s : right) s *= vol;
-    }
+    // Volume is applied later, in SubmitPendingFrame - see its comment for
+    // why (finer-grained, so in-flight volume changes take effect sooner).
     const int sample_rate = decoded->sample_rate > 0 ? decoded->sample_rate : kOutputSampleRate;
     AppendDecoded(left.data(), right.data(), left.size(), sample_rate);
   };
@@ -562,11 +566,8 @@ void AudioMediaPlayer::PlayWmaData(const std::vector<uint8_t>& file_data) {
                  volume_.load(std::memory_order_relaxed));
     }
     ++decoded_frame_count;
-    const float vol = volume_.load(std::memory_order_relaxed);
-    if (vol != 1.0f) {
-      for (float& s : left) s *= vol;
-      for (float& s : right) s *= vol;
-    }
+    // Volume is applied later, in SubmitPendingFrame - see its comment for
+    // why (finer-grained, so in-flight volume changes take effect sooner).
     const int sample_rate = decoded->sample_rate > 0 ? decoded->sample_rate : kOutputSampleRate;
     AppendDecoded(left.data(), right.data(), left.size(), sample_rate);
   };

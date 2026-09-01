@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <memory>
@@ -91,7 +92,11 @@ class AudioMediaPlayer {
   // wired through rex::audio::AudioDriver (which has no per-driver volume
   // control, only a global output-stage gain shared with real in-game
   // audio - see downmix.h) - this only affects XMP's own stream.
-  void SetVolume(float volume) { volume_.store(volume, std::memory_order_relaxed); }
+  // Matches xenia's own clamp (std::min(volume, 1.0f)) - only an upper bound,
+  // since a title is never expected to send anything above unity gain.
+  void SetVolume(float volume) {
+    volume_.store(std::min(volume, 1.0f), std::memory_order_relaxed);
+  }
   float GetVolume() const { return volume_.load(std::memory_order_relaxed); }
 
  private:
