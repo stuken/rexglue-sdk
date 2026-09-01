@@ -11,6 +11,8 @@
 
 #pragma once
 
+#include <algorithm>
+#include <array>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -237,6 +239,352 @@ class UserProfile {
   void LoadSetting(UserProfile::Setting*);
   void SaveSetting(UserProfile::Setting*);
 };
+
+// Real Xbox 360 XPROFILE_* setting IDs, ported verbatim from xenia's
+// user_settings.h (xenia's UserSettingId enum / SettingKey helper), used
+// here only to validate that a setting_id a title reads/writes is one a
+// real console would recognize. Values must not be changed - they're the
+// wire-format setting IDs games actually use.
+constexpr uint32_t kMaxUserSettingId = 0x58;
+constexpr uint32_t kMaxUserDataSize = 0x03E8;
+
+constexpr uint32_t SettingKey(UserProfile::Setting::Type type, uint16_t size, uint16_t id) {
+  return static_cast<uint32_t>(type) << 28 | size << 16 | id;
+}
+
+enum class UserSettingId : uint32_t {
+  XPROFILE_PERMISSIONS = SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 0),
+  XPROFILE_GAMER_TYPE = SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 1),
+  XPROFILE_GAMER_YAXIS_INVERSION =
+      SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 2),
+  XPROFILE_OPTION_CONTROLLER_VIBRATION =
+      SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 3),
+  XPROFILE_GAMERCARD_ZONE = SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 4),
+  XPROFILE_GAMERCARD_REGION = SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 5),
+  XPROFILE_GAMERCARD_CRED = SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 6),
+  XPROFILE_GAMER_PRESENCE_USER_STATE =
+      SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 7),
+  XPROFILE_GAMERCARD_HAS_VISION =
+      SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 8),
+
+  XPROFILE_OPTION_VOICE_MUTED =
+      SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 0xC),
+  XPROFILE_OPTION_VOICE_THRU_SPEAKERS =
+      SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 0xD),
+  XPROFILE_OPTION_VOICE_VOLUME =
+      SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 0xE),
+
+  XPROFILE_GAMERCARD_TITLES_PLAYED =
+      SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 0x12),
+  XPROFILE_GAMERCARD_ACHIEVEMENTS_EARNED =
+      SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 0x13),
+  XPROFILE_GAMER_DIFFICULTY = SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 0x15),
+  XPROFILE_GAMER_CONTROL_SENSITIVITY =
+      SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 0x18),
+  XPROFILE_GAMER_PREFERRED_COLOR_FIRST =
+      SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 0x1D),
+  XPROFILE_GAMER_PREFERRED_COLOR_SECOND =
+      SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 0x1E),
+  XPROFILE_GAMER_ACTION_AUTO_AIM =
+      SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 0x22),
+  XPROFILE_GAMER_ACTION_AUTO_CENTER =
+      SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 0x23),
+  XPROFILE_GAMER_ACTION_MOVEMENT_CONTROL =
+      SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 0x24),
+  XPROFILE_GAMER_RACE_TRANSMISSION =
+      SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 0x26),
+  XPROFILE_GAMER_RACE_CAMERA_LOCATION =
+      SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 0x27),
+  XPROFILE_GAMER_RACE_BRAKE_CONTROL =
+      SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 0x28),
+  XPROFILE_GAMER_RACE_ACCELERATOR_CONTROL =
+      SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 0x29),
+  XPROFILE_GAMERCARD_TITLE_CRED_EARNED =
+      SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 0x38),
+  XPROFILE_GAMERCARD_TITLE_ACHIEVEMENTS_EARNED =
+      SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 0x39),
+  XPROFILE_GAMER_TIER = SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 0x3A),
+  XPROFILE_MESSENGER_SIGNUP_STATE =
+      SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 0x3B),
+  XPROFILE_MESSENGER_AUTO_SIGNIN =
+      SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 0x3C),
+  XPROFILE_SAVE_WINDOWS_LIVE_PASSWORD =
+      SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 0x3D),
+  XPROFILE_FRIENDSAPP_SHOW_BUDDIES =
+      SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 0x3E),
+  XPROFILE_GAMERCARD_SERVICE_TYPE_FLAGS =
+      SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 0x3F),
+  XPROFILE_ENABLE_TUTORIALS =
+      SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 0x40),
+  XPROFILE_ENABLE_SUBTITLES =
+      SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 0x41),
+  XPROFILE_UNKNOWN_42 = SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 0x42),
+  XPROFILE_UNKNOWN_43 = SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 0x43),
+  XPROFILE_AIM_SENSITIVITY_XAXIS =
+      SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 0x44),
+  XPROFILE_AIM_SENSITIVITY_YAXIS =
+      SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 0x45),
+  XPROFILE_UNKNOWN_46 = SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 0x46),
+  XPROFILE_TENURE_LEVEL = SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 0x47),
+  XPROFILE_TENURE_MILESTONE =
+      SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 0x48),
+
+  XPROFILE_UNKNOWN_49 = SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 0x49),
+  XPROFILE_SHOW_DAMAGE_INDICATORS =
+      SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 0x4A),
+  XPROFILE_SUBSCRIPTION_TYPE_LENGTH_IN_MONTHS =
+      SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 0x4B),
+  XPROFILE_SUBSCRIPTION_PAYMENT_TYPE =
+      SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 0x4C),
+  XPROFILE_PEC_INFO = SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 0x4D),
+  // set by XamUserNuiEnableBiometric
+  XPROFILE_NUI_BIOMETRIC_SIGNIN =
+      SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 0x4E),
+  XPROFILE_GFWL_VADNORMAL = SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 0x4F),
+  XPROFILE_UNKNOWN_50 = SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 0x50),
+  XPROFILE_MINIMAP_AUTOROTATE =
+      SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 0x51),
+  XPROFILE_BEACONS_SOCIAL_NETWORK_SHARING =
+      SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 0x52),
+  XPROFILE_USER_PREFERENCES =
+      SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 0x53),
+  // "XboxOneGamerscore" inside dash.xex
+  XPROFILE_XBOXONE_GAMERSCORE =
+      SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 0x57),
+
+  WEB_EMAIL_FORMAT = SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 0x2000),
+  WEB_FLAGS = SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 0x2001),
+  WEB_SPAM = SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 0x2002),
+  WEB_FAVORITE_GENRE = SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 0x2003),
+  WEB_FAVORITE_GAME = SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 0x2004),
+  WEB_FAVORITE_GAME1 = SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 0x2005),
+  WEB_FAVORITE_GAME2 = SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 0x2006),
+  WEB_FAVORITE_GAME3 = SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 0x2007),
+  WEB_FAVORITE_GAME4 = SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 0x2008),
+  WEB_FAVORITE_GAME5 = SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 0x2009),
+  WEB_PLATFORMS_OWNED = SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 0x200A),
+  WEB_CONNECTION_SPEED = SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 0x200B),
+  WEB_FLASH = SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 0x200C),
+  WEB_VIDEO_PREFERENCE = SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 0x200D),
+  XPROFILE_CRUX_MEDIA_STYLE1 =
+      SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 0x3EA),
+  XPROFILE_CRUX_MEDIA_STYLE2 =
+      SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 0x3EB),
+  XPROFILE_CRUX_MEDIA_STYLE3 =
+      SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 0x3EC),
+  XPROFILE_CRUX_TOP_ALBUM1 =
+      SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 0x3ED),
+  XPROFILE_CRUX_TOP_ALBUM2 =
+      SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 0x3EE),
+  XPROFILE_CRUX_TOP_ALBUM3 =
+      SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 0x3EF),
+  XPROFILE_CRUX_TOP_ALBUM4 =
+      SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 0x3F0),
+  XPROFILE_CRUX_TOP_ALBUM5 =
+      SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 0x3F1),
+  XPROFILE_CRUX_BKGD_IMAGE =
+      SettingKey(UserProfile::Setting::Type::INT32, sizeof(uint32_t), 0x3F3),
+
+  XPROFILE_GAMERCARD_USER_LOCATION =
+      SettingKey(UserProfile::Setting::Type::WSTRING, 0x52, 0x41),
+  XPROFILE_GAMERCARD_USER_NAME = SettingKey(UserProfile::Setting::Type::WSTRING, 0x104, 0x40),
+  XPROFILE_GAMERCARD_USER_URL = SettingKey(UserProfile::Setting::Type::WSTRING, 0x190, 0x42),
+  XPROFILE_GAMERCARD_USER_BIO =
+      SettingKey(UserProfile::Setting::Type::WSTRING, kMaxUserDataSize, 0x43),
+
+  XPROFILE_CRUX_BIO = SettingKey(UserProfile::Setting::Type::WSTRING, kMaxUserDataSize, 0x3FA),
+  XPROFILE_CRUX_BG_SMALL_PRIVATE =
+      SettingKey(UserProfile::Setting::Type::WSTRING, 0x64, 0x3FB),
+  XPROFILE_CRUX_BG_LARGE_PRIVATE =
+      SettingKey(UserProfile::Setting::Type::WSTRING, 0x64, 0x3FC),
+  XPROFILE_CRUX_BG_SMALL_PUBLIC =
+      SettingKey(UserProfile::Setting::Type::WSTRING, 0x64, 0x3FD),
+  XPROFILE_CRUX_BG_LARGE_PUBLIC =
+      SettingKey(UserProfile::Setting::Type::WSTRING, 0x64, 0x3FE),
+
+  XPROFILE_GAMERCARD_PICTURE_KEY = SettingKey(UserProfile::Setting::Type::WSTRING, 0x64, 0xF),
+  XPROFILE_GAMERCARD_PERSONAL_PICTURE =
+      SettingKey(UserProfile::Setting::Type::WSTRING, 0x64, 0x10),
+  XPROFILE_GAMERCARD_MOTTO = SettingKey(UserProfile::Setting::Type::WSTRING, 0x2C, 0x11),
+  XPROFILE_GFWL_RECDEVICEDESC = SettingKey(UserProfile::Setting::Type::WSTRING, 200, 0x49),
+
+  XPROFILE_GFWL_PLAYDEVICEDESC = SettingKey(UserProfile::Setting::Type::WSTRING, 200, 0x4B),
+  XPROFILE_CRUX_MEDIA_PICTURE = SettingKey(UserProfile::Setting::Type::WSTRING, 0x64, 0x3E8),
+  XPROFILE_CRUX_MEDIA_MOTTO = SettingKey(UserProfile::Setting::Type::WSTRING, 0x100, 0x3F6),
+
+  XPROFILE_GAMERCARD_REP = SettingKey(UserProfile::Setting::Type::FLOAT, sizeof(float), 0xB),
+  XPROFILE_GFWL_VOLUMELEVEL = SettingKey(UserProfile::Setting::Type::FLOAT, sizeof(float), 0x4C),
+  XPROFILE_GFWL_RECLEVEL = SettingKey(UserProfile::Setting::Type::FLOAT, sizeof(float), 0x4D),
+  XPROFILE_GFWL_PLAYDEVICE = SettingKey(UserProfile::Setting::Type::BINARY, 0x10, 0x4A),
+
+  XPROFILE_VIDEO_METADATA = SettingKey(UserProfile::Setting::Type::BINARY, 0x20, 0x4A),
+
+  XPROFILE_CRUX_OFFLINE_ID = SettingKey(UserProfile::Setting::Type::BINARY, 0x34, 0x3F2),
+
+  XPROFILE_UNK_61180050 = SettingKey(UserProfile::Setting::Type::BINARY, 280, 0x50),
+
+  XPROFILE_JUMP_IN_LIST = SettingKey(UserProfile::Setting::Type::BINARY, kMaxUserDataSize, 0x51),
+
+  XPROFILE_GAMERCARD_PARTY_ADDR = SettingKey(UserProfile::Setting::Type::BINARY, 0x62, 0x54),
+
+  XPROFILE_CRUX_TOP_MUSIC = SettingKey(UserProfile::Setting::Type::BINARY, 0xA8, 0x3F5),
+
+  XPROFILE_CRUX_TOP_MEDIAID1 = SettingKey(UserProfile::Setting::Type::BINARY, 0x10, 0x3F7),
+  XPROFILE_CRUX_TOP_MEDIAID2 = SettingKey(UserProfile::Setting::Type::BINARY, 0x10, 0x3F8),
+  XPROFILE_CRUX_TOP_MEDIAID3 = SettingKey(UserProfile::Setting::Type::BINARY, 0x10, 0x3F9),
+
+  XPROFILE_GAMERCARD_AVATAR_INFO_1 =
+      SettingKey(UserProfile::Setting::Type::BINARY, kMaxUserDataSize, 0x44),
+  XPROFILE_GAMERCARD_AVATAR_INFO_2 =
+      SettingKey(UserProfile::Setting::Type::BINARY, kMaxUserDataSize, 0x45),
+  XPROFILE_GAMERCARD_PARTY_INFO = SettingKey(UserProfile::Setting::Type::BINARY, 0x100, 0x46),
+
+  XPROFILE_TITLE_SPECIFIC1 =
+      SettingKey(UserProfile::Setting::Type::BINARY, kMaxUserDataSize, 0x3FFF),
+  XPROFILE_TITLE_SPECIFIC2 =
+      SettingKey(UserProfile::Setting::Type::BINARY, kMaxUserDataSize, 0x3FFE),
+  XPROFILE_TITLE_SPECIFIC3 =
+      SettingKey(UserProfile::Setting::Type::BINARY, kMaxUserDataSize, 0x3FFD),
+
+  XPROFILE_CRUX_LAST_CHANGE_TIME =
+      SettingKey(UserProfile::Setting::Type::DATETIME, sizeof(uint64_t), 0x3F4),
+  // aka ProfileDateTimeCreated?
+  XPROFILE_TENURE_NEXT_MILESTONE_DATE =
+      SettingKey(UserProfile::Setting::Type::DATETIME, sizeof(uint64_t), 0x49),
+  // named "LastOnLIVE" in Velocity
+  XPROFILE_LAST_LIVE_SIGNIN =
+      SettingKey(UserProfile::Setting::Type::DATETIME, sizeof(uint64_t), 0x4F),
+};
+
+inline constexpr std::array<UserSettingId, 115> known_settings = {
+    UserSettingId::XPROFILE_PERMISSIONS,
+    UserSettingId::XPROFILE_GAMER_TYPE,
+    UserSettingId::XPROFILE_GAMER_YAXIS_INVERSION,
+    UserSettingId::XPROFILE_OPTION_CONTROLLER_VIBRATION,
+    UserSettingId::XPROFILE_GAMERCARD_ZONE,
+    UserSettingId::XPROFILE_GAMERCARD_REGION,
+    UserSettingId::XPROFILE_GAMERCARD_CRED,
+    UserSettingId::XPROFILE_GAMER_PRESENCE_USER_STATE,
+    UserSettingId::XPROFILE_GAMERCARD_HAS_VISION,
+    UserSettingId::XPROFILE_OPTION_VOICE_MUTED,
+    UserSettingId::XPROFILE_OPTION_VOICE_THRU_SPEAKERS,
+    UserSettingId::XPROFILE_OPTION_VOICE_VOLUME,
+    UserSettingId::XPROFILE_GAMERCARD_TITLES_PLAYED,
+    UserSettingId::XPROFILE_GAMERCARD_ACHIEVEMENTS_EARNED,
+    UserSettingId::XPROFILE_GAMER_DIFFICULTY,
+    UserSettingId::XPROFILE_GAMER_CONTROL_SENSITIVITY,
+    UserSettingId::XPROFILE_GAMER_PREFERRED_COLOR_FIRST,
+    UserSettingId::XPROFILE_GAMER_PREFERRED_COLOR_SECOND,
+    UserSettingId::XPROFILE_GAMER_ACTION_AUTO_AIM,
+    UserSettingId::XPROFILE_GAMER_ACTION_AUTO_CENTER,
+    UserSettingId::XPROFILE_GAMER_ACTION_MOVEMENT_CONTROL,
+    UserSettingId::XPROFILE_GAMER_RACE_TRANSMISSION,
+    UserSettingId::XPROFILE_GAMER_RACE_CAMERA_LOCATION,
+    UserSettingId::XPROFILE_GAMER_RACE_BRAKE_CONTROL,
+    UserSettingId::XPROFILE_GAMER_RACE_ACCELERATOR_CONTROL,
+    UserSettingId::XPROFILE_GAMERCARD_TITLE_CRED_EARNED,
+    UserSettingId::XPROFILE_GAMERCARD_TITLE_ACHIEVEMENTS_EARNED,
+    UserSettingId::XPROFILE_GAMER_TIER,
+    UserSettingId::XPROFILE_MESSENGER_SIGNUP_STATE,
+    UserSettingId::XPROFILE_MESSENGER_AUTO_SIGNIN,
+    UserSettingId::XPROFILE_SAVE_WINDOWS_LIVE_PASSWORD,
+    UserSettingId::XPROFILE_FRIENDSAPP_SHOW_BUDDIES,
+    UserSettingId::XPROFILE_GAMERCARD_SERVICE_TYPE_FLAGS,
+    UserSettingId::XPROFILE_ENABLE_TUTORIALS,
+    UserSettingId::XPROFILE_ENABLE_SUBTITLES,
+    UserSettingId::XPROFILE_UNKNOWN_42,
+    UserSettingId::XPROFILE_UNKNOWN_43,
+    UserSettingId::XPROFILE_AIM_SENSITIVITY_XAXIS,
+    UserSettingId::XPROFILE_AIM_SENSITIVITY_YAXIS,
+    UserSettingId::XPROFILE_UNKNOWN_46,
+    UserSettingId::XPROFILE_TENURE_LEVEL,
+    UserSettingId::XPROFILE_TENURE_MILESTONE,
+    UserSettingId::XPROFILE_UNKNOWN_49,
+    UserSettingId::XPROFILE_SHOW_DAMAGE_INDICATORS,
+    UserSettingId::XPROFILE_SUBSCRIPTION_TYPE_LENGTH_IN_MONTHS,
+    UserSettingId::XPROFILE_SUBSCRIPTION_PAYMENT_TYPE,
+    UserSettingId::XPROFILE_PEC_INFO,
+    UserSettingId::XPROFILE_NUI_BIOMETRIC_SIGNIN,
+    UserSettingId::XPROFILE_GFWL_VADNORMAL,
+    UserSettingId::XPROFILE_UNKNOWN_50,
+    UserSettingId::XPROFILE_MINIMAP_AUTOROTATE,
+    UserSettingId::XPROFILE_BEACONS_SOCIAL_NETWORK_SHARING,
+    UserSettingId::XPROFILE_USER_PREFERENCES,
+    UserSettingId::XPROFILE_XBOXONE_GAMERSCORE,
+    UserSettingId::WEB_EMAIL_FORMAT,
+    UserSettingId::WEB_FLAGS,
+    UserSettingId::WEB_SPAM,
+    UserSettingId::WEB_FAVORITE_GENRE,
+    UserSettingId::WEB_FAVORITE_GAME,
+    UserSettingId::WEB_FAVORITE_GAME1,
+    UserSettingId::WEB_FAVORITE_GAME2,
+    UserSettingId::WEB_FAVORITE_GAME3,
+    UserSettingId::WEB_FAVORITE_GAME4,
+    UserSettingId::WEB_FAVORITE_GAME5,
+    UserSettingId::WEB_PLATFORMS_OWNED,
+    UserSettingId::WEB_CONNECTION_SPEED,
+    UserSettingId::WEB_FLASH,
+    UserSettingId::WEB_VIDEO_PREFERENCE,
+    UserSettingId::XPROFILE_CRUX_MEDIA_STYLE1,
+    UserSettingId::XPROFILE_CRUX_MEDIA_STYLE2,
+    UserSettingId::XPROFILE_CRUX_MEDIA_STYLE3,
+    UserSettingId::XPROFILE_CRUX_TOP_ALBUM1,
+    UserSettingId::XPROFILE_CRUX_TOP_ALBUM2,
+    UserSettingId::XPROFILE_CRUX_TOP_ALBUM3,
+    UserSettingId::XPROFILE_CRUX_TOP_ALBUM4,
+    UserSettingId::XPROFILE_CRUX_TOP_ALBUM5,
+    UserSettingId::XPROFILE_CRUX_BKGD_IMAGE,
+    UserSettingId::XPROFILE_GAMERCARD_USER_LOCATION,
+    UserSettingId::XPROFILE_GAMERCARD_USER_NAME,
+    UserSettingId::XPROFILE_GAMERCARD_USER_URL,
+    UserSettingId::XPROFILE_GAMERCARD_USER_BIO,
+    UserSettingId::XPROFILE_CRUX_BIO,
+    UserSettingId::XPROFILE_CRUX_BG_SMALL_PRIVATE,
+    UserSettingId::XPROFILE_CRUX_BG_LARGE_PRIVATE,
+    UserSettingId::XPROFILE_CRUX_BG_SMALL_PUBLIC,
+    UserSettingId::XPROFILE_CRUX_BG_LARGE_PUBLIC,
+    UserSettingId::XPROFILE_GAMERCARD_PICTURE_KEY,
+    UserSettingId::XPROFILE_GAMERCARD_PERSONAL_PICTURE,
+    UserSettingId::XPROFILE_GAMERCARD_MOTTO,
+    UserSettingId::XPROFILE_GFWL_RECDEVICEDESC,
+    UserSettingId::XPROFILE_GFWL_PLAYDEVICEDESC,
+    UserSettingId::XPROFILE_CRUX_MEDIA_PICTURE,
+    UserSettingId::XPROFILE_CRUX_MEDIA_MOTTO,
+    UserSettingId::XPROFILE_GAMERCARD_REP,
+    UserSettingId::XPROFILE_GFWL_VOLUMELEVEL,
+    UserSettingId::XPROFILE_GFWL_RECLEVEL,
+    UserSettingId::XPROFILE_GFWL_PLAYDEVICE,
+    UserSettingId::XPROFILE_VIDEO_METADATA,
+    UserSettingId::XPROFILE_CRUX_OFFLINE_ID,
+    UserSettingId::XPROFILE_UNK_61180050,
+    UserSettingId::XPROFILE_JUMP_IN_LIST,
+    UserSettingId::XPROFILE_GAMERCARD_PARTY_ADDR,
+    UserSettingId::XPROFILE_CRUX_TOP_MUSIC,
+    UserSettingId::XPROFILE_CRUX_TOP_MEDIAID1,
+    UserSettingId::XPROFILE_CRUX_TOP_MEDIAID2,
+    UserSettingId::XPROFILE_CRUX_TOP_MEDIAID3,
+    UserSettingId::XPROFILE_GAMERCARD_AVATAR_INFO_1,
+    UserSettingId::XPROFILE_GAMERCARD_AVATAR_INFO_2,
+    UserSettingId::XPROFILE_GAMERCARD_PARTY_INFO,
+    UserSettingId::XPROFILE_TITLE_SPECIFIC1,
+    UserSettingId::XPROFILE_TITLE_SPECIFIC2,
+    UserSettingId::XPROFILE_TITLE_SPECIFIC3,
+    UserSettingId::XPROFILE_CRUX_LAST_CHANGE_TIME,
+    UserSettingId::XPROFILE_TENURE_NEXT_MILESTONE_DATE,
+    UserSettingId::XPROFILE_LAST_LIVE_SIGNIN,
+};
+
+// True if setting_id is either a "core" setting (id sub-field < kMaxUserSettingId,
+// matching xenia's is_setting_valid) or one of the extended settings above.
+inline bool IsKnownUserSettingId(uint32_t setting_id) {
+  UserProfile::Setting::Key key;
+  key.value = setting_id;
+  if (key.id < kMaxUserSettingId) {
+    return true;
+  }
+  return std::find(known_settings.cbegin(), known_settings.cend(),
+                   static_cast<UserSettingId>(setting_id)) != known_settings.cend();
+}
 
 }  // namespace xam
 }  // namespace system

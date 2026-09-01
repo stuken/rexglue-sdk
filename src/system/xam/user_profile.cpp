@@ -94,6 +94,11 @@ UserProfile::UserProfile() {
 }
 
 void UserProfile::AddSetting(std::unique_ptr<Setting> setting) {
+  if (!IsKnownUserSettingId(setting->setting_id)) {
+    REXSYS_WARN("Rejecting write to unrecognized profile setting {:08X}", setting->setting_id);
+    return;
+  }
+
   Setting* previous_setting = setting.get();
   std::swap(settings_[setting->setting_id], previous_setting);
 
@@ -118,6 +123,10 @@ void UserProfile::AddSetting(std::unique_ptr<Setting> setting) {
 UserProfile::Setting* UserProfile::GetSetting(uint32_t setting_id) {
   const auto& it = settings_.find(setting_id);
   if (it == settings_.end()) {
+    if (!IsKnownUserSettingId(setting_id)) {
+      REXSYS_DEBUG("Requested profile setting {:08X} is not a recognized XPROFILE_* ID",
+                   setting_id);
+    }
     return nullptr;
   }
   UserProfile::Setting* setting = it->second;
