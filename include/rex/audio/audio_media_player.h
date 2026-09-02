@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <vector>
 
@@ -108,6 +109,18 @@ class AudioMediaPlayer {
   }
   float GetVolume() const { return volume_.load(std::memory_order_relaxed); }
 
+  // Invoked from the worker thread when a song finishes decoding entirely on
+  // its own (ran out of input) rather than via an explicit Stop()/Play()
+  // request - lets the owner (XmpApp, which owns playlist/repeat-mode state
+  // this class deliberately doesn't - see the class comment) decide what
+  // plays next without this class needing to know about playlists at all.
+  // Returning nullptr means "nothing next, go idle." Must be set before the
+  // first Play() call; not safe to change once playback may be underway.
+  using SongEndedCallback = std::function<Song*()>;
+  void SetSongEndedCallback(SongEndedCallback callback) {
+    song_ended_callback_ = std::move(callback);
+  }
+
  private:
   void WorkerThreadMain();
   void PlaySong(Song* song);
@@ -154,6 +167,7 @@ class AudioMediaPlayer {
   Song* pending_song_ = nullptr;
 
   std::atomic<float> volume_ = 1.0f;
+  SongEndedCallback song_ended_callback_;
 
   rex::audio::AudioSystem* audio_system_ = nullptr;
   std::unique_ptr<rex::thread::Semaphore> driver_semaphore_;

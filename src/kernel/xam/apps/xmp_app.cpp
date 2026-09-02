@@ -29,15 +29,17 @@ XmpApp::XmpApp(KernelState* kernel_state)
     : App(kernel_state, 0xFA),
       state_(State::kIdle),
       playback_client_(PlaybackClient::kTitle),
-      playback_mode_(PlaybackMode::kUnknown),
-      repeat_mode_(RepeatMode::kUnknown),
+      playback_mode_(PlaybackMode::kInOrder),
+      repeat_mode_(RepeatMode::kPlaylist),
       unknown_flags_(0),
       volume_(1.0f),
       active_playlist_(nullptr),
       active_song_index_(0),
       next_playlist_handle_(1),
       next_song_handle_(1),
-      media_player_(std::make_unique<rex::audio::AudioMediaPlayer>(kernel_state)) {}
+      media_player_(std::make_unique<rex::audio::AudioMediaPlayer>(kernel_state)) {
+  media_player_->SetSongEndedCallback([this] { return OnSongEndedNaturally(); });
+}
 
 XmpApp::~XmpApp() = default;
 
@@ -147,6 +149,11 @@ X_HRESULT XmpApp::XMPPlayTitlePlaylist(uint32_t playlist_handle, uint32_t song_h
     return X_E_FAIL;
   }
 
+  // Blocks until the worker thread has left PlaySong() (and therefore any
+  // in-flight OnSongEndedNaturally() call) before the mutations below -
+  // see that function's comment for why this ordering matters.
+  media_player_->Stop();
+
   active_playlist_ = playlist;
   active_song_index_ = 0;
   if (song_handle) {
@@ -202,6 +209,9 @@ X_HRESULT XmpApp::XMPNext() {
   if (!active_playlist_) {
     return X_E_NOTFOUND;
   }
+  // See OnSongEndedNaturally()'s comment - parks the worker before touching
+  // active_song_index_/state_.
+  media_player_->Stop();
   state_ = State::kPlaying;
   active_song_index_ = (active_song_index_ + 1) % active_playlist_->songs.size();
   media_player_->Play(active_playlist_->songs[active_song_index_].get());
@@ -214,6 +224,7 @@ X_HRESULT XmpApp::XMPPrevious() {
   if (!active_playlist_) {
     return X_E_NOTFOUND;
   }
+  media_player_->Stop();
   state_ = State::kPlaying;
   if (!active_song_index_) {
     active_song_index_ = static_cast<int>(active_playlist_->songs.size()) - 1;
@@ -227,6 +238,29 @@ X_HRESULT XmpApp::XMPPrevious() {
 
 void XmpApp::OnStateChanged() {
   kernel_state_->BroadcastNotification(kMsgStateChanged, static_cast<uint32_t>(state_));
+}
+
+XmpApp::Song* XmpApp::OnSongEndedNaturally() {
+  // A concurrent XMPStop()/XMPDeleteTitlePlaylist() may have already cleared
+  // this out from under us by the time the worker thread got here - nothing
+  // to advance.
+  if (!active_playlist_ || active_playlist_->songs.empty()) {
+    return nullptr;
+  }
+
+  const size_t next_index = static_cast<size_t>(active_song_index_) + 1;
+  if (next_index < active_playlist_->songs.size()) {
+    active_song_index_ = static_cast<int>(next_index);
+  } else if (repeat_mode_ == RepeatMode::kPlaylist) {
+    active_song_index_ = 0;
+  } else {
+    state_ = State::kIdle;
+    OnStateChanged();
+    return nullptr;
+  }
+
+  OnStateChanged();
+  return active_playlist_->songs[active_song_index_].get();
 }
 
 X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
@@ -394,9 +428,15 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       auto info = memory_->TranslateVirtual<SongInfo*>(args->info_ptr);
       assert_true(args->xmp_client == 0x00000002);
       assert_zero(args->unk_ptr);
-      REXKRNL_ERROR("XMPGetInfo?({:08X}, {:08X})", uint32_t(args->unk_ptr),
+      REXKRNL_DEBUG("XMPGetCurrentSong({:08X}, {:08X})", uint32_t(args->unk_ptr),
                     uint32_t(args->info_ptr));
-      if (!active_playlist_) {
+      // active_playlist_ alone isn't enough: OnSongEndedNaturally() leaves
+      // it set (only marks state_ kIdle) when the playlist finishes without
+      // repeating, so without this check a finished playlist would keep
+      // reporting its last song as "current" forever. state_ == kPaused
+      // still reports correctly, matching xenia (Pause() doesn't clear
+      // active_song_ there either).
+      if (!active_playlist_ || state_ == State::kIdle) {
         return X_E_FAIL;
       }
       auto& song = active_playlist_->songs[active_song_index_];

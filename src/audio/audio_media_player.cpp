@@ -329,57 +329,83 @@ void AudioMediaPlayer::SubmitPendingFrame() {
 }
 
 void AudioMediaPlayer::PlaySong(Song* song) {
-  REXAPU_DEBUG("AudioMediaPlayer: worker picked up song '{}' (path='{}', format={}, volume={:g})",
-              rex::string::to_utf8(song->name), rex::string::to_utf8(song->file_path),
-              static_cast<uint32_t>(song->format), volume_.load(std::memory_order_relaxed));
+  // Loops (rather than recursing) so repeat-mode playlists don't grow the
+  // worker thread's stack across an unbounded number of auto-advanced
+  // songs. Each iteration plays one song; song_ended_callback_ (if a song
+  // ran out of input on its own, not via an external stop request) decides
+  // what plays next, same as an internally-triggered "Next()" - see its
+  // comment in xmp_app.h/.cpp for the threading argument that makes this
+  // safe without a lock.
+  while (song) {
+    REXAPU_DEBUG("AudioMediaPlayer: worker picked up song '{}' (path='{}', format={}, volume={:g})",
+                rex::string::to_utf8(song->name), rex::string::to_utf8(song->file_path),
+                static_cast<uint32_t>(song->format), volume_.load(std::memory_order_relaxed));
 
-  // A title that has never set a real volume - or explicitly asks for
-  // exactly 0.0 - is asking for "whatever the system default is": on real
-  // hardware/xenia this reads a persisted XCONFIG_USER_MUSIC_VOLUME setting
-  // (see xe::apu::AudioMediaPlayer::Play()'s `if (volume_ == 0.0f) { volume_
-  // = xconfig()->ReadSetting(...); }`). RexGlue has no persisted user-
-  // settings store yet (that's the GPD/profile rewrite tracked separately in
-  // XAM_PORT_AUDIT.md), so full volume is used as the closest available
-  // default rather than staying silent - confirmed via PGR3 logs setting
-  // volume to 0.0 once at boot and never raising it again, which would
-  // otherwise permanently silence every song for the rest of the session.
-  if (volume_.load(std::memory_order_relaxed) == 0.0f) {
-    volume_.store(1.0f, std::memory_order_relaxed);
-    REXAPU_INFO("AudioMediaPlayer: volume was 0 (no real value set yet) - defaulting to 1.0");
+    // A title that has never set a real volume - or explicitly asks for
+    // exactly 0.0 - is asking for "whatever the system default is": on real
+    // hardware/xenia this reads a persisted XCONFIG_USER_MUSIC_VOLUME setting
+    // (see xe::apu::AudioMediaPlayer::Play()'s `if (volume_ == 0.0f) { volume_
+    // = xconfig()->ReadSetting(...); }`). RexGlue has no persisted user-
+    // settings store yet (that's the GPD/profile rewrite tracked separately in
+    // XAM_PORT_AUDIT.md), so full volume is used as the closest available
+    // default rather than staying silent - confirmed via PGR3 logs setting
+    // volume to 0.0 once at boot and never raising it again, which would
+    // otherwise permanently silence every song for the rest of the session.
+    if (volume_.load(std::memory_order_relaxed) == 0.0f) {
+      volume_.store(1.0f, std::memory_order_relaxed);
+      REXAPU_INFO("AudioMediaPlayer: volume was 0 (no real value set yet) - defaulting to 1.0");
+    }
+
+    std::vector<uint8_t> file_data = LoadSongToMemory(kernel_state_, song->file_path);
+    if (file_data.empty()) {
+      REXAPU_WARN("AudioMediaPlayer: failed to load song file '{}' for playback",
+                 rex::string::to_utf8(song->file_path));
+      state_.store(State::kIdle, std::memory_order_relaxed);
+      return;
+    }
+    REXAPU_DEBUG("AudioMediaPlayer: loaded {} bytes for '{}'", file_data.size(),
+                rex::string::to_utf8(song->file_path));
+
+    if (!EnsureDriver()) {
+      REXAPU_ERROR("AudioMediaPlayer: failed to create an audio driver for XMP playback");
+      state_.store(State::kIdle, std::memory_order_relaxed);
+      return;
+    }
+
+    resample_in_left_.clear();
+    resample_in_right_.clear();
+    resample_pos_ = 0.0;
+    pending_left_.clear();
+    pending_right_.clear();
+
+    switch (song->format) {
+      case Song::Format::kMp3:
+        PlayMp3Data(file_data);
+        break;
+      case Song::Format::kWma:
+        PlayWmaData(file_data);
+        break;
+      default:
+        REXAPU_WARN("AudioMediaPlayer: unknown song format {} for '{}' - skipping playback",
+                   static_cast<uint32_t>(song->format), rex::string::to_utf8(song->name));
+        state_.store(State::kIdle, std::memory_order_relaxed);
+        return;
+    }
+
+    if (song_should_stop_.load(std::memory_order_relaxed)) {
+      // Ended via an explicit Stop()/Play()/... request, not naturally -
+      // state_ is already whatever that caller set it to (Stop() sets
+      // kIdle itself; Play() sets kPlaying for the song it's switching to).
+      // Don't auto-advance: the request already decided what's next.
+      return;
+    }
+
+    song = song_ended_callback_ ? song_ended_callback_() : nullptr;
   }
 
-  std::vector<uint8_t> file_data = LoadSongToMemory(kernel_state_, song->file_path);
-  if (file_data.empty()) {
-    REXAPU_WARN("AudioMediaPlayer: failed to load song file '{}' for playback",
-               rex::string::to_utf8(song->file_path));
-    return;
-  }
-  REXAPU_DEBUG("AudioMediaPlayer: loaded {} bytes for '{}'", file_data.size(),
-              rex::string::to_utf8(song->file_path));
-
-  if (!EnsureDriver()) {
-    REXAPU_ERROR("AudioMediaPlayer: failed to create an audio driver for XMP playback");
-    return;
-  }
-
-  resample_in_left_.clear();
-  resample_in_right_.clear();
-  resample_pos_ = 0.0;
-  pending_left_.clear();
-  pending_right_.clear();
-
-  switch (song->format) {
-    case Song::Format::kMp3:
-      PlayMp3Data(file_data);
-      break;
-    case Song::Format::kWma:
-      PlayWmaData(file_data);
-      break;
-    default:
-      REXAPU_WARN("AudioMediaPlayer: unknown song format {} for '{}' - skipping playback",
-                 static_cast<uint32_t>(song->format), rex::string::to_utf8(song->name));
-      break;
-  }
+  // Ran out of input and there's nothing next (no callback, or it returned
+  // nullptr) - genuinely idle now, not just between two auto-advanced songs.
+  state_.store(State::kIdle, std::memory_order_relaxed);
 }
 
 void AudioMediaPlayer::PlayMp3Data(const std::vector<uint8_t>& file_data) {

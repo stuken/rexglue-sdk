@@ -43,12 +43,12 @@ class XmpApp : public system::xam::App {
     kTitle = 1,
   };
   enum class PlaybackMode : uint32_t {
-    // kInOrder = ?,
-    kUnknown = 0,
+    kInOrder = 0,
+    kShuffle = 1,
   };
   enum class RepeatMode : uint32_t {
-    // kNoRepeat = ?,
-    kUnknown = 0,
+    kPlaylist = 0,
+    kNoRepeat = 1,
   };
   struct Song {
     enum class Format : uint32_t {
@@ -102,6 +102,31 @@ class XmpApp : public system::xam::App {
   static const uint32_t kMsgDashInitChanged = 0x8A000009;
 
   void OnStateChanged();
+
+  // Called from AudioMediaPlayer's worker thread (via the callback wired up
+  // in the constructor) when a song finishes decoding entirely on its own -
+  // not via an explicit Stop()/Play()/Next()/Previous() request. Advances
+  // active_song_index_ to the next song in active_playlist_, wraps to the
+  // start when repeat_mode_ is kPlaylist, or marks state_ kIdle and returns
+  // nullptr when there's nothing left to play. Matches xenia's own
+  // AudioMediaPlayer::Play() worker-side auto-advance/repeat logic, which
+  // (like this) doesn't consult playback_mode_ (shuffle) either - xenia
+  // declares XMP_CLIENT/PlaybackMode::kShuffle but never actually branches
+  // on it in Next()/Previous()/the natural-completion path, so always
+  // advancing sequentially is faithful, not a gap relative to xenia.
+  //
+  // Safe to touch active_playlist_/active_song_index_/state_ without a lock:
+  // this only ever runs while the worker thread has *not* been asked to
+  // stop, and every dispatch-thread handler that mutates those same fields
+  // calls media_player_->Stop() first - which blocks until the worker has
+  // fully left PlaySong() (and therefore this function) - before touching
+  // them. The one exception is XMPPause()/XMPContinue(), which don't park
+  // the worker before writing state_; a natural end-of-playlist racing
+  // exactly against a pause/resume request can lose one of the two writes,
+  // which is a narrow, low-consequence race (a stale kPaused/kPlaying value,
+  // never a dangling pointer) accepted rather than adding a second
+  // synchronization mechanism for it.
+  Song* OnSongEndedNaturally();
 
   State state_;
   PlaybackClient playback_client_;
