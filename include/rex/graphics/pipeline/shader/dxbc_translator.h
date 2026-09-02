@@ -47,6 +47,10 @@ namespace rex::graphics {
 // SEE THE NOTES DXBC.H BEFORE WRITING ANYTHING RELATED TO DXBC!
 class DxbcShaderTranslator : public ShaderTranslator {
  public:
+  // gamma_render_target_as_unorm8 only affects CompletePixelShader_WriteToRTVs
+  // (never called when edram_rov_used is true), so callers may pass it based
+  // purely on the render target format setting without also gating on
+  // edram_rov_used - it's a no-op in ROV mode either way.
   DxbcShaderTranslator(ui::GraphicsProvider::GpuVendorID vendor_id, bool bindless_resources_used,
                        bool edram_rov_used, bool gamma_render_target_as_unorm8 = false,
                        bool msaa_2x_supported = true, uint32_t draw_resolution_scale_x = 1,

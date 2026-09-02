@@ -3709,7 +3709,9 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
                                                    ? rb_colorcontrol.alpha_func
                                                    : xenos::CompareFunction::kAlways;
   flags |= uint32_t(alpha_test_function) << DxbcShaderTranslator::kSysFlag_AlphaPassIfLess_Shift;
-  // Gamma writing.
+  // Gamma writing. kSysFlag_ConvertColorNToGamma is only consumed by
+  // CompletePixelShader_WriteToRTVs, which never runs when ROV is in use, so
+  // setting it unconditionally of edram_rov_used here is output-neutral.
   if (!render_target_cache_->gamma_render_target_as_unorm16()) {
     for (uint32_t i = 0; i < 4; ++i) {
       if (color_infos[i].color_format == xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA) {
