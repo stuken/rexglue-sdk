@@ -9,11 +9,14 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <limits>
+
 #include <rex/assert.h>
 #include <rex/audio/audio_driver.h>
 #include <rex/audio/audio_system.h>
 #include <rex/audio/flags.h>
 #include <rex/audio/xma/decoder.h>
+#include <rex/chrono/clock.h>
 #include <rex/dbg.h>
 #include <rex/logging.h>
 #include <rex/math.h>
@@ -23,10 +26,6 @@
 #include <rex/system/thread_state.h>
 #include <rex/thread.h>
 #include <rex/cvar.h>
-
-REXCVAR_DEFINE_INT32(
-    audio_maxqframes, 8, "Audio",
-    "Max buffered audio frames (range 4-64). Lower reduces latency but may cause stuttering.");
 
 // As with normal Microsoft, there are like twelve different ways to access
 // the audio APIs. Early games use XMA*() methods almost exclusively to touch
@@ -52,18 +51,12 @@ AudioSystem::AudioSystem(runtime::FunctionDispatcher* function_dispatcher)
       worker_running_(false) {
   std::memset(clients_, 0, sizeof(clients_));
 
-  queued_frames_ = std::min(
-      static_cast<uint32_t>(kMaximumQueuedFrames),
-      std::max(static_cast<uint32_t>(REXCVAR_GET(audio_maxqframes)), static_cast<uint32_t>(4)));
-
   for (size_t i = 0; i < kMaximumClientCount; ++i) {
-    client_semaphores_[i] = rex::thread::Semaphore::Create(0, queued_frames_);
+    client_semaphores_[i] = rex::thread::Semaphore::Create(0, kMaximumQueuedFrames);
     assert_not_null(client_semaphores_[i]);
-    wait_handles_[i] = client_semaphores_[i].get();
   }
-  shutdown_event_ = rex::thread::Event::CreateAutoResetEvent(false);
-  assert_not_null(shutdown_event_);
-  wait_handles_[kMaximumClientCount] = shutdown_event_.get();
+  pending_work_event_ = rex::thread::Event::CreateAutoResetEvent(false);
+  assert_not_null(pending_work_event_);
 
   xma_decoder_ = std::make_unique<rex::audio::XmaDecoder>(function_dispatcher_);
 
@@ -92,6 +85,12 @@ X_STATUS AudioSystem::Setup(system::KernelState* kernel_state) {
 
   worker_thread_->set_name("Audio Worker");
   worker_thread_->Create();
+  // Bump the underlying host thread's OS priority (not XThread::SetPriority,
+  // which writes the *guest* X_KTHREAD - this worker has no guest context)
+  // for better pacing accuracy.
+  if (rex::thread::Thread* host_thread = worker_thread_->thread()) {
+    host_thread->set_priority(rex::thread::ThreadPriority::kAboveNormal);
+  }
 
   return X_STATUS_SUCCESS;
 }
@@ -100,72 +99,105 @@ void AudioSystem::WorkerThreadMain() {
   // Initialize driver and ringbuffer.
   Initialize();
 
-  // Main run loop.
+  // The host mixer releases a client's semaphore on its own coarse cadence,
+  // but the Xenos audio subsystem operates at kAudioPumpInterval (matching
+  // real hardware's XMA output timing), scaled inversely by
+  // guest_time_scalar for fast-forward/slow-motion. Rather than pumping a
+  // client as fast as its semaphore allows (bursty, and faster than the
+  // guest expects), this paces pumps to each client's next_pump_us deadline
+  // and uses the semaphore only as back-pressure: a callback only fires if
+  // a host output slot is actually free, otherwise this pump is skipped
+  // (the host queue is already well buffered, so nothing is lost). Ported
+  // from xenia's "[APU] Pace audio subsystem" (6e5b8324f).
   uint32_t diag_pump_count = 0;
   while (worker_running_) {
-    // These handles signify the number of submitted samples. Once we reach
-    // 64 samples, we wait until our audio backend releases a semaphore
-    // (signaling a sample has finished playing)
-    auto result = rex::thread::WaitAny(wait_handles_, rex::countof(wait_handles_), true,
-                                       std::chrono::milliseconds(500));
-    if (result.first == rex::thread::WaitResult::kFailed) {
-      REXAPU_WARN("AudioWorker: WaitAny failed");
-      continue;
-    }
+    const uint64_t now = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
 
-    if (result.first == rex::thread::WaitResult::kTimeout) {
-      if (diag_pump_count < 5) {
-        REXAPU_NOISY_DEBUG("AudioWorker: WaitAny timed out (no semaphore signals)");
+    size_t client_index = kMaximumClientCount;
+    uint64_t earliest_pump_us = std::numeric_limits<uint64_t>::max();
+    uint32_t client_callback = 0;
+    uint32_t client_callback_arg = 0;
+    {
+      auto global_lock = global_critical_region_.Acquire();
+
+      for (size_t i = 0; i < kMaximumClientCount; ++i) {
+        if (!clients_[i].in_use || clients_[i].next_pump_us >= earliest_pump_us) {
+          continue;
+        }
+        earliest_pump_us = clients_[i].next_pump_us;
+        client_index = i;
+      }
+
+      if (client_index != kMaximumClientCount) {
+        client_callback = clients_[client_index].callback;
+        client_callback_arg = clients_[client_index].wrapped_callback_arg;
+
+        const double scalar = rex::chrono::Clock::guest_time_scalar();
+        const uint64_t min_us = scalar > 0.0
+                                    ? static_cast<uint64_t>(kAudioPumpInterval / scalar)
+                                    : kAudioPumpInterval;
+        clients_[client_index].next_pump_us =
+            (earliest_pump_us > now ? earliest_pump_us : now) + min_us;
       }
     }
 
-    if (result.first == thread::WaitResult::kSuccess && result.second == kMaximumClientCount) {
-      // Shutdown event signaled.
+    // No clients registered yet: park until one registers, or we're told to
+    // stop/pause.
+    if (client_index == kMaximumClientCount) {
+      rex::thread::Wait(pending_work_event_.get(), true);
       if (paused_) {
         pause_fence_.Signal();
-        thread::Wait(resume_event_.get(), false);
+        rex::thread::Wait(resume_event_.get(), false);
       }
-
       continue;
     }
 
-    // Number of clients pumped
-    bool pumped = false;
-    if (result.first == rex::thread::WaitResult::kSuccess) {
-      auto index = result.second;
-
-      auto global_lock = global_critical_region_.Acquire();
-      uint32_t client_callback = clients_[index].callback;
-      uint32_t client_callback_arg = clients_[index].wrapped_callback_arg;
-      global_lock.unlock();
-
-      if (client_callback) {
-        if (diag_pump_count < 10) {
-          REXAPU_DEBUG("AudioWorker: dispatching callback {:08X} with arg {:08X} for client {}",
-                       client_callback, client_callback_arg, index);
+    // Pace to kAudioIntervalSlack ahead of the deadline.
+    const uint64_t wake_target_us =
+        earliest_pump_us > kAudioIntervalSlack ? earliest_pump_us - kAudioIntervalSlack : 0;
+    if (wake_target_us > now) {
+      const std::chrono::milliseconds timeout((wake_target_us - now) / 1000);
+      auto result = rex::thread::Wait(pending_work_event_.get(), true, timeout);
+      if (result == rex::thread::WaitResult::kSuccess) {
+        // A client was (un)registered, or shutdown/pause was signaled,
+        // before this deadline - re-scan immediately rather than pumping
+        // stale state.
+        if (paused_) {
+          pause_fence_.Signal();
+          rex::thread::Wait(resume_event_.get(), false);
         }
-        SCOPE_profile_cpu_i("apu", "rex::audio::AudioSystem->client_callback");
-        uint64_t args[] = {client_callback_arg};
-        function_dispatcher_->Execute(worker_thread_->thread_state(), client_callback, args,
-                                      rex::countof(args));
-        if (diag_pump_count < 10) {
-          REXAPU_DEBUG("AudioWorker: callback returned for client {}", index);
-        }
-        diag_pump_count++;
-      } else {
-        REXAPU_DEBUG("AudioWorker: semaphore signaled for client {} but callback is 0", index);
+        continue;
       }
 
-      pumped = true;
+      const uint64_t now_precise = static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              std::chrono::steady_clock::now().time_since_epoch())
+              .count());
+      if (wake_target_us > now_precise) {
+        rex::thread::Sleep(std::chrono::microseconds(wake_target_us - now_precise));
+      }
     }
 
-    if (!worker_running_) {
-      break;
-    }
-
-    if (!pumped) {
-      SCOPE_profile_cpu_i("apu", "Sleep");
-      rex::thread::Sleep(std::chrono::milliseconds(500));
+    // Submit only if the host has a free output slot; otherwise this pump
+    // is skipped.
+    if (client_callback &&
+        rex::thread::Wait(client_semaphores_[client_index].get(), false,
+                          std::chrono::milliseconds(0)) == rex::thread::WaitResult::kSuccess) {
+      if (diag_pump_count < 10) {
+        REXAPU_DEBUG("AudioWorker: dispatching callback {:08X} with arg {:08X} for client {}",
+                     client_callback, client_callback_arg, client_index);
+      }
+      SCOPE_profile_cpu_i("apu", "rex::audio::AudioSystem->client_callback");
+      uint64_t args[] = {client_callback_arg};
+      function_dispatcher_->Execute(worker_thread_->thread_state(), client_callback, args,
+                                    rex::countof(args));
+      if (diag_pump_count < 10) {
+        REXAPU_DEBUG("AudioWorker: callback returned for client {}", client_index);
+        diag_pump_count++;
+      }
     }
   }
   worker_running_ = false;
@@ -197,7 +229,7 @@ void AudioSystem::Shutdown() {
   }
 
   worker_running_ = false;
-  shutdown_event_->Set();
+  pending_work_event_->Set();
   if (worker_thread_) {
     // The worker may be stuck inside a guest callback that is itself blocked on
     // guest objects (e.g. KeWaitForMultipleObjects), so terminating is the last
@@ -222,7 +254,7 @@ void AudioSystem::Shutdown() {
       if (clients_[i].wrapped_callback_arg) {
         memory()->SystemHeapFree(clients_[i].wrapped_callback_arg);
       }
-      clients_[i] = {nullptr, 0, 0, 0, false};
+      clients_[i] = {};
     }
   }
 }
@@ -235,10 +267,10 @@ X_STATUS AudioSystem::RegisterClient(uint32_t callback, uint32_t callback_arg, s
   auto index = FindFreeClient();
   assert_true(index >= 0);
   REXAPU_DEBUG("AudioSystem::RegisterClient: using client index={} queued_frames={}", index,
-               queued_frames_);
+               kMaximumQueuedFrames);
 
   auto client_semaphore = client_semaphores_[index].get();
-  auto ret = client_semaphore->Release(queued_frames_, nullptr);
+  auto ret = client_semaphore->Release(kMaximumQueuedFrames, nullptr);
   assert_true(ret);
 
   AudioDriver* driver;
@@ -251,7 +283,15 @@ X_STATUS AudioSystem::RegisterClient(uint32_t callback, uint32_t callback_arg, s
   uint32_t ptr = memory()->SystemHeapAlloc(0x4);
   memory::store_and_swap<uint32_t>(memory()->TranslateVirtual(ptr), callback_arg);
 
-  clients_[index] = {driver, callback, callback_arg, ptr, true};
+  clients_[index] = {};
+  clients_[index].driver = driver;
+  clients_[index].callback = callback;
+  clients_[index].callback_arg = callback_arg;
+  clients_[index].wrapped_callback_arg = ptr;
+  clients_[index].in_use = true;
+
+  // Wake the worker so it re-scans and starts pacing this client immediately.
+  pending_work_event_->Set();
 
   if (out_index) {
     *out_index = index;
@@ -295,7 +335,7 @@ void AudioSystem::UnregisterClient(size_t index) {
   assert_true(index < kMaximumClientCount);
   DestroyDriver(clients_[index].driver);
   memory()->SystemHeapFree(clients_[index].wrapped_callback_arg);
-  clients_[index] = {nullptr, 0, 0, 0, false};
+  clients_[index] = {};
 
   // Drain the semaphore of its count.
   auto client_semaphore = client_semaphores_[index].get();
@@ -356,10 +396,11 @@ bool AudioSystem::Restore(stream::ByteStream* stream) {
     client.callback_arg = stream->Read<uint32_t>();
     client.wrapped_callback_arg = stream->Read<uint32_t>();
 
+    client.next_pump_us = 0;
     client.in_use = true;
 
     auto client_semaphore = client_semaphores_[id].get();
-    auto ret = client_semaphore->Release(queued_frames_, nullptr);
+    auto ret = client_semaphore->Release(kMaximumQueuedFrames, nullptr);
     assert_true(ret);
 
     AudioDriver* driver = nullptr;
@@ -386,7 +427,7 @@ void AudioSystem::Pause() {
   paused_ = true;
 
   // Kind of a hack, but it works.
-  shutdown_event_->Set();
+  pending_work_event_->Set();
   pause_fence_.Wait();
 
   xma_decoder_->Pause();
