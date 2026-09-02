@@ -93,11 +93,11 @@ AudioMediaPlayer::~AudioMediaPlayer() {
 
 void AudioMediaPlayer::Play(Song* song) {
   if (!worker_thread_) {
-    REXAPU_WARN("AudioMediaPlayer: Play() called for '{}' but XMP is disabled (enable_xmp=false)",
-               rex::string::to_utf8(song->name));
+    REXAPU_DEBUG("AudioMediaPlayer: Play() called for '{}' but XMP is disabled (enable_xmp=false)",
+                rex::string::to_utf8(song->name));
     return;
   }
-  REXAPU_INFO("AudioMediaPlayer: Play() called for song '{}'", rex::string::to_utf8(song->name));
+  REXAPU_DEBUG("AudioMediaPlayer: Play() called for song '{}'", rex::string::to_utf8(song->name));
   Stop();
   {
     auto lock = global_critical_region_.Acquire();
@@ -329,9 +329,9 @@ void AudioMediaPlayer::SubmitPendingFrame() {
 }
 
 void AudioMediaPlayer::PlaySong(Song* song) {
-  REXAPU_INFO("AudioMediaPlayer: worker picked up song '{}' (path='{}', format={}, volume={:g})",
-             rex::string::to_utf8(song->name), rex::string::to_utf8(song->file_path),
-             static_cast<uint32_t>(song->format), volume_.load(std::memory_order_relaxed));
+  REXAPU_DEBUG("AudioMediaPlayer: worker picked up song '{}' (path='{}', format={}, volume={:g})",
+              rex::string::to_utf8(song->name), rex::string::to_utf8(song->file_path),
+              static_cast<uint32_t>(song->format), volume_.load(std::memory_order_relaxed));
 
   // A title that has never set a real volume - or explicitly asks for
   // exactly 0.0 - is asking for "whatever the system default is": on real
@@ -354,8 +354,8 @@ void AudioMediaPlayer::PlaySong(Song* song) {
                rex::string::to_utf8(song->file_path));
     return;
   }
-  REXAPU_INFO("AudioMediaPlayer: loaded {} bytes for '{}'", file_data.size(),
-             rex::string::to_utf8(song->file_path));
+  REXAPU_DEBUG("AudioMediaPlayer: loaded {} bytes for '{}'", file_data.size(),
+              rex::string::to_utf8(song->file_path));
 
   if (!EnsureDriver()) {
     REXAPU_ERROR("AudioMediaPlayer: failed to create an audio driver for XMP playback");
@@ -429,8 +429,8 @@ void AudioMediaPlayer::PlayMp3Data(const std::vector<uint8_t>& file_data) {
       return;
     }
     if (decoded_frame_count == 0) {
-      REXAPU_INFO("AudioMediaPlayer: MP3 decoding audio ({} Hz, {} channel(s), volume={:g})",
-                 decoded->sample_rate, decoded->channels, volume_.load(std::memory_order_relaxed));
+      REXAPU_DEBUG("AudioMediaPlayer: MP3 decoding audio ({} Hz, {} channel(s), volume={:g})",
+                  decoded->sample_rate, decoded->channels, volume_.load(std::memory_order_relaxed));
     }
     ++decoded_frame_count;
     // Volume isn't touched here at all - it's pushed straight to the driver
@@ -486,7 +486,7 @@ void AudioMediaPlayer::PlayMp3Data(const std::vector<uint8_t>& file_data) {
     }
   }
 
-  REXAPU_INFO(
+  REXAPU_DEBUG(
       "AudioMediaPlayer: MP3 playback ended ({} frames decoded, stopped={})",
       decoded_frame_count, song_should_stop_.load(std::memory_order_relaxed));
 
@@ -506,7 +506,7 @@ void AudioMediaPlayer::PlayWmaData(const std::vector<uint8_t>& file_data) {
     return;
   }
   const AsfDemuxer::AudioInfo& info = demuxer.audio_info();
-  REXAPU_INFO(
+  REXAPU_DEBUG(
       "AudioMediaPlayer: found WMA stream (format_tag={:#06x}, {} Hz, {} channel(s), "
       "block_align={}, extradata={} bytes)",
       info.format_tag, info.sample_rate, info.channels, info.block_align,
@@ -575,8 +575,8 @@ void AudioMediaPlayer::PlayWmaData(const std::vector<uint8_t>& file_data) {
       return;
     }
     if (decoded_frame_count == 0) {
-      REXAPU_INFO("AudioMediaPlayer: WMA decoding audio (volume={:g})",
-                 volume_.load(std::memory_order_relaxed));
+      REXAPU_DEBUG("AudioMediaPlayer: WMA decoding audio (volume={:g})",
+                  volume_.load(std::memory_order_relaxed));
     }
     ++decoded_frame_count;
     // Volume isn't touched here at all - it's pushed straight to the driver
@@ -624,7 +624,7 @@ void AudioMediaPlayer::PlayWmaData(const std::vector<uint8_t>& file_data) {
     }
   }
 
-  REXAPU_INFO(
+  REXAPU_DEBUG(
       "AudioMediaPlayer: WMA playback ended ({} frames decoded, stopped={})",
       decoded_frame_count, song_should_stop_.load(std::memory_order_relaxed));
 
