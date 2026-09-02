@@ -963,6 +963,20 @@ bool D3D12RenderTargetCache::Initialize() {
 }
 
 void D3D12RenderTargetCache::Shutdown(bool from_destructor) {
+  if (direct_resolve_attempt_count_) {
+    // "Passed" currently just means the preflight succeeded and the resolve
+    // was routed through TryResolveCopyDirectly, which still internally
+    // dumps via the ordinary path - no bandwidth is saved yet, dedicated
+    // direct-write shaders are not implemented (RTV_D3D12_AUDIT.md B1). This
+    // is preflight hit-rate, not an actual direct-write hit-rate.
+    REXGPU_DEBUG(
+        "D3D12RenderTargetCache: direct resolve preflight ran {} time(s), {} passed (routed "
+        "through the still-fallback-only direct resolve path), {} failed the preflight and "
+        "used the ordinary dump path instead",
+        direct_resolve_attempt_count_, direct_resolve_success_count_,
+        direct_resolve_fallback_count_);
+  }
+
   ui::d3d12::util::ReleaseAndNull(resolve_rov_clear_64bpp_pipeline_);
   ui::d3d12::util::ReleaseAndNull(resolve_rov_clear_32bpp_pipeline_);
   ui::d3d12::util::ReleaseAndNull(resolve_rov_clear_root_signature_);
