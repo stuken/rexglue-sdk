@@ -394,7 +394,8 @@ bool D3D12RenderTargetCache::Initialize() {
   use_stencil_reference_output_ =
       REXCVAR_GET(native_stencil_value_output) &&
       provider.IsPSSpecifiedStencilReferenceSupported() &&
-      (REXCVAR_GET(native_stencil_value_output_d3d12_intel) ||
+      (provider.IsIntelArcGpu() ||
+       REXCVAR_GET(native_stencil_value_output_d3d12_intel) ||
        provider.GetAdapterVendorID() != ui::GraphicsProvider::GpuVendorID::kIntel);
 
   if (path_ == Path::kHostRenderTargets) {
