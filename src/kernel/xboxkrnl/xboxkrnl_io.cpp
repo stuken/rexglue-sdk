@@ -221,6 +221,13 @@ u32 NtReadFile_entry(u32 file_handle, u32 event_handle, mapped_void apc_routine_
         io_status_block->information = bytes_read;
       }
 
+      if (XSUCCEEDED(result)) {
+        if (auto* patch = REX_KERNEL_STATE()->xmp_volume_patch()) {
+          patch->OnFileRead(file->name(), REX_KERNEL_MEMORY()->TranslateVirtual(buffer.guest_address()),
+                            buffer_length, buffer.guest_address());
+        }
+      }
+
       // Queue the APC callback. It must be delivered via the APC mechanism even
       // though were are completing immediately.
       // Low bit probably means do not queue to IO ports.
@@ -410,6 +417,13 @@ u32 NtWriteFile_entry(u32 file_handle, u32 event_handle, u32 apc_routine, mapped
       if (io_status_block) {
         io_status_block->status = result;
         io_status_block->information = static_cast<uint32_t>(bytes_written);
+      }
+
+      if (XSUCCEEDED(result)) {
+        if (auto* patch = REX_KERNEL_STATE()->xmp_volume_patch()) {
+          patch->OnFileWrite(file->name(), REX_KERNEL_MEMORY()->TranslateVirtual(buffer.guest_address()),
+                             buffer_length, buffer.guest_address());
+        }
       }
 
       // Queue the APC callback. It must be delivered via the APC mechanism even

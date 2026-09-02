@@ -112,7 +112,15 @@ u32 XamInputGetState_entry(u32 user_index, u32 flags, ppc_ptr_t<X_INPUT_STATE> i
   }
 
   auto* is = input_system();
-  return is->GetState(actual_user_index, input_state);
+  u32 result = is->GetState(actual_user_index, input_state);
+
+  if (input_state && result == X_ERROR_SUCCESS) {
+    if (auto* patch = REX_KERNEL_STATE()->xmp_volume_patch()) {
+      patch->OnInputPoll(static_cast<uint32_t>(input_state->packet_number));
+    }
+  }
+
+  return result;
 }
 
 // https://msdn.microsoft.com/en-us/library/windows/desktop/microsoft.directx_sdk.reference.xinputsetstate(v=vs.85).aspx

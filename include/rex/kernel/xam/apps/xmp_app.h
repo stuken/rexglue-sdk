@@ -94,6 +94,12 @@ class XmpApp : public system::xam::App {
   X_HRESULT DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
                                 uint32_t buffer_length) override;
 
+  // For code outside this class that needs to drive playback state directly
+  // (e.g. rex::system::util::XmpVolumePatch, which syncs a title's own
+  // save-file volume byte into XMP since some titles never call the real
+  // XMPSetVolume export) rather than through a dispatched XMP message.
+  rex::audio::AudioMediaPlayer* media_player() const { return media_player_.get(); }
+
  private:
   static const uint32_t kMsgStateChanged = 0x0A000001;
   static const uint32_t kMsgPlaybackBehaviorChanged = 0x0A000002;

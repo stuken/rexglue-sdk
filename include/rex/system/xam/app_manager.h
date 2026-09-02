@@ -51,6 +51,10 @@ class AppManager {
  public:
   void RegisterApp(std::unique_ptr<App> app);
 
+  // Returns the registered app for `app_id`, or nullptr if none is
+  // registered under that id.
+  App* LookupApp(uint32_t app_id) const;
+
   X_HRESULT DispatchMessageSync(uint32_t app_id, uint32_t message, uint32_t buffer_ptr,
                                 uint32_t buffer_length);
   X_HRESULT DispatchMessageAsync(uint32_t app_id, uint32_t message, uint32_t buffer_ptr,

@@ -32,6 +32,7 @@
 #include <rex/system/util/native_list.h>
 #include <rex/system/util/object_table.h>
 #include <rex/system/util/xdbf_utils.h>
+#include <rex/system/util/xmp_volume_patch.h>
 #include <rex/system/xam/app_manager.h>
 #include <rex/system/xam/content_manager.h>
 #include <rex/system/xam/user_profile.h>
@@ -201,6 +202,12 @@ class KernelState {
   xam::ContentManager* content_manager() const { return content_manager_.get(); }
   xam::UserProfile* user_profile() const { return user_profile_.get(); }
 
+  // Non-null only for titles with a known save-file volume quirk - see
+  // util::XmpVolumePatch. Set up in SetExecutableModule, torn down in
+  // TerminateTitle.
+  util::XmpVolumePatch* xmp_volume_patch() const { return xmp_volume_patch_.get(); }
+  void InitXmpVolumePatch();
+
   // Access must be guarded by the global critical region.
   util::ObjectTable* object_table() { return &object_table_; }
 
@@ -352,6 +359,7 @@ class KernelState {
   rex::filesystem::VirtualFileSystem* file_system_;
 
   std::unique_ptr<xam::AppManager> app_manager_;
+  std::unique_ptr<util::XmpVolumePatch> xmp_volume_patch_;
   std::unique_ptr<xam::ContentManager> content_manager_;
   std::unique_ptr<xam::UserProfile> user_profile_;
 

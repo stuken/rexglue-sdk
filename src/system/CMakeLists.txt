@@ -27,6 +27,7 @@ set(REXSYSTEM_SOURCES
     util/native_list.cpp
     util/xdbf_utils.cpp
     util/gameinfo_utils.cpp
+    util/xmp_volume_patch.cpp
 
     # XAM services
     xam/app_manager.cpp

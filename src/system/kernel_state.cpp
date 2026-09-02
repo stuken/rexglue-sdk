@@ -687,6 +687,12 @@ void KernelState::SetExecutableModule(object_ref<UserModule> module) {
   }
 
   LoadAchievementsData();
+
+  InitXmpVolumePatch();
+}
+
+void KernelState::InitXmpVolumePatch() {
+  xmp_volume_patch_ = util::XmpVolumePatch::CreateForTitle(title_id(), this);
 }
 
 void KernelState::LoadKernelModule(object_ref<KernelModule> kernel_module) {
@@ -978,6 +984,7 @@ void KernelState::WaitForThreadsToExit(const std::vector<object_ref<XThread>>& t
 
 void KernelState::TerminateTitle() {
   REXSYS_DEBUG("KernelState::TerminateTitle");
+  xmp_volume_patch_.reset();
 
   constexpr uint32_t kCooperativeExitTimeoutMs = 200;
 
