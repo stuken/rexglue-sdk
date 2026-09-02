@@ -170,6 +170,17 @@ struct kPacketInfo {
   }
 };
 
+// Resolves a packet index that may run past the end of `buffer_index`'s
+// packet count into the *other* input buffer, to a concrete (buffer, local
+// packet index) pair - bounds-checked against that buffer's own packet
+// count rather than assumed to start at its packet 0. Mirrors xenia's
+// XmaContextNew::GetPacketHandle.
+struct kPacketHandle {
+  uint8_t buffer_index_ = 0;
+  uint32_t packet_index_ = 0;
+  bool is_valid_ = false;
+};
+
 static constexpr int kIdToSampleRate[4] = {24000, 32000, 44100, 48000};
 
 class XmaContext {
@@ -244,9 +255,19 @@ class XmaContext {
 
   kPacketInfo GetPacketInfo(uint8_t* packet, uint32_t frame_offset);
   uint32_t GetAmountOfBitsToRead(uint32_t remaining_stream_bits, uint32_t frame_size);
+  kPacketHandle GetPacketHandle(XMA_CONTEXT_DATA* data, uint8_t buffer_index,
+                                uint32_t packet_index, uint32_t current_input_packet_count);
   const uint8_t* GetNextPacket(XMA_CONTEXT_DATA* data, uint32_t next_packet_index,
                                uint32_t current_input_packet_count);
+  // Single-buffer scan: walks forward from next_packet_index within `buffer`
+  // (which must already hold current_input_packet_count packets) for the
+  // first one whose frame_offset header is valid.
   uint32_t GetNextPacketReadOffset(uint8_t* buffer, uint32_t next_packet_index,
+                                   uint32_t current_input_packet_count);
+  // Dual-buffer-aware: resolves next_packet_index via GetPacketHandle first
+  // (following it into the other input buffer, bounds-checked, if it runs
+  // past current_input_packet_count), then scans from there.
+  uint32_t GetNextPacketReadOffset(XMA_CONTEXT_DATA* data, uint32_t next_packet_index,
                                    uint32_t current_input_packet_count);
   uint8_t* GetCurrentInputBuffer(XMA_CONTEXT_DATA* data);
 

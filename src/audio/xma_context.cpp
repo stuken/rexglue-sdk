@@ -286,25 +286,54 @@ uint32_t XmaContext::GetAmountOfBitsToRead(uint32_t remaining_stream_bits, uint3
   return std::min(remaining_stream_bits, frame_size);
 }
 
+kPacketHandle XmaContext::GetPacketHandle(XMA_CONTEXT_DATA* data, uint8_t buffer_index,
+                                          uint32_t packet_index,
+                                          uint32_t current_input_packet_count) {
+  kPacketHandle result{};
+  const bool is_packet_in_next_buffer = packet_index >= current_input_packet_count;
+  if (is_packet_in_next_buffer) {
+    buffer_index ^= 1;
+    packet_index -= current_input_packet_count;
+  }
+
+  if (!data->IsInputBufferValid(buffer_index)) {
+    return result;
+  }
+
+  const uint32_t buffer_address = data->GetInputBufferAddress(buffer_index);
+  if (!buffer_address) {
+    REXAPU_ERROR(
+        "XmaContext {}: the packet is expected to be in the {} buffer, but the buffer marked "
+        "valid has a null pointer!",
+        id(), is_packet_in_next_buffer ? "next" : "current");
+    return result;
+  }
+
+  const uint32_t buffer_packet_count = data->GetInputBufferPacketCount(buffer_index);
+  if (packet_index >= buffer_packet_count) {
+    REXAPU_ERROR(
+        "XmaContext {}: the packet is expected to be in the {} buffer, but that buffer is too "
+        "short to contain it!",
+        id(), is_packet_in_next_buffer ? "next" : "current");
+    return result;
+  }
+
+  result.buffer_index_ = buffer_index;
+  result.packet_index_ = packet_index;
+  result.is_valid_ = true;
+  return result;
+}
+
 const uint8_t* XmaContext::GetNextPacket(XMA_CONTEXT_DATA* data, uint32_t next_packet_index,
                                          uint32_t current_input_packet_count) {
-  if (next_packet_index < current_input_packet_count) {
-    return memory()->TranslatePhysical(data->GetCurrentInputBufferAddress()) +
-           next_packet_index * kBytesPerPacket;
-  }
-
-  const uint8_t next_buffer_index = data->current_buffer ^ 1;
-  if (!data->IsInputBufferValid(next_buffer_index)) {
+  const kPacketHandle handle = GetPacketHandle(data, static_cast<uint8_t>(data->current_buffer),
+                                               next_packet_index, current_input_packet_count);
+  if (!handle.is_valid_) {
     return nullptr;
   }
 
-  const uint32_t next_buffer_address = data->GetInputBufferAddress(next_buffer_index);
-  if (!next_buffer_address) {
-    REXAPU_ERROR("XmaContext {}: Buffer marked valid but has null pointer!", id());
-    return nullptr;
-  }
-
-  return memory()->TranslatePhysical(next_buffer_address);
+  const uint32_t buffer_address = data->GetInputBufferAddress(handle.buffer_index_);
+  return memory()->TranslatePhysical(buffer_address) + handle.packet_index_ * kBytesPerPacket;
 }
 
 uint32_t XmaContext::GetNextPacketReadOffset(uint8_t* buffer, uint32_t next_packet_index,
@@ -320,6 +349,19 @@ uint32_t XmaContext::GetNextPacketReadOffset(uint8_t* buffer, uint32_t next_pack
   }
 
   return kBitsPerPacketHeader;
+}
+
+uint32_t XmaContext::GetNextPacketReadOffset(XMA_CONTEXT_DATA* data, uint32_t next_packet_index,
+                                             uint32_t current_input_packet_count) {
+  const kPacketHandle handle = GetPacketHandle(data, static_cast<uint8_t>(data->current_buffer),
+                                               next_packet_index, current_input_packet_count);
+  if (!handle.is_valid_) {
+    return kBitsPerPacketHeader;
+  }
+
+  const uint32_t buffer_address = data->GetInputBufferAddress(handle.buffer_index_);
+  return GetNextPacketReadOffset(memory()->TranslatePhysical(buffer_address), handle.packet_index_,
+                                 data->GetInputBufferPacketCount(handle.buffer_index_));
 }
 
 memory::RingBuffer XmaContext::PrepareOutputRingBuffer(XMA_CONTEXT_DATA* data) {
@@ -588,9 +630,11 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
 
   // Full packet skip (0xFF) -- no new frames begin in this packet.
   if (skip_count == 0xFF) {
+    const uint32_t next_packet_index_skip = packet_index + 1;
     uint32_t next_input_offset =
-        GetNextPacketReadOffset(current_input_buffer, packet_index + 1, current_input_packet_count);
-    if (next_input_offset == kBitsPerPacketHeader) {
+        GetNextPacketReadOffset(data, next_packet_index_skip, current_input_packet_count);
+    if (next_packet_index_skip >= current_input_packet_count ||
+        next_input_offset == kBitsPerPacketHeader) {
       SwapInputBuffer(data);
     }
     data->input_buffer_read_offset = next_input_offset;
@@ -723,10 +767,13 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
   }
 
   uint32_t next_input_offset =
-      GetNextPacketReadOffset(current_input_buffer, next_packet_index, current_input_packet_count);
+      GetNextPacketReadOffset(data, next_packet_index, current_input_packet_count);
+
+  if (next_packet_index >= current_input_packet_count || next_input_offset == kBitsPerPacketHeader) {
+    SwapInputBuffer(data);
+  }
 
   if (next_input_offset == kBitsPerPacketHeader) {
-    SwapInputBuffer(data);
     if (data->IsAnyInputBufferValid()) {
       next_input_offset = xma::GetPacketFrameOffset(
           memory()->TranslatePhysical(data->GetCurrentInputBufferAddress()));
