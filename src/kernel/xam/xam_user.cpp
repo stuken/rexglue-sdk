@@ -29,6 +29,7 @@
 #include <rex/system/xtypes.h>
 
 REXCVAR_DEFINE_UINT32(user_language, 1, "Kernel", "User's language ID");
+REXCVAR_DECLARE(uint32_t, user_country);  // defined in xam_locale.cpp
 
 namespace rex {
 namespace kernel {
@@ -455,6 +456,115 @@ u32 XamUserGetMembershipTier_entry(u32 user_index) {
   return 6 /* 6 appears to be Gold */;
 }
 
+u32 XamUserGetMembershipTierFromXUID_entry(u64 xuid) {
+  const auto& user_profile = REX_KERNEL_STATE()->user_profile();
+  if (xuid != user_profile->xuid()) {
+    return 0 /* kSubscriptionTierNone */;
+  }
+  return 6 /* Gold, matches XamUserGetMembershipTier_entry above */;
+}
+
+i32 XamUserGetIndexFromXUID_entry(u64 xuid, u32 flags, mapped_u32 index) {
+  if (!index) {
+    return X_E_INVALIDARG;
+  }
+
+  const auto& user_profile = REX_KERNEL_STATE()->user_profile();
+  if (xuid != user_profile->xuid()) {
+    return X_E_NO_SUCH_USER;
+  }
+
+  *index = 0;
+  return X_E_SUCCESS;
+}
+
+u32 XamUserGetOnlineLanguageFromXUID_entry(u64 xuid) {
+  // Single profile: fall back to the host language cvar the same way xenia's
+  // real implementation falls back to a persisted xconfig setting when no
+  // matching profile is found.
+  return REXCVAR_GET(user_language);
+}
+
+u32 XamUserGetOnlineCountryFromXUID_entry(u64 xuid) {
+  return REXCVAR_GET(user_country);
+}
+
+u32 XamUserGetUserFlags_entry(u32 user_index) {
+  // No account-level flags (parental controls, live-enabled bits, etc.) are
+  // modeled for the single local profile - 0 is the honest "none set" value.
+  return 0;
+}
+
+u32 XamUserGetUserFlagsFromXUID_entry(u64 xuid) {
+  return 0;
+}
+
+u32 XamUserGetCachedUserFlags_entry(u32 user_index) {
+  return 0;
+}
+
+u32 XamUserIsParentalControlled_entry(u32 user_index) {
+  return 0;  // No parental controls modeled for the single local profile.
+}
+
+u32 XamUserIsUnsafeProgrammingAllowed_entry(u32 user_index, u32 unk, mapped_u32 result_ptr) {
+  if (!result_ptr) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+  if (user_index != 0xFF && user_index >= 4) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+  *result_ptr = 1;
+  return X_ERROR_SUCCESS;
+}
+
+u32 XamUserGetSubscriptionType_entry(u32 user_index, mapped_u32 subscription_ptr, mapped_u32 r5,
+                                     u32 overlapped_ptr) {
+  if (user_index >= 4) {
+    return X_E_INVALIDARG;
+  }
+  if (!subscription_ptr || !r5) {
+    return X_E_INVALIDARG;
+  }
+  if (user_index) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+
+  *subscription_ptr = 6;  // Gold, matches XamUserGetMembershipTier_entry above.
+  *r5 = 0;
+  return X_ERROR_SUCCESS;
+}
+
+u32 XamUserGetUserTenure_entry(u32 user_index, mapped_u32 tenure_level_ptr, mapped_u32 milestone_ptr,
+                               mapped_u64 milestone_date_ptr, u32 overlapped_ptr) {
+  if (user_index) {
+    return X_E_INVALIDARG;
+  }
+
+  const auto& user_profile = REX_KERNEL_STATE()->user_profile();
+
+  if (tenure_level_ptr) {
+    if (auto setting =
+            user_profile->GetSetting(static_cast<uint32_t>(UserSettingId::XPROFILE_TENURE_LEVEL))) {
+      *tenure_level_ptr = uint32_t(int32_t(setting->get_data()->data.s32));
+    }
+  }
+  if (milestone_ptr) {
+    if (auto setting = user_profile->GetSetting(
+            static_cast<uint32_t>(UserSettingId::XPROFILE_TENURE_MILESTONE))) {
+      *milestone_ptr = uint32_t(int32_t(setting->get_data()->data.s32));
+    }
+  }
+  if (milestone_date_ptr) {
+    if (auto setting = user_profile->GetSetting(
+            static_cast<uint32_t>(UserSettingId::XPROFILE_TENURE_NEXT_MILESTONE_DATE))) {
+      *milestone_date_ptr = uint64_t(int64_t(setting->get_data()->data.s64));
+    }
+  }
+
+  return X_ERROR_SUCCESS;
+}
+
 u32 XamUserAreUsersFriends_entry(u32 user_index, u32 unk1, u32 unk2, mapped_u32 out_value,
                                  u32 overlapped_ptr) {
   uint32_t are_friends = 0;
@@ -698,6 +808,70 @@ u32 XamUserCreateAchievementEnumerator_entry(u32 title_id, u32 user_index, u32 x
   return X_ERROR_SUCCESS;
 }
 
+// Ported from xenia's real X_XDBF_GPD_TITLE_PLAYED-shaped enumerator entry
+// (XTitleEnumerator::XTITLE_PLAYED): the fixed-size GPD title record plus a
+// fixed 64-char16 title name buffer. XStaticEnumerator<T> reinterprets its
+// item buffer directly as T, so this struct plays both the "wire format" and
+// "item passed to AppendItem" roles - unlike the achievement enumerator
+// above, no separate host-side type is needed since there's no variable-size
+// side buffer.
+struct X_TITLE_PLAYED {
+  util::X_XDBF_GPD_TITLE_PLAYED base;
+  rex::be<char16_t> title_name[64];
+
+  void Write(X_TITLE_PLAYED* ptr) const { *ptr = *this; }
+};
+static_assert_size(X_TITLE_PLAYED,
+                   sizeof(util::X_XDBF_GPD_TITLE_PLAYED) + 64 * sizeof(char16_t));
+
+u32 XamUserCreateTitlesPlayedEnumerator_entry(u32 title_id, u32 user_index, u64 xuid,
+                                              u32 starting_index, u32 game_count,
+                                              mapped_u32 buffer_size_ptr, mapped_u32 handle_ptr) {
+  if (user_index >= 4 || !game_count || !buffer_size_ptr || !handle_ptr) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+  if (user_index) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+
+  const auto& user_profile = REX_KERNEL_STATE()->user_profile();
+  if (xuid && xuid != user_profile->xuid()) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+
+  *buffer_size_ptr = game_count * static_cast<uint32_t>(sizeof(X_TITLE_PLAYED));
+
+  auto e = object_ref<XStaticEnumerator<X_TITLE_PLAYED>>(
+      new XStaticEnumerator<X_TITLE_PLAYED>(REX_KERNEL_STATE(), game_count));
+  auto result = e->Initialize(user_index, 0xFB, 0xB0050, 0xB000B, 0);
+  if (XFAILED(result)) {
+    return result;
+  }
+
+  uint32_t skipped = 0;
+  for (const auto* title : user_profile->GetPlayedTitles()) {
+    if (!title->include_in_enumerator()) {
+      continue;
+    }
+    if (skipped < starting_index) {
+      ++skipped;
+      continue;
+    }
+
+    X_TITLE_PLAYED entry = {};
+    entry.base = *title;
+    // Real console zeroes this when the title was played offline.
+    entry.base.last_played = 0;
+    rex::string::copy_and_swap_truncating(reinterpret_cast<char16_t*>(entry.title_name),
+                                          user_profile->GetTitleName(uint32_t(title->title_id)),
+                                          rex::countof(entry.title_name));
+    e->AppendItem(entry);
+  }
+
+  *handle_ptr = e->handle();
+  return X_ERROR_SUCCESS;
+}
+
 u32 XamParseGamerTileKey_entry(mapped_u32 key_ptr, mapped_u32 out1_ptr, mapped_u32 out2_ptr,
                                mapped_u32 out3_ptr) {
   *out1_ptr = 0xC0DE0001;
@@ -781,33 +955,38 @@ REX_EXPORT_STUB(__imp__XamUserAllowedToPostToSocialNetwork);
 REX_EXPORT_STUB(__imp__XamUserCreateAvatarAssetEnumerator);
 REX_EXPORT_STUB(__imp__XamUserCreatePlayerEnumerator);
 REX_EXPORT_STUB(__imp__XamUserCreateStatsEnumerator);
-REX_EXPORT_STUB(__imp__XamUserCreateTitlesPlayedEnumerator);
+REX_EXPORT(__imp__XamUserCreateTitlesPlayedEnumerator,
+           rex::kernel::xam::XamUserCreateTitlesPlayedEnumerator_entry)
 REX_EXPORT_STUB(__imp__XamUserFlushLogonQueue);
 REX_EXPORT_STUB(__imp__XamUserGetAge);
 REX_EXPORT_STUB(__imp__XamUserGetAgeGroup);
-REX_EXPORT_STUB(__imp__XamUserGetCachedUserFlags);
+REX_EXPORT(__imp__XamUserGetCachedUserFlags, rex::kernel::xam::XamUserGetCachedUserFlags_entry)
 REX_EXPORT_STUB(__imp__XamUserGetDeviceId);
-REX_EXPORT_STUB(__imp__XamUserGetIndexFromXUID);
-REX_EXPORT_STUB(__imp__XamUserGetMembershipTierFromXUID);
-REX_EXPORT_STUB(__imp__XamUserGetOnlineCountryFromXUID);
-REX_EXPORT_STUB(__imp__XamUserGetOnlineLanguageFromXUID);
+REX_EXPORT(__imp__XamUserGetIndexFromXUID, rex::kernel::xam::XamUserGetIndexFromXUID_entry)
+REX_EXPORT(__imp__XamUserGetMembershipTierFromXUID,
+           rex::kernel::xam::XamUserGetMembershipTierFromXUID_entry)
+REX_EXPORT(__imp__XamUserGetOnlineCountryFromXUID,
+           rex::kernel::xam::XamUserGetOnlineCountryFromXUID_entry)
+REX_EXPORT(__imp__XamUserGetOnlineLanguageFromXUID,
+           rex::kernel::xam::XamUserGetOnlineLanguageFromXUID_entry)
 REX_EXPORT_STUB(__imp__XamUserGetOnlineXUIDFromOfflineXUID);
 REX_EXPORT_STUB(__imp__XamUserGetReportingInfo);
 REX_EXPORT_STUB(__imp__XamUserGetRequestedUserIndexMask);
-REX_EXPORT_STUB(__imp__XamUserGetSubscriptionType);
-REX_EXPORT_STUB(__imp__XamUserGetUserFlags);
-REX_EXPORT_STUB(__imp__XamUserGetUserFlagsFromXUID);
+REX_EXPORT(__imp__XamUserGetSubscriptionType, rex::kernel::xam::XamUserGetSubscriptionType_entry)
+REX_EXPORT(__imp__XamUserGetUserFlags, rex::kernel::xam::XamUserGetUserFlags_entry)
+REX_EXPORT(__imp__XamUserGetUserFlagsFromXUID, rex::kernel::xam::XamUserGetUserFlagsFromXUID_entry)
 REX_EXPORT_STUB(__imp__XamUserGetUserIndexMask);
-REX_EXPORT_STUB(__imp__XamUserGetUserTenure);
+REX_EXPORT(__imp__XamUserGetUserTenure, rex::kernel::xam::XamUserGetUserTenure_entry)
 REX_EXPORT_STUB(__imp__XamUserGetUsersMissingAvatars);
 REX_EXPORT_STUB(__imp__XamUserGetXUIDForTFA);
 REX_EXPORT_STUB(__imp__XamUserInvalidateProfileSetting);
 REX_EXPORT_STUB(__imp__XamUserIsGuest);
 REX_EXPORT_STUB(__imp__XamUserIsLogonPreviewModeEnabled);
-REX_EXPORT_STUB(__imp__XamUserIsParentalControlled);
+REX_EXPORT(__imp__XamUserIsParentalControlled, rex::kernel::xam::XamUserIsParentalControlled_entry)
 REX_EXPORT_STUB(__imp__XamUserIsPartial);
 REX_EXPORT_STUB(__imp__XamUserIsPartialProfile);
-REX_EXPORT_STUB(__imp__XamUserIsUnsafeProgrammingAllowed);
+REX_EXPORT(__imp__XamUserIsUnsafeProgrammingAllowed,
+           rex::kernel::xam::XamUserIsUnsafeProgrammingAllowed_entry)
 REX_EXPORT_STUB(__imp__XamUserLockLogonPreviewMode);
 REX_EXPORT_STUB(__imp__XamUserLogon);
 REX_EXPORT_STUB(__imp__XamUserLogonEx);

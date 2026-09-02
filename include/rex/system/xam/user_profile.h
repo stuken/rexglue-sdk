@@ -118,6 +118,15 @@ class UserProfile {
   // recorded as unlocked in the GPD.
   void OnAchievementUnlocked(const AchievementInfo& info, uint64_t unlock_filetime);
 
+  // Dashboard played-titles list, for XamUserCreateTitlesPlayedEnumerator.
+  // Pointers are valid only as long as this UserProfile's dashboard GPD
+  // isn't mutated (e.g. by TrackTitle/OnAchievementUnlocked) - callers
+  // should copy any entry they need to keep past that.
+  std::vector<const util::X_XDBF_GPD_TITLE_PLAYED*> GetPlayedTitles() const {
+    return dashboard_gpd_.GetTitlesInfo();
+  }
+  std::u16string GetTitleName(uint32_t title_id) const { return dashboard_gpd_.GetTitleName(title_id); }
+
  private:
   uint64_t xuid_;
   std::string name_;
