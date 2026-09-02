@@ -16,11 +16,13 @@
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/logging.h>
 #include <rex/hook.h>
+#include <rex/runtime.h>
 #include <rex/types.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xexception.h>
 #include <rex/system/xthread.h>
 #include <rex/system/xtypes.h>
+#include <rex/ui/imgui_dialog.h>
 
 namespace rex::kernel::xboxkrnl {
 using namespace rex::system;
@@ -144,11 +146,35 @@ void RtlRaiseException_entry(ppc_ptr_t<X_EXCEPTION_RECORD> record) {
 }
 
 void KeBugCheckEx_entry(u32 code, u32 param1, u32 param2, u32 param3, u32 param4) {
-  REXKRNL_DEBUG("*** STOP: 0x{:08X} (0x{:08X}, 0x{:08X}, 0x{:08X}, 0x{:08X})", code, param1, param2,
-                param3, param4);
+  auto msg = fmt::format("*** STOP: 0x{:08X} (0x{:08X}, 0x{:08X}, 0x{:08X}, 0x{:08X})", code,
+                         param1, param2, param3, param4);
+  REXKRNL_ERROR("{}", msg);
   fflush(stdout);
-  rex::debug::Break();
-  assert_always();
+
+  if (rex::debug::IsDebuggerAttached()) {
+    rex::debug::Break();
+  }
+
+  // Show a crash dialog and suspend only the faulting guest thread instead of taking down the
+  // whole host process -- a guest kernel panic in one title shouldn't kill the emulator.
+  auto current_thread = XThread::GetCurrentThread();
+  auto* runtime = REX_KERNEL_STATE()->emulator();
+  auto* display_window = runtime ? runtime->display_window() : nullptr;
+  auto* imgui_drawer = runtime ? runtime->imgui_drawer() : nullptr;
+  if (display_window && imgui_drawer) {
+    auto dlg_msg = fmt::format(
+        "The guest kernel has crashed (KeBugCheck).\n\n{}\n\n"
+        "The faulting thread has been suspended.",
+        msg);
+    display_window->app_context().CallInUIThreadSynchronous(
+        [imgui_drawer, dlg_msg]() {
+          rex::ui::ImGuiDialog::ShowMessageBox(imgui_drawer, "Guest Kernel Crash", dlg_msg);
+        });
+  }
+
+  if (current_thread) {
+    current_thread->Suspend(nullptr);
+  }
 }
 
 void KeBugCheck_entry(u32 code) {

@@ -13,6 +13,10 @@
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
 #include <algorithm>
+#include <array>
+#include <map>
+#include <string>
+#include <tuple>
 
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/logging.h>
@@ -38,6 +42,9 @@
 
 extern "C" {
 #include "aes_128/aes.h"
+#include "FFmpeg/libavutil/md5.h"
+#include "FFmpeg/libavutil/mem.h"
+#include "FFmpeg/libavutil/sha512.h"
 }
 
 namespace rex::kernel::xboxkrnl {
@@ -158,6 +165,56 @@ void XeCryptSha_entry(mapped_void input_1, u32 input_1_size, mapped_void input_2
   std::copy_n(digest, std::min<size_t>(rex::countof(digest), output_size), output.as<uint8_t*>());
 }
 
+typedef struct {
+  XECRYPT_SHA_STATE sha_state[2];
+} XECRYPT_HMACSHA_STATE;
+static_assert_size(XECRYPT_HMACSHA_STATE, 0xB0);
+
+void XeCryptHmacShaInit_entry(ppc_ptr_t<XECRYPT_HMACSHA_STATE> sha_state_ptr, mapped_void key_ptr,
+                              u32 key_size) {
+  sha_state_ptr.Zero();
+
+  const uint8_t* key_data_ptr = key_ptr.as<const uint8_t*>();
+  const uint32_t key_size_ = key_size > 64 ? 64 : key_size;
+
+  auto sha_state_0 = ppc_ptr_t<XECRYPT_SHA_STATE>::from_host(&sha_state_ptr->sha_state[0]);
+  auto sha_state_1 = ppc_ptr_t<XECRYPT_SHA_STATE>::from_host(&sha_state_ptr->sha_state[1]);
+
+  XeCryptShaInit_entry(sha_state_0);
+  XeCryptShaInit_entry(sha_state_1);
+
+  std::array<uint8_t, 64> key_1 = {};
+  std::array<uint8_t, 64> key_2 = {};
+
+  std::copy_n(key_data_ptr, key_size_, key_1.begin());
+  std::copy_n(key_data_ptr, key_size_, key_2.begin());
+
+  for (uint32_t i = 0; i < key_size_; i += 1) {
+    key_1[i] ^= 0x5C;
+    key_2[i] ^= 0x36;
+  }
+
+  XeCryptShaUpdate_entry(sha_state_0, mapped_void::from_host(key_2.data()), key_size_);
+  XeCryptShaUpdate_entry(sha_state_1, mapped_void::from_host(key_1.data()), key_size_);
+}
+
+void XeCryptHmacShaUpdate_entry(ppc_ptr_t<XECRYPT_HMACSHA_STATE> sha_state_ptr, mapped_void input,
+                                u32 input_size) {
+  auto sha_state_0 = ppc_ptr_t<XECRYPT_SHA_STATE>::from_host(&sha_state_ptr->sha_state[0]);
+  XeCryptShaUpdate_entry(sha_state_0, input, input_size);
+}
+
+void XeCryptHmacShaFinal_entry(ppc_ptr_t<XECRYPT_HMACSHA_STATE> sha_state_ptr, ppc_ptr_t<uint8_t> out,
+                               u32 out_size) {
+  auto sha_state_0 = ppc_ptr_t<XECRYPT_SHA_STATE>::from_host(&sha_state_ptr->sha_state[0]);
+  auto sha_state_1 = ppc_ptr_t<XECRYPT_SHA_STATE>::from_host(&sha_state_ptr->sha_state[1]);
+
+  XeCryptShaFinal_entry(sha_state_0, ppc_ptr_t<uint8_t>(), 0);
+  XeCryptShaUpdate_entry(sha_state_1, mapped_void::from_host(sha_state_ptr->sha_state[0].state),
+                         sizeof(XECRYPT_SHA_STATE::state));
+  XeCryptShaFinal_entry(sha_state_1, out, out_size);
+}
+
 // TODO: Size of this struct hasn't been confirmed yet.
 typedef struct {
   rex::be<uint32_t> count;     // 0x0
@@ -204,6 +261,159 @@ void XeCryptSha256Final_entry(ppc_ptr_t<XECRYPT_SHA256_STATE> sha_state, ppc_ptr
 
   std::copy_n(hash, std::min<size_t>(rex::countof(hash), out_size), static_cast<uint8_t*>(out));
   std::copy(std::begin(hash), std::end(hash), sha_state->buffer);
+}
+
+// TODO: Size of this struct hasn't been confirmed yet.
+typedef struct {
+  rex::be<uint64_t> count;     // 0x0
+  rex::be<uint64_t> state[8];  // 0x8
+  uint8_t buffer[128];         // 0x48
+} XECRYPT_SHA512_STATE;
+
+// Mirrors FFmpeg's internal AVSHA512 layout (libavutil/sha512.c) so the state can be bridged
+// into/out of av_sha512_* between guest-visible Update/Final calls.
+struct SHA512_STATE {
+  uint8_t digest_len;
+  uint64_t count;
+  uint8_t buffer[128];
+  uint64_t state[8];
+};
+
+void XeCryptSha512Init_entry(ppc_ptr_t<XECRYPT_SHA512_STATE> sha_state) {
+  sha_state.Zero();
+
+  sha_state->state[0] = 0x6a09e667f3bcc908;
+  sha_state->state[1] = 0xbb67ae8584caa73b;
+  sha_state->state[2] = 0x3c6ef372fe94f82b;
+  sha_state->state[3] = 0xa54ff53a5f1d36f1;
+  sha_state->state[4] = 0x510e527fade682d1;
+  sha_state->state[5] = 0x9b05688c2b3e6c1f;
+  sha_state->state[6] = 0x1f83d9abfb41bd6b;
+  sha_state->state[7] = 0x5be0cd19137e2179;
+}
+
+void XeCryptSha512Update_entry(ppc_ptr_t<XECRYPT_SHA512_STATE> sha_state, mapped_void input,
+                               u32 input_size) {
+  AVSHA512* sha = av_sha512_alloc();
+  av_sha512_init(sha, 512);
+
+  SHA512_STATE* sha2 = reinterpret_cast<SHA512_STATE*>(sha);
+  std::copy(std::begin(sha_state->state), std::end(sha_state->state), sha2->state);
+  std::copy(std::begin(sha_state->buffer), std::end(sha_state->buffer), sha2->buffer);
+  sha2->count = sha_state->count;
+
+  av_sha512_update(sha, input, input_size);
+
+  std::copy_n(sha2->state, rex::countof(sha_state->state), sha_state->state);
+  std::copy_n(sha2->buffer, rex::countof(sha_state->buffer), sha_state->buffer);
+  sha_state->count = sha2->count;
+
+  av_free(sha);
+}
+
+void XeCryptSha512Final_entry(ppc_ptr_t<XECRYPT_SHA512_STATE> sha_state, ppc_ptr_t<uint8_t> out,
+                              u32 out_size) {
+  AVSHA512* sha = av_sha512_alloc();
+  av_sha512_init(sha, 512);
+
+  SHA512_STATE* sha2 = reinterpret_cast<SHA512_STATE*>(sha);
+  std::copy(std::begin(sha_state->state), std::end(sha_state->state), sha2->state);
+  std::copy(std::begin(sha_state->buffer), std::end(sha_state->buffer), sha2->buffer);
+  sha2->count = sha_state->count;
+
+  uint8_t hash[64];
+  av_sha512_final(sha, hash);
+
+  std::copy_n(hash, std::min<size_t>(rex::countof(hash), out_size), static_cast<uint8_t*>(out));
+  std::copy(std::begin(hash), std::end(hash), sha_state->buffer);
+
+  av_free(sha);
+}
+
+// TODO: Size of this struct hasn't been confirmed yet.
+typedef struct {
+  rex::be<uint64_t> count;
+  rex::be<uint32_t> state[4];
+  uint8_t buffer[64];
+} XECRYPT_MD5_STATE;
+
+// Mirrors FFmpeg's internal AVMD5 layout (libavutil/md5.c) so the state can be bridged into/out
+// of av_md5_* between guest-visible Update/Final calls.
+struct MD5_STATE {
+  uint64_t len;
+  uint8_t block[64];
+  uint32_t ABCD[4];
+};
+
+void XeCryptMd5_entry(mapped_void input_1, u32 input_1_size, mapped_void input_2, u32 input_2_size,
+                      mapped_void input_3, u32 input_3_size, mapped_void output, u32 output_size) {
+  AVMD5* md5 = av_md5_alloc();
+  av_md5_init(md5);
+
+  if (input_1 && input_1_size) {
+    av_md5_update(md5, input_1, input_1_size);
+  }
+  if (input_2 && input_2_size) {
+    av_md5_update(md5, input_2, input_2_size);
+  }
+  if (input_3 && input_3_size) {
+    av_md5_update(md5, input_3, input_3_size);
+  }
+
+  uint8_t digest[16];
+  av_md5_final(md5, digest);
+
+  std::copy_n(digest, std::min<size_t>(rex::countof(digest), output_size), output.as<uint8_t*>());
+
+  av_free(md5);
+}
+
+void XeCryptMd5Init_entry(ppc_ptr_t<XECRYPT_MD5_STATE> md5_state) {
+  md5_state.Zero();
+
+  // must match av_md5_init
+  md5_state->state[0] = 0x10325476;
+  md5_state->state[1] = 0x98badcfe;
+  md5_state->state[2] = 0xefcdab89;
+  md5_state->state[3] = 0x67452301;
+}
+
+void XeCryptMd5Update_entry(ppc_ptr_t<XECRYPT_MD5_STATE> md5_state, mapped_void input,
+                            u32 input_size) {
+  AVMD5* md5 = av_md5_alloc();
+  av_md5_init(md5);
+
+  MD5_STATE* md5_internal = reinterpret_cast<MD5_STATE*>(md5);
+  std::copy(std::begin(md5_state->state), std::end(md5_state->state), md5_internal->ABCD);
+  std::copy(std::begin(md5_state->buffer), std::end(md5_state->buffer), md5_internal->block);
+  md5_internal->len = md5_state->count;
+
+  av_md5_update(md5, input, input_size);
+
+  std::copy_n(md5_internal->ABCD, rex::countof(md5_state->state), md5_state->state);
+  std::copy_n(md5_internal->block, rex::countof(md5_state->buffer), md5_state->buffer);
+  md5_state->count = md5_internal->len;
+
+  av_free(md5);
+}
+
+void XeCryptMd5Final_entry(ppc_ptr_t<XECRYPT_MD5_STATE> md5_state, ppc_ptr_t<uint8_t> out,
+                           u32 out_size) {
+  AVMD5* md5 = av_md5_alloc();
+  av_md5_init(md5);
+
+  MD5_STATE* md5_internal = reinterpret_cast<MD5_STATE*>(md5);
+  std::copy(std::begin(md5_state->state), std::end(md5_state->state), md5_internal->ABCD);
+  std::copy(std::begin(md5_state->buffer), std::end(md5_state->buffer), md5_internal->block);
+  md5_internal->len = md5_state->count;
+
+  uint8_t hash[16];
+  av_md5_final(md5, hash);
+
+  std::copy_n(hash, std::min<size_t>(rex::countof(hash), out_size), static_cast<uint8_t*>(out));
+  std::copy(std::begin(hash), std::end(hash), md5_state->buffer);
+
+  av_free(md5);
 }
 
 // Byteswaps each 8 bytes
@@ -333,6 +543,21 @@ void XeCryptRandom_entry(mapped_void buf, u32 buf_size) {
 struct XECRYPT_DES_STATE {
   uint32_t keytab[16][2];
 };
+
+void XeCryptDesKey_entry(ppc_ptr_t<XECRYPT_DES_STATE> state_ptr, mapped_u64 key) {
+  DES des(key[0]);
+  std::memcpy(state_ptr->keytab, des.get_sub_key(), 128);
+}
+
+void XeCryptDesEcb_entry(ppc_ptr_t<XECRYPT_DES_STATE> state_ptr, mapped_u64 inp, mapped_u64 out,
+                         u32 encrypt) {
+  DES des(reinterpret_cast<uint64_t*>(state_ptr->keytab));
+  if (encrypt) {
+    *out = des.encrypt(*inp);
+  } else {
+    *out = des.decrypt(*inp);
+  }
+}
 
 // Sets bit 0 to make the parity odd
 void XeCryptDesParity_entry(mapped_void inp, u32 inp_size, mapped_void out_ptr) {
@@ -649,6 +874,187 @@ u32 XeKeysConsoleSignatureVerification_entry(mapped_void hash, mapped_void signa
   return 0;  // Success (signature valid)
 }
 
+// https://github.com/emoose/ExCrypt/blob/master/src/exkeys.cpp#L7
+enum X_KEY_INDEX : uint32_t {
+  MANUFACTURING_MODE = 0x0,
+  ALTERNATE_KEY_VAULT = 0x1,
+  RESTRICTED_PRIVILEGES_FLAGS = 0x2,
+  RESERVED_BYTE3 = 0x3,
+  ODD_FEATURES = 0x4,
+  ODD_AUTHTYPE = 0x5,
+  RESTRICTED_HVEXT_LOADER = 0x6,
+  POLICY_FLASH_SIZE = 0x7,
+  POLICY_BUILTIN_USBMU_SIZE = 0x8,
+  RESERVED_DWORD4 = 0x9,
+  RESTRICTED_PRIVILEGES = 0xA,
+  RESERVED_QWORD2 = 0xB,
+  RESERVED_QWORD3 = 0xC,
+  RESERVED_QWORD4 = 0xD,
+  RESERVED_KEY1 = 0xE,
+  RESERVED_KEY2 = 0xF,
+  RESERVED_KEY3 = 0x10,
+  RESERVED_KEY4 = 0x11,
+  RESERVED_RANDOM_KEY1 = 0x12,
+  RESERVED_RANDOM_KEY2 = 0x13,
+  CONSOLE_SERIAL_NUMBER = 0x14,
+  MOBO_SERIAL_NUMBER = 0x15,
+  GAME_REGION = 0x16,
+  CONSOLE_OBFUSCATION_KEY = 0x17,
+  KEY_OBFUSCATION_KEY = 0x18,
+  ROAMABLE_OBFUSCATION_KEY = 0x19,
+  DVD_KEY = 0x1A,
+  PRIMARY_ACTIVATION_KEY = 0x1B,
+  SECONDARY_ACTIVATION_KEY = 0x1C,
+  GLOBAL_DEVICE_2DES_KEY1 = 0x1D,
+  GLOBAL_DEVICE_2DES_KEY2 = 0x1E,
+  WIRELESS_CONTROLLER_MS_2DES_KEY1 = 0x1F,
+  WIRELESS_CONTROLLER_MS_2DES_KEY2 = 0x20,
+  WIRED_WEBCAM_MS_2DES_KEY1 = 0x21,
+  WIRED_WEBCAM_MS_2DES_KEY2 = 0x22,
+  WIRED_CONTROLLER_MS_2DES_KEY1 = 0x23,
+  WIRED_CONTROLLER_MS_2DES_KEY2 = 0x24,
+  MEMORY_UNIT_MS_2DES_KEY1 = 0x25,
+  MEMORY_UNIT_MS_2DES_KEY2 = 0x26,
+  OTHER_XSM3_DEVICE_MS_2DES_KEY1 = 0x27,
+  OTHER_XSM3_DEVICE_MS_2DES_KEY2 = 0x28,
+  WIRELESS_CONTROLLER_3P_2DES_KEY1 = 0x29,
+  WIRELESS_CONTROLLER_3P_2DES_KEY2 = 0x2A,
+  WIRED_WEBCAM_3P_2DES_KEY1 = 0x2B,
+  WIRED_WEBCAM_3P_2DES_KEY2 = 0x2C,
+  WIRED_CONTROLLER_3P_2DES_KEY1 = 0x2D,
+  WIRED_CONTROLLER_3P_2DES_KEY2 = 0x2E,
+  MEMORY_UNIT_3P_2DES_KEY1 = 0x2F,
+  MEMORY_UNIT_3P_2DES_KEY2 = 0x30,
+  OTHER_XSM3_DEVICE_3P_2DES_KEY1 = 0x31,
+  OTHER_XSM3_DEVICE_3P_2DES_KEY2 = 0x32,
+  CONSOLE_PRIVATE_KEY = 0x33,
+  XEIKA_PRIVATE_KEY = 0x34,
+  CARDEA_PRIVATE_KEY = 0x35,
+  CONSOLE_CERTIFICATE = 0x36,
+  XEIKA_CERTIFICATE = 0x37,
+  CARDEA_CERTIFICATE = 0x38,
+  MAX_KEY_INDEX = 0x39,
+};
+
+static const std::map<uint32_t, std::tuple<uint32_t, uint32_t>> X_Key_Properties = {
+    {MANUFACTURING_MODE, {0x8, 0x1}},
+    {ALTERNATE_KEY_VAULT, {0x9, 0x1}},
+    {RESTRICTED_PRIVILEGES_FLAGS, {0xA, 0x1}},
+    {RESERVED_BYTE3, {0xB, 0x1}},
+    {ODD_FEATURES, {0xC, 0x2}},
+    {ODD_AUTHTYPE, {0xE, 0x2}},
+    {RESTRICTED_HVEXT_LOADER, {0x10, 0x4}},
+    {POLICY_FLASH_SIZE, {0x14, 0x4}},
+    {POLICY_BUILTIN_USBMU_SIZE, {0x18, 0x4}},
+    {RESERVED_DWORD4, {0x1C, 0x4}},
+    {RESTRICTED_PRIVILEGES, {0x20, 0x8}},
+    {RESERVED_QWORD2, {0x28, 0x8}},
+    {RESERVED_QWORD3, {0x30, 0x8}},
+    {RESERVED_QWORD4, {0x38, 0x8}},
+    {RESERVED_KEY1, {0x40, 0x10}},
+    {RESERVED_KEY2, {0x50, 0x10}},
+    {RESERVED_KEY3, {0x60, 0x10}},
+    {RESERVED_KEY4, {0x70, 0x10}},
+    {RESERVED_RANDOM_KEY1, {0x80, 0x10}},
+    {RESERVED_RANDOM_KEY2, {0x90, 0x10}},
+    {CONSOLE_SERIAL_NUMBER, {0xA0, 0xC}},
+    {MOBO_SERIAL_NUMBER, {0xAC, 0xC}},
+    {GAME_REGION, {0xB8, 0x2}},
+    {CONSOLE_OBFUSCATION_KEY, {0xC0, 0x10}},
+    {KEY_OBFUSCATION_KEY, {0xD0, 0x10}},
+    {ROAMABLE_OBFUSCATION_KEY, {0xE0, 0x10}},
+    {DVD_KEY, {0xF0, 0x10}},
+    {PRIMARY_ACTIVATION_KEY, {0x100, 0x18}},
+    {SECONDARY_ACTIVATION_KEY, {0x118, 0x10}},
+    {GLOBAL_DEVICE_2DES_KEY1, {0x128, 0x10}},
+    {GLOBAL_DEVICE_2DES_KEY2, {0x138, 0x10}},
+    {WIRELESS_CONTROLLER_MS_2DES_KEY1, {0x148, 0x10}},
+    {WIRELESS_CONTROLLER_MS_2DES_KEY2, {0x158, 0x10}},
+    {WIRED_WEBCAM_MS_2DES_KEY1, {0x168, 0x10}},
+    {WIRED_WEBCAM_MS_2DES_KEY2, {0x178, 0x10}},
+    {WIRED_CONTROLLER_MS_2DES_KEY1, {0x188, 0x10}},
+    {WIRED_CONTROLLER_MS_2DES_KEY2, {0x198, 0x10}},
+    {MEMORY_UNIT_MS_2DES_KEY1, {0x1A8, 0x10}},
+    {MEMORY_UNIT_MS_2DES_KEY2, {0x1B8, 0x10}},
+    {OTHER_XSM3_DEVICE_MS_2DES_KEY1, {0x1C8, 0x10}},
+    {OTHER_XSM3_DEVICE_MS_2DES_KEY2, {0x1D8, 0x10}},
+    {WIRELESS_CONTROLLER_3P_2DES_KEY1, {0x1E8, 0x10}},
+    {WIRELESS_CONTROLLER_3P_2DES_KEY2, {0x1F8, 0x10}},
+    {WIRED_WEBCAM_3P_2DES_KEY1, {0x208, 0x10}},
+    {WIRED_WEBCAM_3P_2DES_KEY2, {0x218, 0x10}},
+    {WIRED_CONTROLLER_3P_2DES_KEY1, {0x228, 0x10}},
+    {WIRED_CONTROLLER_3P_2DES_KEY2, {0x238, 0x10}},
+    {MEMORY_UNIT_3P_2DES_KEY1, {0x248, 0x10}},
+    {MEMORY_UNIT_3P_2DES_KEY2, {0x258, 0x10}},
+    {OTHER_XSM3_DEVICE_3P_2DES_KEY1, {0x268, 0x10}},
+    {OTHER_XSM3_DEVICE_3P_2DES_KEY2, {0x278, 0x10}},
+    {CONSOLE_PRIVATE_KEY, {0x288, 0x1D0}},
+    {XEIKA_PRIVATE_KEY, {0x458, 0x390}},
+    {CARDEA_PRIVATE_KEY, {0x7E8, 0x1D0}},
+    {CONSOLE_CERTIFICATE, {0x9B8, 0x1A8}},
+    {XEIKA_CERTIFICATE, {0xB60, 0x1288}},
+    {CARDEA_CERTIFICATE, {0x1EE8, 0x2108}},
+};
+
+u32 XeKeysGetKeyProperties_entry(u32 key) {
+  auto it = X_Key_Properties.find(key);
+  if (it != X_Key_Properties.end()) {
+    return std::get<1>(it->second);
+  }
+  REXKRNL_WARN("XeKeysGetKeyProperties: key 0x{:04X} not implemented", static_cast<uint16_t>(key));
+  return 0;
+}
+
+enum XConsoleType : uint32_t {
+  ConsoleType_Invalid = 0,
+  ConsoleType_Devkit = 1,
+  ConsoleType_Retail = 2,
+  ConsoleType_Testkit = 0x40000001,
+  ConsoleType_RecoveredDevkit = 0x80000001,
+  ConsoleType_Pre1888Devkit = 0x80000002,
+};
+
+u32 XeKeysGetConsoleType_entry(mapped_u32 type_out) {
+  *type_out = ConsoleType_Retail;
+  return 0;
+}
+
+#pragma pack(push, 1)
+struct XE_CONSOLE_ID {
+  union {
+    struct {
+      uint8_t RefurbBits : 4;
+      uint8_t ManufactureMonth : 4;
+      uint32_t ManufactureYear : 4;
+      uint32_t MacIndex3 : 8;
+      uint32_t MacIndex4 : 8;
+      uint32_t MacIndex5 : 8;
+      uint32_t Crc : 4;
+    };
+    uint8_t Data[5];
+  };
+};
+#pragma pack(pop)
+
+u32 XeKeysGetConsoleID_entry(ppc_ptr_t<XE_CONSOLE_ID> raw_bytes, mapped_string hex_string) {
+  // We don't care about the key vault or using official keys.
+  if (raw_bytes) {
+    raw_bytes.Zero();
+    raw_bytes->RefurbBits = 0b0011;
+    raw_bytes->ManufactureMonth = 0b1001;
+    raw_bytes->ManufactureYear = 0b0001;
+    raw_bytes->MacIndex3 = 0b01000000;
+    raw_bytes->MacIndex4 = 0b01100110;
+    raw_bytes->MacIndex5 = 0b01111110;
+    raw_bytes->Crc = 0b0000;
+  }
+  if (hex_string) {
+    std::string key = "245149100000";
+    std::memcpy(hex_string, key.c_str(), 0xC);
+  }
+  return X_STATUS_SUCCESS;
+}
+
 REX_EXPORT_STUB(__imp__XeKeysGetConsoleCertificate);
 REX_EXPORT_STUB(__imp__XeCryptBnDwLeDhEqualBase);
 REX_EXPORT_STUB(__imp__XeCryptBnDwLeDhInvalBase);
@@ -671,21 +1077,12 @@ REX_EXPORT_STUB(__imp__XeCryptBnQw_SwapDwQw);
 REX_EXPORT_STUB(__imp__XeCryptBnQw_SwapLeBe);
 REX_EXPORT_STUB(__imp__XeCryptBnQw_Zero);
 REX_EXPORT_STUB(__imp__XeCryptChainAndSumMac);
-REX_EXPORT_STUB(__imp__XeCryptDesKey);
-REX_EXPORT_STUB(__imp__XeCryptDesEcb);
 REX_EXPORT_STUB(__imp__XeCryptDesCbc);
 REX_EXPORT_STUB(__imp__XeCryptHmacMd5Init);
 REX_EXPORT_STUB(__imp__XeCryptHmacMd5Update);
 REX_EXPORT_STUB(__imp__XeCryptHmacMd5Final);
 REX_EXPORT_STUB(__imp__XeCryptHmacMd5);
-REX_EXPORT_STUB(__imp__XeCryptHmacShaInit);
-REX_EXPORT_STUB(__imp__XeCryptHmacShaUpdate);
-REX_EXPORT_STUB(__imp__XeCryptHmacShaFinal);
 REX_EXPORT_STUB(__imp__XeCryptHmacShaVerify);
-REX_EXPORT_STUB(__imp__XeCryptMd5Init);
-REX_EXPORT_STUB(__imp__XeCryptMd5Update);
-REX_EXPORT_STUB(__imp__XeCryptMd5Final);
-REX_EXPORT_STUB(__imp__XeCryptMd5);
 REX_EXPORT_STUB(__imp__XeCryptParveEcb);
 REX_EXPORT_STUB(__imp__XeCryptParveCbcMac);
 REX_EXPORT_STUB(__imp__XeCryptRotSumSha);
@@ -694,9 +1091,6 @@ REX_EXPORT_STUB(__imp__XeCryptSha384Init);
 REX_EXPORT_STUB(__imp__XeCryptSha384Update);
 REX_EXPORT_STUB(__imp__XeCryptSha384Final);
 REX_EXPORT_STUB(__imp__XeCryptSha384);
-REX_EXPORT_STUB(__imp__XeCryptSha512Init);
-REX_EXPORT_STUB(__imp__XeCryptSha512Update);
-REX_EXPORT_STUB(__imp__XeCryptSha512Final);
 REX_EXPORT_STUB(__imp__XeCryptSha512);
 REX_EXPORT_STUB(__imp__XeCryptBnQwNeCompare);
 REX_EXPORT_STUB(__imp__XeKeysGetFactoryChallenge);
@@ -706,13 +1100,10 @@ REX_EXPORT_STUB(__imp__XeKeysSaveBootLoader);
 REX_EXPORT_STUB(__imp__XeKeysSaveKeyVault);
 REX_EXPORT_STUB(__imp__XeKeysGetStatus);
 REX_EXPORT_STUB(__imp__XeKeysGeneratePrivateKey);
-REX_EXPORT_STUB(__imp__XeKeysGetKeyProperties);
 REX_EXPORT_STUB(__imp__XeKeysSetKey);
 REX_EXPORT_STUB(__imp__XeKeysGenerateRandomKey);
 REX_EXPORT_STUB(__imp__XeKeysGetKey);
 REX_EXPORT_STUB(__imp__XeKeysGetDigest);
-REX_EXPORT_STUB(__imp__XeKeysGetConsoleID);
-REX_EXPORT_STUB(__imp__XeKeysGetConsoleType);
 REX_EXPORT_STUB(__imp__XeKeysQwNeRsaPrvCrypt);
 REX_EXPORT_STUB(__imp__XeKeysAesCbc);
 REX_EXPORT_STUB(__imp__XeKeysDes2Cbc);
@@ -801,6 +1192,21 @@ REX_EXPORT(__imp__XeCryptAesKey, rex::kernel::xboxkrnl::XeCryptAesKey_entry)
 REX_EXPORT(__imp__XeCryptAesEcb, rex::kernel::xboxkrnl::XeCryptAesEcb_entry)
 REX_EXPORT(__imp__XeCryptAesCbc, rex::kernel::xboxkrnl::XeCryptAesCbc_entry)
 REX_EXPORT(__imp__XeCryptHmacSha, rex::kernel::xboxkrnl::XeCryptHmacSha_entry)
+REX_EXPORT(__imp__XeCryptHmacShaInit, rex::kernel::xboxkrnl::XeCryptHmacShaInit_entry)
+REX_EXPORT(__imp__XeCryptHmacShaUpdate, rex::kernel::xboxkrnl::XeCryptHmacShaUpdate_entry)
+REX_EXPORT(__imp__XeCryptHmacShaFinal, rex::kernel::xboxkrnl::XeCryptHmacShaFinal_entry)
+REX_EXPORT(__imp__XeCryptMd5, rex::kernel::xboxkrnl::XeCryptMd5_entry)
+REX_EXPORT(__imp__XeCryptMd5Init, rex::kernel::xboxkrnl::XeCryptMd5Init_entry)
+REX_EXPORT(__imp__XeCryptMd5Update, rex::kernel::xboxkrnl::XeCryptMd5Update_entry)
+REX_EXPORT(__imp__XeCryptMd5Final, rex::kernel::xboxkrnl::XeCryptMd5Final_entry)
+REX_EXPORT(__imp__XeCryptSha512Init, rex::kernel::xboxkrnl::XeCryptSha512Init_entry)
+REX_EXPORT(__imp__XeCryptSha512Update, rex::kernel::xboxkrnl::XeCryptSha512Update_entry)
+REX_EXPORT(__imp__XeCryptSha512Final, rex::kernel::xboxkrnl::XeCryptSha512Final_entry)
+REX_EXPORT(__imp__XeCryptDesKey, rex::kernel::xboxkrnl::XeCryptDesKey_entry)
+REX_EXPORT(__imp__XeCryptDesEcb, rex::kernel::xboxkrnl::XeCryptDesEcb_entry)
+REX_EXPORT(__imp__XeKeysGetKeyProperties, rex::kernel::xboxkrnl::XeKeysGetKeyProperties_entry)
+REX_EXPORT(__imp__XeKeysGetConsoleType, rex::kernel::xboxkrnl::XeKeysGetConsoleType_entry)
+REX_EXPORT(__imp__XeKeysGetConsoleID, rex::kernel::xboxkrnl::XeKeysGetConsoleID_entry)
 REX_EXPORT(__imp__XeKeysHmacSha, rex::kernel::xboxkrnl::XeKeysHmacSha_entry)
 REX_EXPORT(__imp__XeKeysAesCbcUsingKey, rex::kernel::xboxkrnl::XeKeysAesCbcUsingKey_entry)
 REX_EXPORT(__imp__XeKeysObscureKey, rex::kernel::xboxkrnl::XeKeysObscureKey_entry)

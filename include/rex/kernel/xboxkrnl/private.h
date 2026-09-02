@@ -11,4 +11,13 @@
 
 #pragma once
 
-namespace rex::kernel::xboxkrnl {}  // namespace rex::kernel::xboxkrnl
+#include <cstdint>
+
+#include <rex/system/xtypes.h>
+
+namespace rex::kernel::xboxkrnl {
+
+X_STATUS xeExGetXConfigSetting(uint16_t category, uint16_t setting, void* buffer,
+                               uint16_t buffer_size, uint16_t* required_size);
+
+}  // namespace rex::kernel::xboxkrnl

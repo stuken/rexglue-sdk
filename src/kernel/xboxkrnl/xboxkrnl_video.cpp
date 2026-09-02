@@ -122,7 +122,6 @@ REX_EXPORT_STUB(__imp__VdGetDisplayDiscoveryData);
 REX_EXPORT_STUB(__imp__VdStartDisplayDiscovery);
 REX_EXPORT_STUB(__imp__VdSetHDCPRevocationList);
 REX_EXPORT_STUB(__imp__VdEnableWMAProOverHDMI);
-REX_EXPORT_STUB(__imp__VdQueryRealVideoMode);
 REX_EXPORT_STUB(__imp__VdSetCGMSState);
 REX_EXPORT_STUB(__imp__VdSetSCMSState);
 REX_EXPORT_STUB(__imp__VdGetOption);
@@ -247,6 +246,12 @@ void VdQueryVideoMode(X_VIDEO_MODE* video_mode) {
 }
 
 void VdQueryVideoMode_entry(ppc_ptr_t<X_VIDEO_MODE> video_mode) {
+  VdQueryVideoMode(video_mode);
+}
+
+void VdQueryRealVideoMode_entry(ppc_ptr_t<X_VIDEO_MODE> video_mode) {
+  // rexglue has no separate "virtual/spoofed" mode to distinguish from -- the mode reported by
+  // VdQueryVideoMode is already the real configured one.
   VdQueryVideoMode(video_mode);
 }
 
@@ -557,6 +562,7 @@ REX_EXPORT(__imp__VdGetCurrentDisplayGamma, rex::kernel::xboxkrnl::VdGetCurrentD
 REX_EXPORT(__imp__VdGetCurrentDisplayInformation,
            rex::kernel::xboxkrnl::VdGetCurrentDisplayInformation_entry)
 REX_EXPORT(__imp__VdQueryVideoMode, rex::kernel::xboxkrnl::VdQueryVideoMode_entry)
+REX_EXPORT(__imp__VdQueryRealVideoMode, rex::kernel::xboxkrnl::VdQueryRealVideoMode_entry)
 REX_EXPORT(__imp__VdQueryVideoFlags, rex::kernel::xboxkrnl::VdQueryVideoFlags_entry)
 REX_EXPORT(__imp__VdSetDisplayMode, rex::kernel::xboxkrnl::VdSetDisplayMode_entry)
 REX_EXPORT(__imp__VdSetDisplayModeOverride, rex::kernel::xboxkrnl::VdSetDisplayModeOverride_entry)

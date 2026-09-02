@@ -180,6 +180,15 @@ u32 ObCreateSymbolicLink_entry(ppc_ptr_t<X_ANSI_STRING> path_ptr,
   if (rex::string::utf8_starts_with(path, u8"\\??\\")) {
     path = path.substr(4);  // Strip the full qualifier
   }
+  if (rex::string::utf8_starts_with(path, u8"\\System??\\")) {
+    path = path.substr(10);
+  }
+
+  // 4D5307DC expects re-registering an existing symbolic link to succeed, not fail.
+  std::string existing_target;
+  if (REX_KERNEL_FS()->FindSymbolicLink(path, existing_target)) {
+    return X_STATUS_SUCCESS;
+  }
 
   if (!REX_KERNEL_FS()->RegisterSymbolicLink(path, target)) {
     return X_STATUS_UNSUCCESSFUL;

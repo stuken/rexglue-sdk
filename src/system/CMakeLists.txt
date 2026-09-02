@@ -95,6 +95,7 @@ target_link_libraries(rexruntime
         xxHash::xxhash
     PRIVATE
         aes128
+        libavutil
         mspack
 )
 

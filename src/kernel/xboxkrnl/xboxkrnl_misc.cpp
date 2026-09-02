@@ -64,7 +64,6 @@ REX_EXPORT_STUB(__imp__EmaExecute);
 REX_EXPORT_STUB(__imp__ExRegisterThreadNotification);
 REX_EXPORT_STUB(__imp__ExTerminateTitleProcess);
 REX_EXPORT_STUB(__imp__ExFreeDebugPool);
-REX_EXPORT_STUB(__imp__ExReadModifyWriteXConfigSettingUlong);
 REX_EXPORT_STUB(__imp__ExRegisterXConfigNotification);
 REX_EXPORT_STUB(__imp__ExCancelAlarm);
 REX_EXPORT_STUB(__imp__ExInitializeAlarm);

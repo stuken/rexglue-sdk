@@ -9,6 +9,11 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <span>
+
+#include <rex/filesystem.h>
+#include <rex/filesystem/entry.h>
+#include <rex/filesystem/vfs.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/logging.h>
 #include <rex/hook.h>
@@ -16,9 +21,16 @@
 #include <rex/types.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/user_module.h>
+#include <rex/system/util/string_utils.h>
+#include <rex/system/util/xex2_info.h>
 #include <rex/system/xexception.h>
+#include <rex/system/xio.h>
 #include <rex/system/xthread.h>
 #include <rex/system/xtypes.h>
+
+#ifndef X_STATUS_INVALID_IMAGE_FORMAT
+#define X_STATUS_INVALID_IMAGE_FORMAT ((X_STATUS)0xC000007BL)
+#endif
 
 namespace rex::kernel::xboxkrnl {
 using namespace rex::system;
@@ -148,6 +160,11 @@ u32 XexUnloadImage_entry(mapped_void hmodule) {
   return X_STATUS_SUCCESS;
 }
 
+u32 XexLoadExecutable_entry(mapped_string module_name, u32 module_flags, u32 min_version,
+                            mapped_u32 hmodule_ptr) {
+  return XexLoadImage_entry(module_name, module_flags, min_version, hmodule_ptr);
+}
+
 u32 XexGetProcedureAddress_entry(mapped_void hmodule, u32 ordinal, mapped_u32 out_function_ptr) {
   // May be entry point?
   assert_not_zero(ordinal);
@@ -209,9 +226,60 @@ void ExRegisterTitleTerminateNotification_entry(ppc_ptr_t<X_EX_TITLE_TERMINATE_R
   }
 }
 
-u32 XexLoadImageHeaders_entry(mapped_string path, mapped_void headers) {
-  REXKRNL_DEBUG("XexLoadImageHeaders({}) - stub", path.value());
-  return X_STATUS_NOT_IMPLEMENTED;
+u32 XexLoadImageHeaders_entry(ppc_ptr_t<X_ANSI_STRING> path, ppc_ptr_t<xex2_header> header,
+                              u32 buffer_size) {
+  if (buffer_size < 0x800) {
+    return X_STATUS_BUFFER_TOO_SMALL;
+  }
+
+  auto target_path = util::TranslateAnsiPath(REX_KERNEL_MEMORY(), path);
+
+  rex::filesystem::File* vfs_file = nullptr;
+  rex::filesystem::FileAction file_action;
+  X_STATUS result =
+      REX_KERNEL_FS()->OpenFile(nullptr, target_path, rex::filesystem::FileDisposition::kOpen,
+                               rex::filesystem::FileAccess::kGenericRead, false, true, &vfs_file,
+                               &file_action);
+  if (!vfs_file) {
+    return result;
+  }
+
+  size_t bytes_read = 0;
+  X_STATUS result_status = vfs_file->ReadSync(
+      std::span<uint8_t>(reinterpret_cast<uint8_t*>(header.host_address()), 2048), 0,
+      &bytes_read);
+
+  if (result_status < 0) {
+    vfs_file->Destroy();
+    return result_status;
+  }
+
+  if (header->magic != 'XEX2') {
+    vfs_file->Destroy();
+    return X_STATUS_INVALID_IMAGE_FORMAT;
+  }
+  uint32_t header_size = header->header_size;
+
+  if (header_size < 0x800 || header_size > 0x10000 || (header_size & 0x7FF) != 0) {
+    result_status = X_STATUS_INVALID_IMAGE_FORMAT;
+  } else if (header_size <= buffer_size) {
+    if (header_size <= 0x800) {
+      result_status = X_STATUS_SUCCESS;
+    } else {
+      result_status = vfs_file->ReadSync(
+          std::span<uint8_t>(reinterpret_cast<uint8_t*>(header.host_address()) + 2048,
+                             header_size - 2048),
+          2048, &bytes_read);
+      if (result_status >= X_STATUS_SUCCESS) {
+        result_status = X_STATUS_SUCCESS;
+      }
+    }
+  } else {
+    result_status = X_STATUS_BUFFER_TOO_SMALL;
+  }
+
+  vfs_file->Destroy();
+  return result_status;
 }
 
 }  // namespace rex::kernel::xboxkrnl
@@ -226,8 +294,8 @@ REX_EXPORT(__imp__XexGetProcedureAddress, rex::kernel::xboxkrnl::XexGetProcedure
 REX_EXPORT(__imp__ExRegisterTitleTerminateNotification,
            rex::kernel::xboxkrnl::ExRegisterTitleTerminateNotification_entry)
 REX_EXPORT(__imp__XexLoadImageHeaders, rex::kernel::xboxkrnl::XexLoadImageHeaders_entry)
+REX_EXPORT(__imp__XexLoadExecutable, rex::kernel::xboxkrnl::XexLoadExecutable_entry)
 
-REX_EXPORT_STUB(__imp__XexLoadExecutable);
 REX_EXPORT_STUB(__imp__XexLoadImageFromMemory);
 REX_EXPORT_STUB(__imp__XexPcToFileHeader);
 REX_EXPORT_STUB(__imp__XexRegisterPatchDescriptor);

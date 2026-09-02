@@ -34,11 +34,17 @@ void HalReturnToFirmware_entry(u32 routine) {
   exit(0);
 }
 
+u32 HalGetCurrentAVPack_entry() {
+  // Matches rex::kernel::xam::XGetAVPack_entry's hardcoded value (6, VGA) -- keep these two
+  // in sync rather than introducing an independent setting that could disagree with it.
+  return 6;
+}
+
 }  // namespace rex::kernel::xboxkrnl
 
 REX_EXPORT(__imp__HalReturnToFirmware, rex::kernel::xboxkrnl::HalReturnToFirmware_entry)
+REX_EXPORT(__imp__HalGetCurrentAVPack, rex::kernel::xboxkrnl::HalGetCurrentAVPack_entry)
 
-REX_EXPORT_STUB(__imp__HalGetCurrentAVPack);
 REX_EXPORT_STUB(__imp__HalGpioControl);
 REX_EXPORT_STUB(__imp__HalOpenCloseODDTray);
 REX_EXPORT_STUB(__imp__HalReadWritePCISpace);

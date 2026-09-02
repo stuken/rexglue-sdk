@@ -13,6 +13,7 @@
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
 #include <algorithm>
+#include <cwctype>
 #include <string>
 
 #include <rex/chrono/chrono_steady_cast.h>
@@ -24,6 +25,7 @@
 #include <rex/types.h>
 #include <rex/string.h>
 #include <rex/system/kernel_state.h>
+#include <rex/system/thread_state.h>
 #include <rex/system/user_module.h>
 #include <rex/system/util/string_utils.h>
 #include <rex/system/xevent.h>
@@ -33,6 +35,7 @@
 
 namespace rex::kernel::xboxkrnl {
 using namespace rex::system;
+using rex::runtime::current_ppc_context;
 
 // https://msdn.microsoft.com/en-us/library/ff561778
 u32 RtlCompareMemory_entry(mapped_void source1, mapped_void source2, u32 length) {
@@ -55,21 +58,19 @@ u32 RtlCompareMemory_entry(mapped_void source1, mapped_void source2, u32 length)
 
 // https://msdn.microsoft.com/en-us/library/ff552123
 u32 RtlCompareMemoryUlong_entry(mapped_void source, u32 length, u32 pattern) {
-  // Return 0 if source/length not aligned
-  if (source.guest_address() % 4 || length % 4) {
-    return 0;
-  }
+  // Returns the number of leading bytes that match a repeating 4-byte pattern -- stops at the
+  // first mismatching word, does not scan the whole buffer or count matches anywhere else in it.
+  uint32_t num_compared_bytes = 0;
 
-  uint32_t n = 0;
-  for (uint32_t i = 0; i < (length / 4); i++) {
-    // FIXME: This assumes as_array returns rex::be
-    uint32_t val = source.as_array<uint32_t>()[i];
-    if (val == pattern) {
-      n++;
+  auto words = source.as_array<uint32_t>();
+  for (uint32_t aligned_length = length & 0xFFFFFFFCU; aligned_length;
+       aligned_length -= 4, num_compared_bytes += 4) {
+    if (words[num_compared_bytes / 4] != pattern) {
+      break;
     }
   }
 
-  return n;
+  return num_compared_bytes;
 }
 
 // https://msdn.microsoft.com/en-us/library/ff552263
@@ -102,9 +103,24 @@ u32 RtlLowerChar_entry(u32 in) {
   return c;
 }
 
-u32 RtlCompareString_entry(mapped_string string_1, mapped_string string_2, u32 case_insensitive) {
-  int ret = case_insensitive ? rex::string::compare_case(string_1, string_2)
-                             : std::strcmp(string_1, string_2);
+u32 RtlUpcaseUnicodeChar_entry(u32 source_character) {
+  return static_cast<uint32_t>(std::towupper(static_cast<wint_t>(source_character)));
+}
+
+u32 RtlDowncaseUnicodeChar_entry(u32 source_character) {
+  return static_cast<uint32_t>(std::towlower(static_cast<wint_t>(source_character)));
+}
+
+u32 RtlCompareString_entry(ppc_ptr_t<X_ANSI_STRING> string_1, ppc_ptr_t<X_ANSI_STRING> string_2,
+                           u32 case_insensitive) {
+  // string_1/string_2 point to X_STRING/ANSI_STRING structs (length + guest pointer), not
+  // null-terminated C strings directly -- must resolve length + data before comparing.
+  auto view_1 = util::TranslateAnsiString(REX_KERNEL_MEMORY(), string_1);
+  auto view_2 = util::TranslateAnsiString(REX_KERNEL_MEMORY(), string_2);
+  auto len = std::min(view_1.size(), view_2.size());
+
+  int ret = case_insensitive ? rex::string::compare_case_n(view_1.data(), view_2.data(), len)
+                             : std::strncmp(view_1.data(), view_2.data(), len);
 
   return ret;
 }
@@ -114,13 +130,13 @@ u32 RtlCompareStringN_entry(mapped_string string_1, u32 string_1_len, mapped_str
   uint32_t len1 = string_1_len;
   uint32_t len2 = string_2_len;
 
-  if (string_1_len == 0xFFFF) {
+  if (string_1_len == 0xFFFFFFFF) {
     len1 = uint32_t(std::strlen(string_1));
   }
-  if (string_2_len == 0xFFFF) {
+  if (string_2_len == 0xFFFFFFFF) {
     len2 = uint32_t(std::strlen(string_2));
   }
-  auto len = std::min(string_1_len, string_2_len);
+  auto len = std::min(len1, len2);
 
   int ret = case_insensitive ? rex::string::compare_case_n(string_1, string_2, len)
                              : std::strncmp(string_1, string_2, len);
@@ -278,27 +294,161 @@ u32 RtlUnicodeToMultiByteN_entry(ppc_ptr_t<uint8_t> destination_ptr, u32 destina
   return 0;
 }
 
-// https://undocumented.ntinternals.net/UserMode/Undocumented%20Functions/Executable%20Images/RtlImageNtHeader.html
-u32 RtlImageNtHeader_entry(mapped_void module) {
+// Minimal subset of the standard PE32 header layout needed by RtlImageDirectoryEntryToData.
+// PE headers are little-endian on-disk/in-memory (unlike the rest of guest memory), so these
+// are read directly with no endian swapping -- matches RtlImageNtHeader's parsing below.
+struct XIMAGE_DATA_DIRECTORY {
+  uint32_t VirtualAddress;
+  uint32_t Size;
+};
+
+struct XIMAGE_OPTIONAL_HEADER32 {
+  uint16_t Magic;
+  uint8_t MajorLinkerVersion;
+  uint8_t MinorLinkerVersion;
+  uint32_t SizeOfCode;
+  uint32_t SizeOfInitializedData;
+  uint32_t SizeOfUninitializedData;
+  uint32_t AddressOfEntryPoint;
+  uint32_t BaseOfCode;
+  uint32_t BaseOfData;
+  uint32_t ImageBase;
+  uint32_t SectionAlignment;
+  uint32_t FileAlignment;
+  uint16_t MajorOperatingSystemVersion;
+  uint16_t MinorOperatingSystemVersion;
+  uint16_t MajorImageVersion;
+  uint16_t MinorImageVersion;
+  uint16_t MajorSubsystemVersion;
+  uint16_t MinorSubsystemVersion;
+  uint32_t Reserved1;
+  uint32_t SizeOfImage;
+  uint32_t SizeOfHeaders;
+  uint32_t CheckSum;
+  uint16_t Subsystem;
+  uint16_t DllCharacteristics;
+  uint32_t SizeOfStackReserve;
+  uint32_t SizeOfStackCommit;
+  uint32_t SizeOfHeapReserve;
+  uint32_t SizeOfHeapCommit;
+  uint32_t LoaderFlags;
+  uint32_t NumberOfRvaAndSizes;
+  XIMAGE_DATA_DIRECTORY DataDirectory[16];
+};
+
+struct XIMAGE_FILE_HEADER {
+  uint16_t Machine;
+  uint16_t NumberOfSections;
+  uint32_t TimeDateStamp;
+  uint32_t PointerToSymbolTable;
+  uint32_t NumberOfSymbols;
+  uint16_t SizeOfOptionalHeader;
+  uint16_t Characteristics;
+};
+
+struct XIMAGE_NT_HEADERS32 {
+  uint32_t Signature;
+  XIMAGE_FILE_HEADER FileHeader;
+  XIMAGE_OPTIONAL_HEADER32 OptionalHeader;
+};
+
+struct XIMAGE_SECTION_HEADER {
+  uint8_t Name[8];
+  union {
+    uint32_t PhysicalAddress;
+    uint32_t VirtualSize;
+  } Misc;
+  uint32_t VirtualAddress;
+  uint32_t SizeOfRawData;
+  uint32_t PointerToRawData;
+  uint32_t PointerToRelocations;
+  uint32_t PointerToLinenumbers;
+  uint16_t NumberOfRelocations;
+  uint16_t NumberOfLinenumbers;
+  uint32_t Characteristics;
+};
+
+constexpr uint16_t kImageNtOptionalHdr32Magic = 0x10b;
+
+static XIMAGE_NT_HEADERS32* ImageNtHeader(const uint8_t* module) {
   if (!module) {
-    return 0;
+    return nullptr;
   }
 
   // Little-endian! no swapping!
-
-  auto dos_header = module.as<const uint8_t*>();
-  auto dos_magic = *reinterpret_cast<const uint16_t*>(&dos_header[0x00]);
+  auto dos_magic = *reinterpret_cast<const uint16_t*>(&module[0x00]);
   if (dos_magic != 0x5A4D) {  // 'MZ'
-    return 0;
+    return nullptr;
   }
-  auto dos_lfanew = *reinterpret_cast<const int32_t*>(&dos_header[0x3C]);
+  auto dos_lfanew = *reinterpret_cast<const int32_t*>(&module[0x3C]);
 
-  auto nt_header = &dos_header[dos_lfanew];
+  auto nt_header = &module[dos_lfanew];
   auto nt_magic = *reinterpret_cast<const uint32_t*>(&nt_header[0x00]);
   if (nt_magic != 0x4550) {  // 'PE'
+    return nullptr;
+  }
+  return reinterpret_cast<XIMAGE_NT_HEADERS32*>(const_cast<uint8_t*>(nt_header));
+}
+
+// https://undocumented.ntinternals.net/UserMode/Undocumented%20Functions/Executable%20Images/RtlImageNtHeader.html
+u32 RtlImageNtHeader_entry(mapped_void module) {
+  auto nt_header = ImageNtHeader(module.as<const uint8_t*>());
+  if (!nt_header) {
     return 0;
   }
   return REX_KERNEL_MEMORY()->HostToGuestVirtual(nt_header);
+}
+
+// https://learn.microsoft.com/en-us/windows/win32/api/dbghelp/nf-dbghelp-imagedirectoryentrytodata
+u32 RtlImageDirectoryEntryToData_entry(u32 base, u32 mapped_as_image_in, u16 directory_entry,
+                                       mapped_u32 size_ptr) {
+  bool mapped_as_image = static_cast<unsigned char>(mapped_as_image_in) != 0;
+  uint32_t aligned_base = base;
+  if (base & 1) {
+    aligned_base = base & 0xFFFFFFFE;
+    mapped_as_image = false;
+  }
+
+  auto nt_header =
+      ImageNtHeader(REX_KERNEL_MEMORY()->TranslateVirtual<const uint8_t*>(aligned_base));
+  if (!nt_header) {
+    return 0;
+  }
+  if (nt_header->OptionalHeader.Magic != kImageNtOptionalHdr32Magic) {
+    return 0;
+  }
+  if (directory_entry >= nt_header->OptionalHeader.NumberOfRvaAndSizes) {
+    return 0;
+  }
+
+  uint32_t address = nt_header->OptionalHeader.DataDirectory[directory_entry].VirtualAddress;
+  if (!address) {
+    return 0;
+  }
+
+  if (size_ptr) {
+    *size_ptr = nt_header->OptionalHeader.DataDirectory[directory_entry].Size;
+  }
+
+  if (mapped_as_image || address < nt_header->OptionalHeader.SizeOfHeaders) {
+    return aligned_base + address;
+  }
+
+  uint32_t section_count = nt_header->FileHeader.NumberOfSections;
+  if (!section_count) {
+    return 0;
+  }
+  auto* section = reinterpret_cast<XIMAGE_SECTION_HEADER*>(
+      reinterpret_cast<uint8_t*>(&nt_header->OptionalHeader) +
+      nt_header->FileHeader.SizeOfOptionalHeader);
+
+  for (uint32_t i = 0; i < section_count; ++i, ++section) {
+    if (address >= section->VirtualAddress &&
+        address < section->VirtualAddress + section->SizeOfRawData) {
+      return aligned_base + address - section->VirtualAddress;
+    }
+  }
+  return 0;
 }
 
 u32 RtlImageXexHeaderField_entry(ppc_ptr_t<xex2_header> xex_header, u32 field_dword) {
@@ -569,6 +719,24 @@ void __C_specific_handler_entry() {
   REXKRNL_WARN("[STUB] __C_specific_handler called - not implemented");
 }
 
+void RtlGetStackLimits_entry(mapped_u32 out_end, mapped_u32 out_base) {
+  auto* ctx = current_ppc_context();
+  auto* kpcr = REX_KERNEL_MEMORY()->TranslateVirtual<X_KPCR*>(static_cast<uint32_t>(ctx->r13.u64));
+
+  uint32_t stack_base;
+  uint32_t stack_end;
+  if (kpcr->use_alternative_stack) {
+    stack_base = kpcr->alt_stack_base_ptr;
+    stack_end = kpcr->alt_stack_end_ptr;
+  } else {
+    stack_base = kpcr->stack_base_ptr;
+    stack_end = kpcr->stack_end_ptr;
+  }
+
+  *out_base = stack_base;
+  *out_end = stack_end;
+}
+
 REX_EXPORT_STUB(__imp__RtlAnsiStringToUnicodeString);
 REX_EXPORT_STUB(__imp__RtlAppendStringToString);
 REX_EXPORT_STUB(__imp__RtlAppendUnicodeStringToString);
@@ -577,18 +745,14 @@ REX_EXPORT_STUB(__imp__RtlCompareUnicodeString);
 REX_EXPORT_STUB(__imp__RtlCompareUnicodeStringN);
 REX_EXPORT_STUB(__imp__RtlCompareUtf8ToUnicode);
 REX_EXPORT_STUB(__imp__RtlCreateUnicodeString);
-REX_EXPORT_STUB(__imp__RtlDowncaseUnicodeChar);
 REX_EXPORT_STUB(__imp__RtlGetCallersAddress);
-REX_EXPORT_STUB(__imp__RtlGetStackLimits);
 REX_EXPORT_STUB(__imp__RtlLookupFunctionEntry);
 REX_EXPORT_STUB(__imp__RtlMultiByteToUnicodeSize);
 REX_EXPORT_STUB(__imp__RtlUnicodeToMultiByteSize);
 REX_EXPORT_STUB(__imp__RtlUnicodeToUtf8);
 REX_EXPORT_STUB(__imp__RtlUnicodeToUtf8Size);
 REX_EXPORT_STUB(__imp__RtlUnwind2);
-REX_EXPORT_STUB(__imp__RtlUpcaseUnicodeChar);
 REX_EXPORT_STUB(__imp__RtlVirtualUnwind);
-REX_EXPORT_STUB(__imp__RtlImageDirectoryEntryToData);
 REX_EXPORT_STUB(__imp__RtlCaptureStackBackTrace);
 REX_EXPORT_STUB(__imp__RtlSetVectoredExceptionHandler);
 REX_EXPORT_STUB(__imp__RtlClearVectoredExceptionHandler);
@@ -600,6 +764,8 @@ REX_EXPORT(__imp__RtlCompareMemoryUlong, rex::kernel::xboxkrnl::RtlCompareMemory
 REX_EXPORT(__imp__RtlFillMemoryUlong, rex::kernel::xboxkrnl::RtlFillMemoryUlong_entry)
 REX_EXPORT(__imp__RtlUpperChar, rex::kernel::xboxkrnl::RtlUpperChar_entry)
 REX_EXPORT(__imp__RtlLowerChar, rex::kernel::xboxkrnl::RtlLowerChar_entry)
+REX_EXPORT(__imp__RtlUpcaseUnicodeChar, rex::kernel::xboxkrnl::RtlUpcaseUnicodeChar_entry)
+REX_EXPORT(__imp__RtlDowncaseUnicodeChar, rex::kernel::xboxkrnl::RtlDowncaseUnicodeChar_entry)
 REX_EXPORT(__imp__RtlCompareString, rex::kernel::xboxkrnl::RtlCompareString_entry)
 REX_EXPORT(__imp__RtlCompareStringN, rex::kernel::xboxkrnl::RtlCompareStringN_entry)
 REX_EXPORT(__imp__RtlInitAnsiString, rex::kernel::xboxkrnl::RtlInitAnsiString_entry)
@@ -628,3 +794,6 @@ REX_EXPORT(__imp__RtlComputeCrc32, rex::kernel::xboxkrnl::RtlComputeCrc32_entry)
 REX_EXPORT(__imp__RtlCaptureContext, rex::kernel::xboxkrnl::RtlCaptureContext_entry)
 REX_EXPORT(__imp__RtlUnwind, rex::kernel::xboxkrnl::RtlUnwind_entry)
 REX_EXPORT(__imp____C_specific_handler, rex::kernel::xboxkrnl::__C_specific_handler_entry)
+REX_EXPORT(__imp__RtlGetStackLimits, rex::kernel::xboxkrnl::RtlGetStackLimits_entry)
+REX_EXPORT(__imp__RtlImageDirectoryEntryToData,
+           rex::kernel::xboxkrnl::RtlImageDirectoryEntryToData_entry)

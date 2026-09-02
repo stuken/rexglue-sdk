@@ -25,7 +25,10 @@ namespace rex::kernel::xboxkrnl {
 using namespace rex::system;
 
 u32 XAudioGetSpeakerConfig_entry(mapped_u32 config_ptr) {
-  *config_ptr = 0x00010001;
+  // Routed through the XConfig USER_AUDIO_FLAGS setting instead of a local hardcoded value, so
+  // this stays correct once ExSetXConfigSetting gains real persistence.
+  xeExGetXConfigSetting(/*XCONFIG_USER_CATEGORY=*/0x0003, /*XCONFIG_USER_AUDIO_FLAGS=*/0x000B,
+                       config_ptr, sizeof(uint32_t), nullptr);
   return X_ERROR_SUCCESS;
 }
 

@@ -12,6 +12,11 @@
 // Disable warnings about unused parameters for kernel functions
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
+#include <cstring>
+#include <map>
+#include <mutex>
+#include <vector>
+
 #include <rex/cvar.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/logging.h>
@@ -23,6 +28,20 @@
 #include <rex/system/xtypes.h>
 
 namespace rex::kernel::xboxkrnl {
+
+namespace {
+// Session-local (not persisted to disk) overrides for settings written via
+// ExSetXConfigSetting/ExReadModifyWriteXConfigSettingUlong. Values are stored as the raw
+// guest-endian bytes the guest itself wrote, matching xeExGetXConfigSetting's own output
+// convention -- no separate persistence/UI backing store exists here (see docs audit item on
+// the full XConfig system).
+std::mutex g_xconfig_override_mutex;
+std::map<uint32_t, std::vector<uint8_t>> g_xconfig_overrides;
+
+uint32_t XConfigKey(uint16_t category, uint16_t setting) {
+  return (uint32_t(category) << 16) | setting;
+}
+}  // namespace
 
 X_STATUS xeExGetXConfigSetting(uint16_t category, uint16_t setting, void* buffer,
                                uint16_t buffer_size, uint16_t* required_size) {
@@ -94,6 +113,16 @@ X_STATUS xeExGetXConfigSetting(uint16_t category, uint16_t setting, void* buffer
       return X_STATUS_INVALID_PARAMETER_1;
   }
 
+  // A prior ExSetXConfigSetting/ExReadModifyWriteXConfigSettingUlong call overrides the
+  // hardcoded default above, so a title reading back a setting it just wrote sees its own value.
+  {
+    std::lock_guard<std::mutex> lock(g_xconfig_override_mutex);
+    auto it = g_xconfig_overrides.find(XConfigKey(category, setting));
+    if (it != g_xconfig_overrides.end() && it->second.size() >= setting_size) {
+      std::memcpy(value, it->second.data(), setting_size);
+    }
+  }
+
   if (buffer) {
     if (buffer_size < setting_size) {
       return X_STATUS_BUFFER_TOO_SMALL;
@@ -125,7 +154,49 @@ u32 ExGetXConfigSetting_entry(u16 category, u16 setting, mapped_void buffer_ptr,
   return result;
 }
 
+u32 ExSetXConfigSetting_entry(u16 category, u16 setting, mapped_void buffer_ptr, u16 buffer_size) {
+  if (!buffer_ptr) {
+    return buffer_size ? X_STATUS_INVALID_PARAMETER_3 : X_STATUS_SUCCESS;
+  }
+
+  std::vector<uint8_t> bytes(buffer_size);
+  uint8_t* src = buffer_ptr;
+  std::memcpy(bytes.data(), src, buffer_size);
+
+  {
+    std::lock_guard<std::mutex> lock(g_xconfig_override_mutex);
+    g_xconfig_overrides[XConfigKey(category, setting)] = std::move(bytes);
+  }
+
+  REXKRNL_DEBUG("ExSetXConfigSetting: category=0x{:04X} setting=0x{:04X}", category, setting);
+  return X_STATUS_SUCCESS;
+}
+
+u32 ExReadModifyWriteXConfigSettingUlong_entry(u16 category, u16 setting, u32 bit_affected,
+                                               u32 flag) {
+  alignas(uint32_t) uint8_t current[4] = {};
+  uint16_t required_size = 0;
+  xeExGetXConfigSetting(category, setting, current, sizeof(current), &required_size);
+
+  uint32_t value = memory::load_and_swap<uint32_t>(current);
+  value = (value & bit_affected) | flag;
+
+  std::vector<uint8_t> bytes(4);
+  memory::store_and_swap<uint32_t>(bytes.data(), value);
+
+  {
+    std::lock_guard<std::mutex> lock(g_xconfig_override_mutex);
+    g_xconfig_overrides[XConfigKey(category, setting)] = std::move(bytes);
+  }
+
+  REXKRNL_DEBUG("ExReadModifyWriteXConfigSettingUlong: category=0x{:04X} setting=0x{:04X}", category,
+               setting);
+  return X_STATUS_SUCCESS;
+}
+
 }  // namespace rex::kernel::xboxkrnl
 
 REX_EXPORT(__imp__ExGetXConfigSetting, rex::kernel::xboxkrnl::ExGetXConfigSetting_entry)
-REX_EXPORT_STUB(__imp__ExSetXConfigSetting);
+REX_EXPORT(__imp__ExSetXConfigSetting, rex::kernel::xboxkrnl::ExSetXConfigSetting_entry)
+REX_EXPORT(__imp__ExReadModifyWriteXConfigSettingUlong,
+           rex::kernel::xboxkrnl::ExReadModifyWriteXConfigSettingUlong_entry)

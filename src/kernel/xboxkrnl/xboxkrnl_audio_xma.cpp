@@ -191,7 +191,7 @@ u32 XMAInitializeContext_entry(mapped_void context_ptr, ppc_ptr_t<XMA_CONTEXT_IN
   return 0;
 }
 
-u32 XMASetLoopData_entry(mapped_void context_ptr, ppc_ptr_t<XMA_CONTEXT_DATA> loop_data) {
+u32 XMASetLoopData_entry(mapped_void context_ptr, ppc_ptr_t<XMA_LOOP_DATA> loop_data) {
   XMA_CONTEXT_DATA context(context_ptr);
 
   context.loop_start = loop_data->loop_start;
