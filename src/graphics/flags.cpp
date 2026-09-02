@@ -20,14 +20,16 @@ REXCVAR_DEFINE_BOOL(
     "Use 4x MSAA with 2 samples instead of native 2x MSAA when available. For "
     "scalability testing on host GPU APIs where 2x is not mandatory. MSAA will "
     "be of a similar or worse quality and use more memory.");
-REXCVAR_DEFINE_BOOL(depth_float24_round, false, "GPU", "Round float24 depth values");
+REXCVAR_DEFINE_BOOL(depth_float24_round, false, "GPU", "Round float24 depth values")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(depth_float24_convert_in_pixel_shader, false, "GPU",
-                    "Convert float24 depth in pixel shader");
+                    "Convert float24 depth in pixel shader")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(depth_transfer_not_equal_test, true, "GPU",
                     "Use not-equal test for depth transfer");
 REXCVAR_DEFINE_BOOL(gamma_render_target_as_unorm16, true, "GPU",
                     "Use R16G16B16A16_UNORM for gamma render targets (more accurate than sRGB)")
-    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(
     ac6_ground_fix, false, "HACKS",
     "This fixes(hide) issues with black ground in AC6. Use only in AC6. "
