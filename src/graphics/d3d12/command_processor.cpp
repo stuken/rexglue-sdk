@@ -3970,6 +3970,12 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
     dirty |= system_constants_.zpd_rov_counter_index != zpd_rov_counter_index;
     system_constants_.zpd_rov_counter_index = zpd_rov_counter_index;
 
+    // This recomputes edram_poly_offset_* from PA_SU_POLY_OFFSET registers,
+    // unconditionally overwriting whatever the host_depth_polygon_offset block
+    // above wrote - but that's fine, since it's never non-null here:
+    // apply_host_depth_polygon_offset requires GetPath() ==
+    // kHostRenderTargets, while edram_rov_used requires GetPath() ==
+    // kPixelShaderInterlock, so the two blocks never both run for one draw.
     // For non-polygons, front polygon offset is used, and it's enabled if
     // POLY_OFFSET_PARA_ENABLED is set, for polygons, separate front and back
     // are used.
