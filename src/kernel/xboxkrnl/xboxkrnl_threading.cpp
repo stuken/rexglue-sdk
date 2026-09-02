@@ -924,15 +924,15 @@ u32 NtWaitForMultipleObjectsEx_entry(u32 count, mapped_u32 handles, u32 wait_typ
                                       timeout_ptr ? &timeout : nullptr);
 }
 
-u32 NtSignalAndWaitForSingleObjectEx_entry(u32 signal_handle, u32 wait_handle, u32 alertable,
-                                           u32 r6, mapped_u64 timeout_ptr) {
+u32 NtSignalAndWaitForSingleObjectEx_entry(u32 signal_handle, u32 wait_handle, u32 wait_mode,
+                                           u32 alertable, mapped_u64 timeout_ptr) {
   X_STATUS result = X_STATUS_SUCCESS;
 
   auto signal_object = REX_KERNEL_OBJECTS()->LookupObject<XObject>(signal_handle);
   auto wait_object = REX_KERNEL_OBJECTS()->LookupObject<XObject>(wait_handle);
   if (signal_object && wait_object) {
     uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
-    result = XObject::SignalAndWait(signal_object.get(), wait_object.get(), 3, 1, alertable,
+    result = XObject::SignalAndWait(signal_object.get(), wait_object.get(), 3, wait_mode, alertable,
                                     timeout_ptr ? &timeout : nullptr);
   } else {
     result = X_STATUS_INVALID_HANDLE;
@@ -1183,11 +1183,6 @@ u32 KeInsertQueueDpc_entry(ppc_ptr_t<XDPC> dpc, u32 arg1, u32 arg2) {
   // Lock dispatcher.
   auto global_lock = rex::thread::global_critical_region::AcquireDirect();
   auto dpc_list = REX_KERNEL_STATE()->dpc_list();
-
-  // If already in a queue, abort.
-  if (dpc_list->IsQueued(list_entry_ptr)) {
-    return 0;
-  }
 
   // Prep DPC.
   dpc->arg1 = (uint32_t)arg1;

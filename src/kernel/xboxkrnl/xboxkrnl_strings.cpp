@@ -261,7 +261,9 @@ REX_HOOK_RAW(__imp___vsnprintf) {
       buffer[count] = '\0';
     }
   } else {
+    // Overflowed buffer.
     std::memcpy(buffer, data.str().c_str(), buffer_count);
+    count = -1;
   }
   ctx.r3.u64 = count;
 }

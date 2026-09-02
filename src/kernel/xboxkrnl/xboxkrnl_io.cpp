@@ -15,6 +15,7 @@
 #include <rex/filesystem/device.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/logging.h>
+#include <rex/math.h>
 #include <rex/memory.h>
 #include <rex/hook.h>
 #include <rex/types.h>
@@ -722,24 +723,106 @@ u32 NtDeviceIoControlFile_entry(u32 handle, u32 event_handle, u32 apc_routine, u
   return X_STATUS_SUCCESS;
 }
 
-u32 IoCreateDevice_entry(u32 device_struct, u32 r4, u32 r5, u32 r6, u32 r7, mapped_u32 out_struct) {
-  // Called from XMountUtilityDrive XAM-task code
-  // That code tries writing things to a pointer at out_struct+0x18
-  // We'll alloc some scratch space for it so it doesn't cause any exceptions
+// https://processhacker.sourceforge.io/doc/ntddk_8h.html (DRIVER_OBJECT)
+struct X_DRIVER_OBJECT {
+  be<uint32_t> driver_start_io_ptr;
+  be<uint32_t> driver_delete_device_ptr;
+  be<uint32_t> driver_dismount_volume_ptr;
+  be<uint32_t> major_function_ptr[11];
+};
+static_assert_size(X_DRIVER_OBJECT, 0x38);
 
-  // 0x24 is guessed size from accesses to out_struct - likely incorrect
-  auto out_guest = REX_KERNEL_MEMORY()->SystemHeapAlloc(0x24);
+struct X_KDEVICE_QUEUE {
+  be<uint16_t> type;
+  uint8_t padding;
+  uint8_t busy;
+  be<uint32_t> lock;
+  X_LIST_ENTRY device_list_head;
+};
+static_assert_size(X_KDEVICE_QUEUE, 0x10);
 
-  auto out = REX_KERNEL_MEMORY()->TranslateVirtual<uint8_t*>(out_guest);
-  memset(out, 0, 0x24);
+// device_extension_size worth of data (rounded up to 8-byte granularity) is
+// allocated at the tail of this struct, accessed via device_extension_ptr.
+struct X_DEVICE_OBJECT {
+  be<uint16_t> type;                                           // 0x0
+  be<uint16_t> device_extension_size;                          // 0x2
+  be<uint32_t> reference_count;                                // 0x4
+  TypedGuestPointer<X_DRIVER_OBJECT> driver_object_ptr;        // 0x8
+  TypedGuestPointer<X_DEVICE_OBJECT> mounted_or_self_device;   // 0xC
+  be<uint32_t> current_irp_ptr;                                // 0x10
+  be<uint32_t> flags;                                          // 0x14
+  be<uint32_t> device_extension_ptr;                           // 0x18
+  uint8_t device_type;                                         // 0x1C
+  uint8_t start_io_flags;                                      // 0x1D
+  uint8_t stack_size;                                          // 0x1E
+  uint8_t delete_pending;                                      // 0x1F
+  be<uint32_t> sector_size;                                    // 0x20, set by XamRamDriveCreate
+  be<uint32_t> alignment;                                      // 0x24
+  X_KDEVICE_QUEUE device_queue;                                // 0x28
+  X_KEVENT device_lock;                                        // 0x38
+  be<uint32_t> start_io_count;                                 // 0x48
+  be<uint32_t> start_io_key;                                   // 0x4C
+};
+static_assert_size(X_DEVICE_OBJECT, 0x50);
 
-  // XMountUtilityDrive writes some kind of header here
-  // 0x1000 bytes should be enough to store it
-  auto out_guest2 = REX_KERNEL_MEMORY()->SystemHeapAlloc(0x1000);
-  memory::store_and_swap(out + 0x18, out_guest2);
+// Called from XMountUtilityDrive XAM-task code; device_name is optional,
+// extra_device_object_attributes gets assigned to the attributes field of
+// the OBJECT_ATTRIBUTES used for ObCreateObject (untracked here).
+u32 IoCreateDevice_entry(ppc_ptr_t<X_DRIVER_OBJECT> driver_object, u32 device_extension_size,
+                         ppc_ptr_t<X_ANSI_STRING> device_name, u32 device_type,
+                         u32 extra_device_object_attributes, mapped_u32 device_object) {
+  uint32_t required_size =
+      sizeof(X_DEVICE_OBJECT) +
+      rex::align<uint32_t>(static_cast<uint32_t>(device_extension_size), 8);
 
-  *out_struct = out_guest;
+  auto out_guest = REX_KERNEL_MEMORY()->SystemHeapAlloc(required_size);
+  auto out = REX_KERNEL_MEMORY()->TranslateVirtual<X_DEVICE_OBJECT*>(out_guest);
+  memset(out, 0, required_size);
+
+  out->type = 3;  // maybe device object's Ob type?
+
+  // this stores the total object size, without alignment!
+  out->device_extension_size =
+      static_cast<uint16_t>(static_cast<uint32_t>(device_extension_size) + sizeof(X_DEVICE_OBJECT));
+
+  // from 17559
+  uint32_t device_type_value = static_cast<uint32_t>(device_type);
+  if (device_type_value == 7 || device_type_value == 58 || device_type_value == 62 ||
+      device_type_value == 45 || device_type_value == 2 || device_type_value == 60 ||
+      device_type_value == 61 || device_type_value == 36 || device_type_value == 64 ||
+      device_type_value == 65 || device_type_value == 66 || device_type_value == 67 ||
+      device_type_value == 68 || device_type_value == 69 || device_type_value == 70 ||
+      device_type_value == 72 || device_type_value == 73) {
+    out->mounted_or_self_device = 0;
+  } else {
+    out->mounted_or_self_device = static_cast<uint32_t>(out_guest);
+  }
+  out->device_type = static_cast<uint8_t>(device_type_value);
+
+  uint32_t flags_field_value = 16;
+  if (device_name) {
+    flags_field_value |= 8;
+  }
+  out->stack_size = 1;
+  out->flags = flags_field_value;
+  if (static_cast<uint32_t>(device_extension_size) != 0) {
+    // pointer to device specific data; XMountUtilityDrive writes some kind
+    // of header here
+    out->device_extension_ptr = out_guest + sizeof(X_DEVICE_OBJECT);
+  }
+
+  out->driver_object_ptr = static_cast<uint32_t>(driver_object);
+
+  *device_object = out_guest;
   return X_STATUS_SUCCESS;
+}
+
+// Supposed to invoke a callback on the driver object - some sort of
+// destructor intended to be called for all devices created from the driver.
+void IoDeleteDevice_entry(ppc_ptr_t<X_DEVICE_OBJECT> device_ptr) {
+  if (device_ptr) {
+    REX_KERNEL_MEMORY()->SystemHeapFree(static_cast<uint32_t>(device_ptr));
+  }
 }
 
 u32 IoDismountVolumeByFileHandle_entry(u32 handle) {
@@ -791,6 +874,7 @@ REX_EXPORT(__imp__FscGetCacheElementCount, rex::kernel::xboxkrnl::FscGetCacheEle
 REX_EXPORT(__imp__FscSetCacheElementCount, rex::kernel::xboxkrnl::FscSetCacheElementCount_entry)
 REX_EXPORT(__imp__NtDeviceIoControlFile, rex::kernel::xboxkrnl::NtDeviceIoControlFile_entry)
 REX_EXPORT(__imp__IoCreateDevice, rex::kernel::xboxkrnl::IoCreateDevice_entry)
+REX_EXPORT(__imp__IoDeleteDevice, rex::kernel::xboxkrnl::IoDeleteDevice_entry)
 REX_EXPORT(__imp__IoDismountVolumeByFileHandle,
            rex::kernel::xboxkrnl::IoDismountVolumeByFileHandle_entry)
 REX_EXPORT(__imp__IoDismountVolumeByName, rex::kernel::xboxkrnl::IoDismountVolumeByName_entry)
@@ -808,7 +892,6 @@ REX_EXPORT_STUB(__imp__IoCallDriver);
 REX_EXPORT_STUB(__imp__IoCheckShareAccess);
 REX_EXPORT_STUB(__imp__IoCompleteRequest);
 REX_EXPORT_STUB(__imp__IoCreateFile);
-REX_EXPORT_STUB(__imp__IoDeleteDevice);
 REX_EXPORT_STUB(__imp__IoDismountVolume);
 REX_EXPORT_STUB(__imp__IoFreeIrp);
 REX_EXPORT_STUB(__imp__IoInitializeIrp);

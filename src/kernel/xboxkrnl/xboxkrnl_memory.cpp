@@ -629,6 +629,11 @@ u32 KeGetImagePageTableEntry_entry(mapped_void address) {
   result /= heap->page_size();
   if (heap->page_size() < 65536) {
     result |= 0x40000000;
+
+    // TODO: Verify if 1 is set when page is marked as read-only. For now
+    // there is not enough data, but dashboard 14xxx and above requires that
+    // the return from this call have bit 0 set.
+    result |= 1;
   }
   return result & 0x400FFFFF;
 }
