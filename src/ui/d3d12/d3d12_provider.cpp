@@ -54,6 +54,14 @@ bool D3D12Provider::IsD3D12APIAvailable() {
   return true;
 }
 
+bool D3D12Provider::IsIntelArcGpu() const {
+  if (adapter_vendor_id_ != GpuVendorID::kIntel) {
+    return false;
+  }
+  return adapter_description_.starts_with("Intel(R) Arc(TM)") ||
+         adapter_description_.starts_with("Intel(R) Graphics");
+}
+
 std::unique_ptr<D3D12Provider> D3D12Provider::Create() {
   std::unique_ptr<D3D12Provider> provider(new D3D12Provider);
   if (!provider->Initialize()) {
@@ -313,6 +321,7 @@ bool D3D12Provider::Initialize() {
     char* adapter_name_mb = reinterpret_cast<char*>(alloca(adapter_name_mb_size));
     if (WideCharToMultiByte(CP_UTF8, 0, adapter_desc.Description, -1, adapter_name_mb,
                             adapter_name_mb_size, nullptr, nullptr) != 0) {
+      adapter_description_ = adapter_name_mb;
       REXGPU_INFO("DXGI adapter: {} (vendor 0x{:04X}, device 0x{:04X})", adapter_name_mb,
                   adapter_desc.VendorId, adapter_desc.DeviceId);
     }

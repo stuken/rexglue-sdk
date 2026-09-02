@@ -12,6 +12,7 @@
 #pragma once
 
 #include <memory>
+#include <string>
 
 #include <rex/ui/d3d12/d3d12_api.h>
 #include <rex/ui/graphics_provider.h>
@@ -80,6 +81,10 @@ class D3D12Provider : public GraphicsProvider {
 
   // Adapter info.
   GpuVendorID GetAdapterVendorID() const { return adapter_vendor_id_; }
+  const std::string& GetAdapterDescription() const { return adapter_description_; }
+  // Check for Intel Arc cards and Intel Graphics iGPUs which use the same
+  // architecture.
+  bool IsIntelArcGpu() const;
 
   // Device features.
   D3D12_HEAP_FLAGS GetHeapFlagCreateNotZeroed() const { return heap_flag_create_not_zeroed_; }
@@ -159,6 +164,7 @@ class D3D12Provider : public GraphicsProvider {
   uint32_t descriptor_sizes_[D3D12_DESCRIPTOR_HEAP_TYPE_NUM_TYPES];
 
   GpuVendorID adapter_vendor_id_;
+  std::string adapter_description_;
 
   D3D12_HEAP_FLAGS heap_flag_create_not_zeroed_;
   D3D12_PROGRAMMABLE_SAMPLE_POSITIONS_TIER programmable_sample_positions_tier_;

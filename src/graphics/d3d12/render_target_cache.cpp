@@ -181,15 +181,18 @@ bool D3D12RenderTargetCache::Initialize() {
     // As of April 2021 (driver version 27.20.0100.9316), on Intel (tested on
     // UHD Graphics 630), the "always" stencil comparison function isn't working
     // properly, so clears in the Xbox 360's Direct3D 9 don't work. Forcing ROV
-    // there.
+    // there. Intel Arc (Alchemist and newer) does not have this issue, so an
+    // exception is made so they default to RTV.
 #if 1
     // The ROV path is currently much slower generally.
     // TODO(Triang3l): Make ROV the default when it's optimized better (for
     // instance, using static shader modifications to pass render target
     // parameters).
-    path_ = provider.GetAdapterVendorID() == ui::GraphicsProvider::GpuVendorID::kIntel
-                ? Path::kPixelShaderInterlock
-                : Path::kHostRenderTargets;
+    path_ = Path::kHostRenderTargets;
+    if (provider.GetAdapterVendorID() == ui::GraphicsProvider::GpuVendorID::kIntel &&
+        !provider.IsIntelArcGpu()) {
+      path_ = Path::kPixelShaderInterlock;
+    }
 #else
     // The AMD shader compiler crashes very often with Xenia's custom
     // output-merger code as of March 2021.
