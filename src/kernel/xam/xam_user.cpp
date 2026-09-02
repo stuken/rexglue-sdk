@@ -872,6 +872,49 @@ u32 XamUserCreateTitlesPlayedEnumerator_entry(u32 title_id, u32 user_index, u64 
   return X_ERROR_SUCCESS;
 }
 
+constexpr uint8_t kStatsMaxAmount = 64;
+
+struct X_STATS_DETAILS {
+  rex::be<uint32_t> id;
+  rex::be<uint32_t> stats_amount;
+  rex::be<uint16_t> stats[kStatsMaxAmount];
+};
+static_assert_size(X_STATS_DETAILS, 8 + kStatsMaxAmount * 2);
+
+u32 XamUserCreateStatsEnumerator_entry(u32 title_id, u32 user_index, u32 count, u32 flags,
+                                       u32 size, ppc_ptr_t<X_STATS_DETAILS> stats_ptr,
+                                       mapped_u32 buffer_size_ptr, mapped_u32 handle_ptr) {
+  if (!count || !buffer_size_ptr || !handle_ptr || !stats_ptr) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+  if (user_index >= 4) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+  if (!flags || flags > 0x64) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+  if (!size) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+
+  *buffer_size_ptr = 0;
+
+  // Matches xenia's own behavior: the enumerator is created successfully but never populated --
+  // there's no real Xbox Live stats backend here (or in xenia itself), so enumeration
+  // immediately reports "no more files" rather than returning any actual stat values. Still a
+  // real fix over the previous stub, which left *handle_ptr/*buffer_size_ptr untouched and
+  // returned an undefined status.
+  auto e = object_ref<XStaticEnumerator<X_STATS_DETAILS>>(
+      new XStaticEnumerator<X_STATS_DETAILS>(REX_KERNEL_STATE(), count));
+  auto result = e->Initialize(user_index, 0xFB, 0xB0023, 0xB0024, 0);
+  if (XFAILED(result)) {
+    return result;
+  }
+
+  *handle_ptr = e->handle();
+  return X_ERROR_SUCCESS;
+}
+
 u32 XamParseGamerTileKey_entry(mapped_u32 key_ptr, mapped_u32 out1_ptr, mapped_u32 out2_ptr,
                                mapped_u32 out3_ptr) {
   *out1_ptr = 0xC0DE0001;
@@ -954,7 +997,7 @@ REX_EXPORT_STUB(__imp__XamUserAddRecentPlayer);
 REX_EXPORT_STUB(__imp__XamUserAllowedToPostToSocialNetwork);
 REX_EXPORT_STUB(__imp__XamUserCreateAvatarAssetEnumerator);
 REX_EXPORT_STUB(__imp__XamUserCreatePlayerEnumerator);
-REX_EXPORT_STUB(__imp__XamUserCreateStatsEnumerator);
+REX_EXPORT(__imp__XamUserCreateStatsEnumerator, rex::kernel::xam::XamUserCreateStatsEnumerator_entry)
 REX_EXPORT(__imp__XamUserCreateTitlesPlayedEnumerator,
            rex::kernel::xam::XamUserCreateTitlesPlayedEnumerator_entry)
 REX_EXPORT_STUB(__imp__XamUserFlushLogonQueue);
