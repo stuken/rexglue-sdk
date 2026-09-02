@@ -46,7 +46,8 @@ REXCVAR_DEFINE_BOOL(
 REXCVAR_DEFINE_STRING(dump_shaders, "", "GPU.Debug", "Path to dump shaders to");
 REXCVAR_DEFINE_BOOL(use_fuzzy_alpha_epsilon, false, "GPU",
                     "Use approximate compare for alpha test values to prevent "
-                    "flickering on NVIDIA graphics cards");
+                    "flickering on NVIDIA graphics cards")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(gpu_debug_markers, false, "GPU",
                     "Insert debug markers into GPU command streams for tools "
                     "like PIX and RenderDoc. Automatically enabled when "
