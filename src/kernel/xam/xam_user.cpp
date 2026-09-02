@@ -183,15 +183,9 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
   uint32_t needed_data_size = 0;
   for (uint32_t i = 0; i < setting_count; ++i) {
     needed_header_size += sizeof(X_USER_PROFILE_SETTING);
-    UserProfile::Setting::Key setting_key;
-    setting_key.value = static_cast<uint32_t>(setting_ids[i]);
-    switch (static_cast<UserProfile::Setting::Type>(setting_key.type)) {
-      case UserProfile::Setting::Type::WSTRING:
-      case UserProfile::Setting::Type::BINARY:
-        needed_data_size += setting_key.size;
-        break;
-      default:
-        break;
+    const uint32_t setting_id = static_cast<uint32_t>(setting_ids[i]);
+    if (UserData::requires_additional_data(setting_id)) {
+      needed_data_size += UserData::get_max_size(setting_id);
     }
   }
   if (xuids) {
@@ -232,7 +226,7 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
   for (uint32_t i = 0; i < setting_count; ++i) {
     auto setting_id = static_cast<uint32_t>(setting_ids[i]);
     auto setting = user_profile->GetSetting(setting_id);
-    if (!setting) {
+    if (!setting.has_value()) {
       any_missing = true;
       REXKRNL_ERROR(
           "xeXamUserReadProfileSettingsEx requested unimplemented setting "
@@ -255,14 +249,19 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
   out_header->setting_count = static_cast<uint32_t>(setting_count);
   out_header->settings_ptr = REX_KERNEL_MEMORY()->HostToGuestVirtual(out_setting);
 
-  UserProfile::SettingByteStream out_stream(REX_KERNEL_MEMORY()->HostToGuestVirtual(buffer), buffer,
-                                            buffer_size, needed_header_size);
+  // Extended (BINARY/WSTRING) payloads are written back-to-back after the
+  // setting headers, one max-size-wide slot per setting - matching xenia's
+  // real XamUserReadProfileSettingsEx layout (UserSetting::WriteToGuest).
+  uint32_t extended_data_address =
+      REX_KERNEL_MEMORY()->HostToGuestVirtual(buffer) + needed_header_size;
   for (uint32_t n = 0; n < setting_count; ++n) {
     uint32_t setting_id = setting_ids[n];
     auto setting = user_profile->GetSetting(setting_id);
 
     std::memset(out_setting, 0, sizeof(X_USER_PROFILE_SETTING));
-    out_setting->from = !setting || !setting->is_set ? 0 : setting->is_title_specific() ? 2 : 1;
+    out_setting->from = setting.has_value()
+                            ? static_cast<uint32_t>(setting->get_setting_source())
+                            : static_cast<uint32_t>(X_USER_PROFILE_SETTING_SOURCE::NO_VALUE);
     if (xuids) {
       out_setting->xuid = user_profile->xuid();
     } else {
@@ -270,8 +269,8 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
     }
     out_setting->setting_id = setting_id;
 
-    if (setting && setting->is_set) {
-      setting->Append(&out_setting->data, &out_stream);
+    if (setting.has_value()) {
+      setting->WriteToGuest(&out_setting->data, extended_data_address);
     }
     ++out_setting;
   }
@@ -324,8 +323,8 @@ u32 XamUserWriteProfileSettings_entry(u32 title_id, u32 user_index, u32 setting_
   for (uint32_t n = 0; n < setting_count; ++n) {
     const X_USER_PROFILE_SETTING& setting = settings[n];
 
-    auto setting_type = static_cast<UserProfile::Setting::Type>(setting.data.type);
-    if (setting_type == UserProfile::Setting::Type::UNSET) {
+    auto setting_type = static_cast<X_USER_DATA_TYPE>(setting.data.type);
+    if (setting_type == X_USER_DATA_TYPE::UNSET) {
       continue;
     }
 
@@ -334,9 +333,13 @@ u32 XamUserWriteProfileSettings_entry(u32 title_id, u32 user_index, u32 setting_
         " from={} setting_id={:08X} data.type={}",
         n, (uint32_t)setting.from, (uint32_t)setting.setting_id, setting.data.type);
 
+    const auto setting_id = static_cast<UserSettingId>(uint32_t(setting.setting_id));
+
     switch (setting_type) {
-      case UserProfile::Setting::Type::CONTENT:
-      case UserProfile::Setting::Type::BINARY: {
+      case X_USER_DATA_TYPE::CONTEXT: {
+        user_profile->AddSetting(UserSetting(setting_id, uint32_t(setting.data.u32)));
+      } break;
+      case X_USER_DATA_TYPE::BINARY: {
         uint8_t* binary_ptr = REX_KERNEL_MEMORY()->TranslateVirtual(setting.data.binary.ptr);
         size_t binary_size = setting.data.binary.size;
         std::vector<uint8_t> bytes;
@@ -348,37 +351,30 @@ u32 XamUserWriteProfileSettings_entry(u32 title_id, u32 user_index, u32 setting_
           // Data pointer was NULL, so just fill with zeroes
           bytes.resize(binary_size, 0);
         }
-        user_profile->AddSetting(
-            std::make_unique<xam::UserProfile::BinarySetting>(setting.setting_id, bytes));
+        user_profile->AddSetting(UserSetting(setting_id, bytes));
       } break;
-      case UserProfile::Setting::Type::INT32: {
-        user_profile->AddSetting(std::make_unique<xam::UserProfile::Int32Setting>(
-            setting.setting_id, int32_t(setting.data.s32)));
+      case X_USER_DATA_TYPE::INT32: {
+        user_profile->AddSetting(UserSetting(setting_id, int32_t(setting.data.s32)));
       } break;
-      case UserProfile::Setting::Type::INT64: {
-        user_profile->AddSetting(std::make_unique<xam::UserProfile::Int64Setting>(
-            setting.setting_id, int64_t(setting.data.s64)));
+      case X_USER_DATA_TYPE::INT64: {
+        user_profile->AddSetting(UserSetting(setting_id, int64_t(setting.data.s64)));
       } break;
-      case UserProfile::Setting::Type::DOUBLE: {
-        user_profile->AddSetting(std::make_unique<xam::UserProfile::DoubleSetting>(
-            setting.setting_id, double(setting.data.f64)));
+      case X_USER_DATA_TYPE::DOUBLE: {
+        user_profile->AddSetting(UserSetting(setting_id, double(setting.data.f64)));
       } break;
-      case UserProfile::Setting::Type::FLOAT: {
-        user_profile->AddSetting(std::make_unique<xam::UserProfile::FloatSetting>(
-            setting.setting_id, float(setting.data.f32)));
+      case X_USER_DATA_TYPE::FLOAT: {
+        user_profile->AddSetting(UserSetting(setting_id, float(setting.data.f32)));
       } break;
-      case UserProfile::Setting::Type::DATETIME: {
-        user_profile->AddSetting(std::make_unique<xam::UserProfile::DateTimeSetting>(
-            setting.setting_id, int64_t(setting.data.filetime)));
+      case X_USER_DATA_TYPE::DATETIME: {
+        user_profile->AddSetting(UserSetting(setting_id, int64_t(setting.data.filetime)));
       } break;
-      case UserProfile::Setting::Type::WSTRING: {
+      case X_USER_DATA_TYPE::WSTRING: {
         std::u16string value;
         if (setting.data.unicode.ptr && setting.data.unicode.size) {
           value = memory::load_and_swap<std::u16string>(
               REX_KERNEL_MEMORY()->TranslateVirtual(setting.data.unicode.ptr));
         }
-        user_profile->AddSetting(
-            std::make_unique<xam::UserProfile::UnicodeSetting>(setting.setting_id, value));
+        user_profile->AddSetting(UserSetting(setting_id, value));
       } break;
       default: {
         REXKRNL_ERROR("XamUserWriteProfileSettings: Unimplemented data type {}", setting_type);

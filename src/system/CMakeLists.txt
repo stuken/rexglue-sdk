@@ -26,6 +26,10 @@ set(REXSYSTEM_SOURCES
     util/object_table.cpp
     util/native_list.cpp
     util/xdbf_utils.cpp
+    util/xdbf_io.cpp
+    util/gpd_info.cpp
+    util/gpd_info_profile.cpp
+    util/gpd_info_title.cpp
     util/gameinfo_utils.cpp
     util/xmp_volume_patch.cpp
 
@@ -33,6 +37,8 @@ set(REXSYSTEM_SOURCES
     xam/app_manager.cpp
     xam/content_manager.cpp
     xam/user_profile.cpp
+    xam/user_data.cpp
+    xam/user_settings.cpp
 
     ppc_types.cpp
     elf_module.cpp

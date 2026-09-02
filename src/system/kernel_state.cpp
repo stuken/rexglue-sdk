@@ -284,9 +284,10 @@ void KernelState::LoadAchievementsData() {
   std::vector<AchievementInfo> achievements;
 
   const util::XdbfGameData db = title_xdbf();
+  std::string title_name;
+  XLanguage language = static_cast<XLanguage>(REXCVAR_GET(user_language));
   if (db.is_valid()) {
-    const XLanguage language =
-        db.GetExistingLanguage(static_cast<XLanguage>(REXCVAR_GET(user_language)));
+    language = db.GetExistingLanguage(language);
     for (const auto& entry : db.GetAchievements()) {
       AchievementInfo info;
       info.id = entry.id;
@@ -298,6 +299,7 @@ void KernelState::LoadAchievementsData() {
       info.flags = entry.flags;
       achievements.push_back(std::move(info));
     }
+    title_name = db.title(language);
   }
 
   SetLoadedAchievements(std::move(achievements));
@@ -312,6 +314,26 @@ void KernelState::LoadAchievementsData() {
                                            fmt::format("{:08X}.toml", title_id()));
     achievement_manager_.LoadUnlockState();
   }
+
+  // Track this title in the GPD-backed profile (real .gpd persistence -
+  // XAM_PORT_AUDIT.md items 1.3/2.2/2.3/2.4) and mirror future unlocks into
+  // it. Kept independent of AchievementManager's own TOML-based unlock
+  // state above, which stays the existing, already-tested source of truth
+  // for IsUnlocked()/unlock notifications.
+  const auto loaded = loaded_achievements();
+  uint32_t total_gamerscore = 0;
+  for (const auto& info : loaded) {
+    total_gamerscore += info.gamerscore;
+  }
+  if (title_name.empty()) {
+    title_name = fmt::format("{:08X}", title_id());
+  }
+  user_profile_->TrackTitle(title_id(), title_name, static_cast<uint32_t>(loaded.size()),
+                            total_gamerscore);
+
+  RegisterAchievementUnlockCallback([this](const AchievementInfo& info) {
+    user_profile_->OnAchievementUnlocked(info, GetAchievementUnlockTime(info.id));
+  });
 }
 
 uint32_t KernelState::process_type() const {
