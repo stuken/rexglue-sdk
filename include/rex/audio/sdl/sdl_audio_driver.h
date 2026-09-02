@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <mutex>
 #include <queue>
 #include <stack>
@@ -29,6 +30,9 @@ class SDLAudioDriver : public AudioDriver {
 
   bool Initialize();
   void SubmitFrame(uint32_t frame_ptr) override;
+  void SetVolume(float volume) override;
+  void Pause() override;
+  void Resume() override;
   void Shutdown();
 
  protected:
@@ -38,8 +42,10 @@ class SDLAudioDriver : public AudioDriver {
   rex::thread::Semaphore* semaphore_ = nullptr;
 
   SDL_AudioStream* sdl_stream_ = nullptr;
+  SDL_AudioDeviceID sdl_device_ = 0;
   bool sdl_initialized_ = false;
   uint8_t sdl_device_channels_ = 0;
+  std::atomic<float> volume_ = 1.0f;
 
   static const uint32_t frame_frequency_ = 48000;
   static const uint32_t frame_channels_ = 6;

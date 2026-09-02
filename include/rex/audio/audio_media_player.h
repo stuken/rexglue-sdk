@@ -38,11 +38,15 @@ class AudioSystem;
 //
 // Xenia's equivalent (xe::apu::AudioMediaPlayer) drives a host-float
 // AudioDriver interface fed by an independently-created driver instance.
-// RexGlue's rex::audio::AudioDriver instead only exposes
+// RexGlue's rex::audio::AudioDriver instead exposes
 // SubmitFrame(uint32_t frame_ptr), where frame_ptr is a *guest* address
 // holding a fixed-format frame: 6 channels (fl, fr, fc, lf, bl, br) of 256
 // samples each, stored as big-endian floats in planar (non-interleaved)
-// layout - see conversion::sequential_6_BE_to_interleaved_*. There is also no
+// layout - see conversion::sequential_6_BE_to_interleaved_* - plus
+// SetVolume/Pause/Resume, applied by the driver itself at its own
+// dequeue/mix stage rather than by this class pre-scaling or dropping
+// submitted samples (see SetVolume and WaitWhilePaused below for why driver_
+// access stays confined to the worker thread either way). There is also no
 // public "give me an untracked driver" factory (AudioSystem::CreateDriver is
 // protected, reachable only via the 8-slot guest-callback client table used
 // by XAudioRegisterRenderDriverClient). This class owns a small persistent
@@ -88,12 +92,17 @@ class AudioMediaPlayer {
   bool is_playing() const { return state_.load(std::memory_order_relaxed) == State::kPlaying; }
   bool is_paused() const { return state_.load(std::memory_order_relaxed) == State::kPaused; }
 
-  // Scales subsequently-decoded samples before they reach the driver. Not
-  // wired through rex::audio::AudioDriver (which has no per-driver volume
-  // control, only a global output-stage gain shared with real in-game
-  // audio - see downmix.h) - this only affects XMP's own stream.
-  // Matches xenia's own clamp (std::min(volume, 1.0f)) - only an upper bound,
-  // since a title is never expected to send anything above unity gain.
+  // Stores the requested volume; does *not* touch driver_ directly, since
+  // this can be called from any thread (whatever dispatches XMPSetVolume)
+  // while driver_ is only ever created/destroyed on the worker thread
+  // (EnsureDriver/TeardownDriver) - reading it here without synchronization
+  // could race a concurrent TeardownDriver(). Instead the worker thread reads
+  // this atomic and pushes it to driver_->SetVolume() once per submitted
+  // output frame (~5.3ms, see SubmitPendingFrame), where the driver applies
+  // it at actual dequeue/mix time - not baked into sample data - so it also
+  // reaches frames already queued in the driver, not just newly-submitted
+  // ones. Matches xenia's own clamp (std::min(volume, 1.0f)) - only an upper
+  // bound, since a title is never expected to send anything above unity gain.
   void SetVolume(float volume) {
     volume_.store(std::min(volume, 1.0f), std::memory_order_relaxed);
   }
@@ -109,6 +118,17 @@ class AudioMediaPlayer {
   void PlayWmaData(const std::vector<uint8_t>& file_data);
   static std::vector<uint8_t> LoadSongToMemory(rex::system::KernelState* kernel_state,
                                                 const std::u16string& file_path);
+
+  // Blocks (only) while state_ is kPaused, pausing/resuming driver_ - a real
+  // OS-level device pause (SDLAudioDriver::Pause -> SDL_PauseAudioDevice)
+  // rather than just letting already-queued frames drain to silence - around
+  // the wait. Called from PlayMp3Data/PlayWmaData's decode loops, which run
+  // on the worker thread, so this keeps driver_ access single-threaded the
+  // same way SetVolume's comment describes; AudioMediaPlayer::Pause()/
+  // Continue() (called from whatever thread dispatches XMP pause messages)
+  // only flip state_ and let this notice it instead of touching driver_
+  // themselves.
+  void WaitWhilePaused();
 
   bool EnsureDriver();
   void TeardownDriver();

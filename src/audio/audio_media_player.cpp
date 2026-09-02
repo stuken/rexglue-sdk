@@ -196,6 +196,22 @@ void AudioMediaPlayer::TeardownDriver() {
   }
 }
 
+void AudioMediaPlayer::WaitWhilePaused() {
+  if (state_.load(std::memory_order_relaxed) != State::kPaused) {
+    return;
+  }
+  // driver_ is guaranteed valid here: this only runs from within
+  // PlayMp3Data/PlayWmaData, which PlaySong only calls after EnsureDriver()
+  // has already succeeded, and nothing tears driver_ down again until this
+  // song's processing has returned to WorkerThreadMain.
+  driver_->Pause();
+  while (state_.load(std::memory_order_relaxed) == State::kPaused &&
+        !song_should_stop_.load(std::memory_order_relaxed)) {
+    rex::thread::Sleep(std::chrono::milliseconds(20));
+  }
+  driver_->Resume();
+}
+
 std::vector<uint8_t> AudioMediaPlayer::LoadSongToMemory(rex::system::KernelState* kernel_state,
                                                         const std::u16string& file_path) {
   rex::filesystem::File* vfs_file = nullptr;
@@ -289,20 +305,20 @@ void AudioMediaPlayer::SubmitPendingFrame() {
   // than stalling the worker thread forever on a stuck/dead driver.
   rex::thread::Wait(driver_semaphore_.get(), false, std::chrono::milliseconds(500));
 
-  // Applied here (at the final ~5.3ms output-frame granularity) rather than
-  // where samples are decoded (~20-40ms MP3/WMA frame granularity) so an
-  // in-flight XMPSetVolume call - e.g. a game's music volume slider - takes
-  // effect on already-decoded-but-not-yet-submitted samples too, not just
-  // audio decoded after the call.
-  const float vol = volume_.load(std::memory_order_relaxed);
+  // Pushed to the driver rather than baked into the samples below, so the
+  // driver's own dequeue/mix stage (SDLAudioDriver::SDLCallback) applies it
+  // to every frame still sitting in its queue, not just this one - see
+  // SetVolume's comment for why this push (driver_ access) has to happen
+  // here, on the worker thread, rather than directly inside SetVolume().
+  driver_->SetVolume(volume_.load(std::memory_order_relaxed));
 
   uint8_t* host_ptr = memory_->TranslateVirtual(frame_guest_ptr_);
   std::memset(host_ptr, 0, kOutputChannels * kSamplesPerChannel * sizeof(float));
   float* channel0 = reinterpret_cast<float*>(host_ptr) + 0 * kSamplesPerChannel;
   float* channel1 = reinterpret_cast<float*>(host_ptr) + 1 * kSamplesPerChannel;
   for (size_t i = 0; i < kSamplesPerChannel; ++i) {
-    rex::memory::store_and_swap<float>(&channel0[i], pending_left_[i] * vol);
-    rex::memory::store_and_swap<float>(&channel1[i], pending_right_[i] * vol);
+    rex::memory::store_and_swap<float>(&channel0[i], pending_left_[i]);
+    rex::memory::store_and_swap<float>(&channel1[i], pending_right_[i]);
   }
   // Channels 2-5 (fc, lf, bl, br) are left silent (already zeroed above).
 
@@ -417,17 +433,14 @@ void AudioMediaPlayer::PlayMp3Data(const std::vector<uint8_t>& file_data) {
                  decoded->sample_rate, decoded->channels, volume_.load(std::memory_order_relaxed));
     }
     ++decoded_frame_count;
-    // Volume is applied later, in SubmitPendingFrame - see its comment for
-    // why (finer-grained, so in-flight volume changes take effect sooner).
+    // Volume isn't touched here at all - it's pushed straight to the driver
+    // each submit cycle instead (see SubmitPendingFrame).
     const int sample_rate = decoded->sample_rate > 0 ? decoded->sample_rate : kOutputSampleRate;
     AppendDecoded(left.data(), right.data(), left.size(), sample_rate);
   };
 
   while (data_size > 0 && !song_should_stop_.load(std::memory_order_relaxed)) {
-    while (state_.load(std::memory_order_relaxed) == State::kPaused &&
-          !song_should_stop_.load(std::memory_order_relaxed)) {
-      rex::thread::Sleep(std::chrono::milliseconds(20));
-    }
+    WaitWhilePaused();
     if (song_should_stop_.load(std::memory_order_relaxed)) {
       break;
     }
@@ -566,17 +579,14 @@ void AudioMediaPlayer::PlayWmaData(const std::vector<uint8_t>& file_data) {
                  volume_.load(std::memory_order_relaxed));
     }
     ++decoded_frame_count;
-    // Volume is applied later, in SubmitPendingFrame - see its comment for
-    // why (finer-grained, so in-flight volume changes take effect sooner).
+    // Volume isn't touched here at all - it's pushed straight to the driver
+    // each submit cycle instead (see SubmitPendingFrame).
     const int sample_rate = decoded->sample_rate > 0 ? decoded->sample_rate : kOutputSampleRate;
     AppendDecoded(left.data(), right.data(), left.size(), sample_rate);
   };
 
   while (!song_should_stop_.load(std::memory_order_relaxed)) {
-    while (state_.load(std::memory_order_relaxed) == State::kPaused &&
-          !song_should_stop_.load(std::memory_order_relaxed)) {
-      rex::thread::Sleep(std::chrono::milliseconds(20));
-    }
+    WaitWhilePaused();
     if (song_should_stop_.load(std::memory_order_relaxed)) {
       break;
     }

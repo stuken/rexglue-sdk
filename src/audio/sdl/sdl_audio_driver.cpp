@@ -101,12 +101,30 @@ bool SDLAudioDriver::Initialize() {
               device_name ? device_name : "?", obtained_spec.channels, obtained_spec.freq,
               static_cast<uint32_t>(obtained_spec.format), static_cast<int>(sdl_device_channels_));
 
+  sdl_device_ = sdl_device;
+
   if (!SDL_ResumeAudioDevice(sdl_device)) {
     REXAPU_ERROR("SDL_ResumeAudioDevice() failed: {}", SDL_GetError());
     return false;
   }
 
   return true;
+}
+
+void SDLAudioDriver::SetVolume(float volume) {
+  volume_.store(volume, std::memory_order_relaxed);
+}
+
+void SDLAudioDriver::Pause() {
+  if (sdl_device_ && !SDL_PauseAudioDevice(sdl_device_)) {
+    REXAPU_WARN("SDLAudioDriver::Pause: SDL_PauseAudioDevice() failed: {}", SDL_GetError());
+  }
+}
+
+void SDLAudioDriver::Resume() {
+  if (sdl_device_ && !SDL_ResumeAudioDevice(sdl_device_)) {
+    REXAPU_WARN("SDLAudioDriver::Resume: SDL_ResumeAudioDevice() failed: {}", SDL_GetError());
+  }
 }
 
 void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
@@ -143,6 +161,7 @@ void SDLAudioDriver::Shutdown() {
     SDL_DestroyAudioStream(sdl_stream_);
     sdl_stream_ = nullptr;
   }
+  sdl_device_ = 0;
   if (sdl_initialized_) {
     SDL_QuitSubSystem(SDL_INIT_AUDIO);
     sdl_initialized_ = false;
@@ -175,9 +194,13 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
     return;
   }
   // Snapshot once. A change mid-callback would split the frame across two mixes.
+  // Folds in this driver's own per-stream volume (SetVolume) alongside the
+  // shared output-stage gain, applied here at dequeue/mix time rather than
+  // by the submitter pre-scaling samples - so it reaches frames already
+  // sitting in frames_queued_, not just ones submitted after the change.
   const StereoFold fold = GetStereoFold();
   const SurroundMix mix = GetSurroundMix();
-  const float gain = GetOutputGain();
+  const float gain = GetOutputGain() * driver->volume_.load(std::memory_order_relaxed);
   while (additional_amount > 0) {
     static uint32_t sdl_callback_count = 0;
     std::unique_lock<std::mutex> guard(driver->frames_mutex_);
