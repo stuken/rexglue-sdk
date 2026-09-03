@@ -24,38 +24,11 @@
 #include <rex/memory.h>
 #include <rex/ui/graphics_util.h>
 
-REXCVAR_DEFINE_BOOL(execute_unclipped_draw_vs_on_cpu, false, "GPU",
+REXCVAR_DEFINE_BOOL(execute_unclipped_draw_vs_on_cpu, true, "GPU",
                     "Execute unclipped draw vertex shader on CPU");
 
 REXCVAR_DEFINE_BOOL(execute_unclipped_draw_vs_on_cpu_with_scissor, false, "GPU",
                     "Execute unclipped draw VS on CPU with scissor");
-
-// DEFINE_bool(
-//     execute_unclipped_draw_vs_on_cpu, true,
-//     "Execute the vertex shader for draws with clipping disabled, primarily "
-//     "screen-space draws (such as clears), on the CPU when possible to estimate "
-//     "the extent of the EDRAM involved in the draw.\n"
-//     "Enabling this may significantly improve GPU performance as otherwise up "
-//     "to the entire EDRAM may be considered used in draws without clipping, "
-//     "potentially resulting in spurious EDRAM range ownership transfer round "
-//     "trips between host render targets.\n"
-//     "Also, on hosts where certain render target formats have to be emulated in "
-//     "a lossy way (for instance, 16-bit fixed-point via 16-bit floating-point), "
-//     "this prevents corruption of other render targets located after the "
-//     "current ones in the EDRAM by lossy range ownership transfers done for "
-//     "those draws.",
-//     "GPU");
-// DEFINE_bool(
-//     execute_unclipped_draw_vs_on_cpu_with_scissor, false,
-//     "Don't restrict the usage of execute_unclipped_draw_vs_on_cpu to only "
-//     "non-scissored draws (with the right and the bottom sides of the scissor "
-//     "rectangle at 8192 or beyond) even though if the scissor rectangle is "
-//     "present, it's usually sufficient for esimating the height of the render "
-//     "target.\n"
-//     "Enabling this may cause excessive processing of vertices on the CPU, as "
-//     "some games draw rectangles (for their UI, for instance) without clipping, "
-//     "but with a proper scissor rectangle.",
-//     "GPU");
 
 namespace rex::graphics {
 

@@ -13,7 +13,7 @@
 #include <rex/logging.h>
 #include <rex/ui/renderdoc_api.h>
 
-REXCVAR_DEFINE_BOOL(gpu_allow_invalid_fetch_constants, false, "GPU",
+REXCVAR_DEFINE_BOOL(gpu_allow_invalid_fetch_constants, true, "GPU",
                     "Allow invalid fetch constants");
 REXCVAR_DEFINE_BOOL(gpu_allow_invalid_upload_range, false, "GPU",
                     "Allows games to read data from pages that are marked as no access.");

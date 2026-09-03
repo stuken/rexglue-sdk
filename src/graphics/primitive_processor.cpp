@@ -36,7 +36,11 @@ REXCVAR_DEFINE_BOOL(force_convert_quad_lists_to_triangle_lists, false, "GPU",
 REXCVAR_DEFINE_BOOL(force_convert_triangle_fans_to_lists, false, "GPU",
                     "Force convert triangle fans to lists");
 
-REXCVAR_DEFINE_INT32(primitive_processor_cache_min_indices, 0, "GPU",
+// Cache lookups/insertions require global critical region locking, and
+// insertions also require protecting pages, so a low threshold hurts more
+// than it helps - at 1024, the cache made performance worse in 415607D4's
+// 16-bit primitive reset index replacement.
+REXCVAR_DEFINE_INT32(primitive_processor_cache_min_indices, 4096, "GPU",
                      "Minimum indices for primitive processor cache")
     .range(0, 1000000);
 
@@ -68,19 +72,6 @@ REXCVAR_DEFINE_INT32(primitive_processor_cache_min_indices, 0, "GPU",
 //     "Adreno 4xx-level host GPU testing), force indirection or pre-masking and "
 //     "pre-swapping of 32-bit vertex indices as if the host only supports 24-bit "
 //     "indices.",
-//     "GPU");
-// TODO(Triang3l): More investigation of the cache threshold as cache lookups
-// and insertions require global critical region locking, and insertions also
-// require protecting pages. At 1024, the cache only made the performance worse
-// (415607D4, 16-bit primitive reset index replacement).
-// DEFINE_int32(
-//     primitive_processor_cache_min_indices, 4096,
-//     "Smallest number of guest indices to store in the cache to try reusing "
-//     "later in the same frame if processing (such as primitive type conversion "
-//     "or reset index replacement) is performed.\n"
-//     "Setting this to a very high value may result in excessive CPU processing, "
-//     "while a very low value may result in excessive locking and lookups.\n"
-//     "Negative values disable caching.",
 //     "GPU");
 
 namespace rex::graphics {

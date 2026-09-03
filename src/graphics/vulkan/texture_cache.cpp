@@ -33,7 +33,7 @@
 #include <rex/ui/vulkan/ui_samplers.h>
 #include <rex/ui/vulkan/util.h>
 
-REXCVAR_DEFINE_BOOL(non_seamless_cube_map, false, "GPU", "Use non-seamless cube map sampling");
+REXCVAR_DEFINE_BOOL(non_seamless_cube_map, true, "GPU", "Use non-seamless cube map sampling");
 
 namespace rex::graphics::vulkan {
 
