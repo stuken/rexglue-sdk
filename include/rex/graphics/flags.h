@@ -56,6 +56,7 @@ REXCVAR_DECLARE(uint32_t, draw_resolution_scale_threshold);
 
 // GPU Textures
 REXCVAR_DECLARE(bool, gpu_allow_invalid_fetch_constants);
+REXCVAR_DECLARE(bool, gpu_allow_invalid_upload_range);
 REXCVAR_DECLARE(bool, gpu_3d_to_2d_texture);
 REXCVAR_DECLARE(int32_t, anisotropic_override);
 REXCVAR_DECLARE(int32_t, texture_cache_memory_limit_render_to_texture);
