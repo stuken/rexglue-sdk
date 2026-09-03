@@ -125,7 +125,14 @@ bool build_bctr(BuilderContext& ctx) {
   }
 
   if (jt) {
-    ctx.println("\tswitch ({}.u32) {{", ctx.r(jt->indexRegister));
+    // If the compiler scaled the index in place before the indexed table load (e.g.
+    // "rlwinm r10,r10,2,..."), the register holds a scaled byte offset at this point, not the
+    // raw 0-based case value the table entries were read out under - shift it back down.
+    if (jt->indexShift) {
+      ctx.println("\tswitch (({}.u32) >> {}) {{", ctx.r(jt->indexRegister), jt->indexShift);
+    } else {
+      ctx.println("\tswitch ({}.u32) {{", ctx.r(jt->indexRegister));
+    }
 
     for (size_t i = 0; i < jt->targets.size(); i++) {
       ctx.println("\tcase {}:", i);

@@ -244,9 +244,13 @@ struct Block {
 //=============================================================================
 
 struct JumpTable {
-  uint32_t bctrAddress;           // Address of bctr instruction
-  uint32_t tableAddress;          // Address of jump table data
-  uint8_t indexRegister;          // Register holding switch index
+  uint32_t bctrAddress;   // Address of bctr instruction
+  uint32_t tableAddress;  // Address of jump table data
+  uint8_t indexRegister;  // Register holding switch index
+  // Right-shift needed to recover the raw 0-based case index from indexRegister at the bctr
+  // site. Nonzero when the compiler scales the index in place (e.g. "rlwinm r10,r10,2,...")
+  // to compute the table byte offset, leaving the scaled value live instead of the raw index.
+  uint8_t indexShift = 0;
   std::vector<uint32_t> targets;  // Resolved case targets (internal labels)
 };
 

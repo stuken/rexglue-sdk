@@ -264,6 +264,7 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
 
       auto address_opt = (*table)["address"].value<uint32_t>();
       auto register_opt = (*table)["register"].value<uint32_t>();
+      auto shift_opt = (*table)["shift"].value<uint32_t>();
       auto labels_array = (*table)["labels"].as_array();
 
       if (!address_opt) {
@@ -283,6 +284,9 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
       jt.bctrAddress = *address_opt;
       jt.tableAddress = 0;
       jt.indexRegister = static_cast<uint8_t>(*register_opt);
+      // Optional: right-shift to apply to 'register' before comparing against the labels below,
+      // for compilers that scale the index in place before the table load (see indexShift).
+      jt.indexShift = shift_opt ? static_cast<uint8_t>(*shift_opt) : 0;
 
       for (auto& label : *labels_array) {
         if (auto label_val = label.value<int64_t>()) {

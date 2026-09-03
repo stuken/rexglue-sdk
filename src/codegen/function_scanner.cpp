@@ -210,6 +210,8 @@ struct JumpTableMatch {
   u8 index_reg = 0;       // Register holding original switch index
   u8 offset_reg = 0;      // Register holding loaded offset
   u8 shift_amount = 0;    // Shift amount for COMPUTED type
+  u8 index_shift_amount = 0;      // Shift amount applied to index_reg itself (ABSOLUTE type)
+  bool index_scaled_in_place = false;  // rlwinm wrote the scaled index back into index_reg
   guest_addr_t table_high = 0;
   guest_addr_t table_low = 0;
   guest_addr_t base_high = 0;
@@ -619,7 +621,28 @@ std::optional<JumpTable> FunctionScanner::detect_jump_table(guest_addr_t bctr_ad
     if (!match.found_shift && instr.opcode == Opcode::rlwinm) {
       // Check if this is scaling the index (for ABSOLUTE, SHORT, or offset-based types)
       // Must check BEFORE offset shift to handle SHORTOFFSET with scaled index
-      if (match.found_load && instr.M.RA == match.index_reg) {
+      //
+      // The lwzx/lbzx/lhzx RA/RB operand order is ambiguous (see Step 2b), so at this point
+      // match.index_reg may actually hold our *tentative* table register instead - check both
+      // candidates and swap if the scaled register turns out to be the "table" guess.
+      bool scalesIndexGuess = instr.M.RA == match.index_reg;
+      bool scalesTableGuess = !scalesIndexGuess && match.found_load && !match.found_table_lis &&
+                              instr.M.RA == match.table_reg;
+
+      if (match.found_load && (scalesIndexGuess || scalesTableGuess)) {
+        if (scalesTableGuess) {
+          REXCODEGEN_TRACE(
+              "  [0x{:08X}] rlwinm scales tentative table_reg r{} - swapping table/index", addr,
+              static_cast<u32>(instr.M.RA));
+          std::swap(match.table_reg, match.index_reg);
+        }
+
+        // If the shift writes back into the same register it read from, the register no
+        // longer holds the raw switch value by the time we reach bctr - the codegen'd switch
+        // must shift it back down to compare against plain 0-based case labels.
+        match.index_scaled_in_place = (instr.M.RA == instr.M.RS);
+        match.index_shift_amount = instr.M.SH;
+
         match.index_reg = instr.M.RS;
         match.found_shift = true;
         REXCODEGEN_TRACE("  [0x{:08X}] Found rlwinm (index scale) r{}, r{}, {}", addr,
@@ -807,6 +830,21 @@ std::optional<JumpTable> FunctionScanner::detect_jump_table(guest_addr_t bctr_ad
     return std::nullopt;
   }
 
+  // For ABSOLUTE tables, the indexed load (lwzx) that fetches the table entry into
+  // ctr_source_reg may reuse the same physical register as the resolved index (e.g.
+  // "lwzx r11,r11,r10" - RT==RA). When that happens the index no longer exists anywhere by the
+  // time execution reaches bctr - the load already overwrote it with the resolved target
+  // address - so there's no way to recover the raw case index at the switch site. Bail out
+  // rather than emit a switch on a clobbered register; ctx.ctr is still computed correctly by
+  // the literal instruction translation either way.
+  if (match.type == JumpTableType::kAbsolute && match.index_reg == match.ctr_source_reg) {
+    REXCODEGEN_TRACE(
+        "  bctr 0x{:08X}: index register r{} is clobbered by its own table load - cannot build "
+        "a switch, treating as indirect call",
+        bctr_address, static_cast<u32>(match.index_reg));
+    return std::nullopt;
+  }
+
   // Validate table address
   guest_addr_t table_address = match.table_address();
   REXCODEGEN_TRACE("  Table address: 0x{:08X} (high=0x{:08X}, low=0x{:04X})", table_address,
@@ -837,6 +875,7 @@ std::optional<JumpTable> FunctionScanner::detect_jump_table(guest_addr_t bctr_ad
   jt.bctrAddress = static_cast<uint32_t>(bctr_address);
   jt.tableAddress = static_cast<uint32_t>(table_address);
   jt.indexRegister = match.index_reg;
+  jt.indexShift = match.index_scaled_in_place ? match.index_shift_amount : 0;
   jt.targets = std::move(targets);
 
   return jt;
@@ -1396,6 +1435,27 @@ std::optional<JumpTable> detectJumpTable(DecodedBinary& decoded, uint32_t bctrAd
   uint8_t indexReg = 0xFF;       // Current reg being traced (0xFF = stop tracing)
   uint8_t finalIndexReg = 0xFF;  // Last valid indexReg for scanForBounds/output
   int shiftAmount = 0;
+  bool indexScaledInPlace = false;  // true if finalIndexReg was overwritten in place by its own
+                                     // scale (e.g. "rlwinm r10,r10,2,..."), so the switch must
+                                     // shift it back down before comparing against case labels
+  uint8_t indexShiftAmount = 0;
+  // Once an in-place scale is found, the register is fully resolved (identity + shift) - stop
+  // tracing it. Further backward instructions writing the same register number are unrelated
+  // earlier definitions (e.g. the load that produced the raw value before it got scaled), not a
+  // clobber of what we just captured, and must not invalidate it.
+  bool indexResolved = false;
+
+  // lwzx/lbzx/lhzx RA/RB operand order is ambiguous - we tentatively assume RA=table, RB=index
+  // (matching the indexReg tracing above). Track RA in parallel so that if the subsequent
+  // lis/addi for the table address turns out to target RB instead, we can tell the guess was
+  // backward and use RA (traced the same way) as the real index register.
+  uint8_t origIndexReg = 0xFF;       // RB at match time, unmutated - used to detect the swap
+  uint8_t tableCandReg = 0xFF;       // RA at match time, unmutated
+  uint8_t finalTableCandReg = 0xFF;  // RA traced back through in-place scales, like finalIndexReg
+  bool tableCandScaledInPlace = false;
+  uint8_t tableCandShiftAmount = 0;
+  bool tableCandResolved = false;  // see indexResolved
+  uint8_t tableAddrDestReg = 0xFF;  // destination register of the lis/addi pair that set tableAddr
 
   // Backward scan from bctr
   uint32_t scanAddr = bctrAddr;
@@ -1427,10 +1487,13 @@ std::optional<JumpTable> detectJumpTable(DecodedBinary& decoded, uint32_t bctrAd
     if (foundMtctr && !foundLoad) {
       // lwzx rD, rA, rB - indexed word load (ABSOLUTE table)
       if (insn->opcode == Opcode::lwzx && insn->X.RT == ctrSourceReg) {
-        // Table address is in rA, index scaled in rB
+        // Table address is in rA, index scaled in rB (tentative - see origIndexReg/tableCandReg)
         tableType = JumpTableType::kAbsolute;
         indexReg = insn->X.RB;
         finalIndexReg = indexReg;
+        origIndexReg = insn->X.RB;
+        tableCandReg = insn->X.RA;
+        finalTableCandReg = tableCandReg;
         foundLoad = true;
         REXCODEGEN_TRACE("detectJumpTable: bctr=0x{:08X} found lwzx at 0x{:08X}", bctrAddr,
                          scanAddr);
@@ -1507,7 +1570,7 @@ std::optional<JumpTable> detectJumpTable(DecodedBinary& decoded, uint32_t bctrAd
     // DON'T trace back through extrwi/other rlwinm variants - those transform the value
     // NOTE: SH must be > 0 for a real shift; SH=0 is just a move/no-op (clrlwi r,r,0)
     // IMPORTANT: Stop tracing if another instruction writes to indexReg (breaks the chain)
-    if (foundLoad && indexReg != 0xFF) {
+    if (foundLoad && (indexReg != 0xFF || finalTableCandReg != 0xFF)) {
       // Check if this instruction writes to indexReg
       bool writesToIndexReg = false;
       uint8_t destReg = 0xFF;
@@ -1537,7 +1600,7 @@ std::optional<JumpTable> detectJumpTable(DecodedBinary& decoded, uint32_t bctrAd
         destReg = insn->XO.RT;
       }
 
-      if (destReg == indexReg) {
+      if (!indexResolved && indexReg != 0xFF && destReg == indexReg) {
         writesToIndexReg = true;
 
         // Check for slwi pattern: if it matches, trace back; otherwise stop tracing
@@ -1547,6 +1610,17 @@ std::optional<JumpTable> detectJumpTable(DecodedBinary& decoded, uint32_t bctrAd
           uint8_t me = insn->M.ME;
           // Check for slwi pattern: SH>0, MB=0, ME=31-SH
           if (sh > 0 && mb == 0 && me == (31 - sh)) {
+            // If the shift writes back into the same register it read from, the register no
+            // longer holds the raw switch value at bctr - record the shift so the emitted
+            // switch can compensate instead of comparing a scaled value against raw case labels.
+            // The register is now fully resolved (identity + shift): stop tracing it, since an
+            // earlier instruction that also happens to write this register number (e.g. the
+            // load that produced the raw pre-scale value) is not a clobber of what we captured.
+            if (insn->M.RA == insn->M.RS) {
+              indexScaledInPlace = true;
+              indexShiftAmount = sh;
+              indexResolved = true;
+            }
             indexReg = insn->M.RS;
             finalIndexReg = indexReg;
             REXCODEGEN_TRACE(
@@ -1568,6 +1642,29 @@ std::optional<JumpTable> detectJumpTable(DecodedBinary& decoded, uint32_t bctrAd
           indexReg = 0xFF;  // Mark as invalid to stop further tracing
         }
       }
+
+      // Mirror the same tracing for the "other" RA candidate (see tableCandReg above) so we
+      // have a resolved index register + shift info available if the RA/RB guess turns out to
+      // be backward once the table address's destination register is known.
+      if (!tableCandResolved && finalTableCandReg != 0xFF && destReg == finalTableCandReg) {
+        if (insn->opcode == Opcode::rlwinm) {
+          uint8_t sh = insn->M.SH;
+          uint8_t mb = insn->M.MB;
+          uint8_t me = insn->M.ME;
+          if (sh > 0 && mb == 0 && me == (31 - sh)) {
+            if (insn->M.RA == insn->M.RS) {
+              tableCandScaledInPlace = true;
+              tableCandShiftAmount = sh;
+              tableCandResolved = true;
+            }
+            finalTableCandReg = insn->M.RS;
+          } else {
+            finalTableCandReg = 0xFF;
+          }
+        } else {
+          finalTableCandReg = 0xFF;
+        }
+      }
     }
 
     // Find lis/addi pairs for table and base addresses
@@ -1583,6 +1680,9 @@ std::optional<JumpTable> detectJumpTable(DecodedBinary& decoded, uint32_t bctrAd
             "detectJumpTable: bctr=0x{:08X} found lis at 0x{:08X} hi=0x{:08X} foundLoad={}",
             bctrAddr, scanAddr, hi, foundLoad);
         if (foundLoad) {
+          if (tableAddrDestReg == 0xFF) {
+            tableAddrDestReg = static_cast<uint8_t>(insn->D.RT);
+          }
           // After load: this is tableAddr (only capture first complete address)
           if (tableAddr == 0) {
             tableAddr =
@@ -1612,6 +1712,9 @@ std::optional<JumpTable> detectJumpTable(DecodedBinary& decoded, uint32_t bctrAd
             "detectJumpTable: bctr=0x{:08X} found {} at 0x{:08X} lo=0x{:04X} foundLoad={}",
             bctrAddr, isAddi ? "addi" : "ori", scanAddr, lo, foundLoad);
         if (foundLoad) {
+          if (tableAddrDestReg == 0xFF) {
+            tableAddrDestReg = static_cast<uint8_t>(insn->D.RT);
+          }
           // After load: this is tableAddr (only capture first complete address)
           if (tableAddr == 0) {
             if (hasPendingTableHi) {
@@ -1664,6 +1767,37 @@ std::optional<JumpTable> detectJumpTable(DecodedBinary& decoded, uint32_t bctrAd
       "baseAddr=0x{:08X}",
       bctrAddr, foundMtctr, foundLoad, tableAddr, baseAddr);
 
+  // Resolve the lwzx RA/RB ambiguity: we tentatively assumed RA=table, RB=index. If the
+  // register the lis/addi pair actually populated tableAddr into was RB (origIndexReg) instead
+  // of RA (tableCandReg), the assumption was backward - the real switch index is RA, traced the
+  // same way as finalTableCandReg above.
+  if (tableType == JumpTableType::kAbsolute && tableAddrDestReg != 0xFF &&
+      origIndexReg != 0xFF && tableAddrDestReg == origIndexReg && tableAddrDestReg != tableCandReg) {
+    REXCODEGEN_TRACE(
+        "detectJumpTable: bctr=0x{:08X} lwzx operand order reversed (table in r{}, index in "
+        "r{}) - using r{} as index",
+        bctrAddr, origIndexReg, tableCandReg, tableCandReg);
+    finalIndexReg = finalTableCandReg;
+    indexScaledInPlace = tableCandScaledInPlace;
+    indexShiftAmount = tableCandShiftAmount;
+  }
+
+  // For ABSOLUTE tables, the load (lwzx) that fetches the table entry into ctrSourceReg may
+  // reuse the same physical register as the resolved index (e.g. "lwzx r11,r11,r10" - RT==RA).
+  // When that happens, the index no longer exists anywhere by the time execution reaches bctr:
+  // the load has already overwritten it with the resolved *target address*. There is no way to
+  // recover the raw case index at the switch site, so don't emit a switch at all - ctx.ctr was
+  // still computed correctly by the literal instruction translation, so fall back to a plain
+  // indirect call.
+  if (tableType == JumpTableType::kAbsolute && finalIndexReg != 0xFF &&
+      finalIndexReg == ctrSourceReg) {
+    REXCODEGEN_TRACE(
+        "detectJumpTable: bctr=0x{:08X} index register r{} is clobbered by its own table load "
+        "(lwzx writes the same register) - cannot build a switch, falling back to indirect call",
+        bctrAddr, finalIndexReg);
+    return std::nullopt;
+  }
+
   if (!foundMtctr || !foundLoad || tableAddr == 0) {
     REXCODEGEN_TRACE(
         "detectJumpTable: bctr=0x{:08X} FAILED foundMtctr={} foundLoad={} tableAddr=0x{:08X}",
@@ -1687,6 +1821,7 @@ std::optional<JumpTable> detectJumpTable(DecodedBinary& decoded, uint32_t bctrAd
   jt.bctrAddress = bctrAddr;
   jt.tableAddress = tableAddr;
   jt.indexRegister = finalIndexReg;
+  jt.indexShift = indexScaledInPlace ? indexShiftAmount : 0;
 
   REXCODEGEN_TRACE(
       "detectJumpTable: bctr=0x{:08X} reading {} entries from table=0x{:08X} base=0x{:08X} type={}",
@@ -1744,9 +1879,12 @@ std::optional<JumpTable> detectJumpTable(DecodedBinary& decoded, uint32_t bctrAd
       break;
     }
 
-    // Validate target is within code region - jump table targets help DEFINE function extent
-    // Don't constrain by funcEnd since that's just PDATA which may not include out-of-line code
-    if (target == 0 || !containingRegion.contains(target)) {
+    // Validate target is real code SOMEWHERE in the binary. Jump table entries commonly point
+    // to functions other than the one containing this bctr (dispatch/handler tables, not just
+    // classic intra-function switch-case labels), so this must not be restricted to
+    // containingRegion - that's only the code island holding the current function, and legitimate
+    // out-of-line targets routinely fall outside it.
+    if (target == 0 || !decoded.isInCodeRegion(target)) {
       // TODO(tomc): Figure out what this voodoo does on real hardware. Its a jump target that
       // points to a null value..?
       if (target != 0) {
@@ -1761,16 +1899,19 @@ std::optional<JumpTable> detectJumpTable(DecodedBinary& decoded, uint32_t bctrAd
       }
       // End of valid entries
       REXCODEGEN_TRACE(
-          "detectJumpTable: bctr=0x{:08X} entry[{}] target=0x{:08X} invalid (region "
-          "0x{:08X}-0x{:08X})",
-          bctrAddr, i, target, containingRegion.start, containingRegion.end);
+          "detectJumpTable: bctr=0x{:08X} entry[{}] target=0x{:08X} invalid (not in any code "
+          "region)",
+          bctrAddr, i, target);
       if (jt.targets.empty())
         return std::nullopt;
       break;
     }
 
-    // Target must be >= function start (can't jump backward past entry point)
-    if (target < funcStart) {
+    // Reject backward jumps into an earlier function's body *within this same code island* -
+    // a legitimate intra-function case label can't land before the switch's own function start.
+    // Targets in a different code island entirely (e.g. a genuinely separate function elsewhere
+    // in the binary, as with dispatch/handler tables) aren't constrained by this at all.
+    if (containingRegion.contains(target) && target < funcStart) {
       REXCODEGEN_TRACE(
           "detectJumpTable: bctr=0x{:08X} entry[{}] target=0x{:08X} < funcStart=0x{:08X}", bctrAddr,
           i, target, funcStart);
