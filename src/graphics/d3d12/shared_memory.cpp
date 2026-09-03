@@ -262,6 +262,26 @@ bool D3D12SharedMemory::UploadRanges(
   for (auto upload_range : upload_page_ranges) {
     uint32_t upload_range_start = upload_range.first;
     uint32_t upload_range_length = upload_range.second;
+
+    if (upload_range_length > 0 && !REXCVAR_GET(gpu_allow_invalid_upload_range)) {
+      // Check both start and end of the range for unmapped memory.
+      const uint32_t range_start_addr = upload_range_start << page_size_log2();
+      const uint32_t upload_range_last_page = upload_range_start + upload_range_length - 1;
+      const uint32_t range_end_addr = upload_range_last_page << page_size_log2();
+
+      const rex::memory::PageAccess start_access =
+          memory().GetPhysicalHeap()->QueryRangeAccess(range_start_addr, range_start_addr);
+      const rex::memory::PageAccess end_access =
+          memory().GetPhysicalHeap()->QueryRangeAccess(range_end_addr, range_end_addr);
+
+      if (start_access == rex::memory::PageAccess::kNoAccess ||
+          end_access == rex::memory::PageAccess::kNoAccess) {
+        REXGPU_ERROR("Invalid upload range for GPU: {:08X} length {:08X}", upload_range_start,
+                     upload_range_length);
+        return false;
+      }
+    }
+
     while (upload_range_length != 0) {
       ID3D12Resource* upload_buffer;
       size_t upload_buffer_offset, upload_buffer_size;

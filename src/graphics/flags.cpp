@@ -15,6 +15,8 @@
 
 REXCVAR_DEFINE_BOOL(gpu_allow_invalid_fetch_constants, false, "GPU",
                     "Allow invalid fetch constants");
+REXCVAR_DEFINE_BOOL(gpu_allow_invalid_upload_range, false, "GPU",
+                    "Allows games to read data from pages that are marked as no access.");
 REXCVAR_DEFINE_BOOL(
     debug_msaa_2x_as_4x, false, "GPU.Debug",
     "Use 4x MSAA with 2 samples instead of native 2x MSAA when available. For "
