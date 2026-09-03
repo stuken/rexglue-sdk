@@ -2013,8 +2013,11 @@ bool PhysicalHeap::Decommit(uint32_t address, uint32_t size) {
     return false;
   }
 
-  // Not caring about the contents anymore.
-  TriggerCallbacks(std::move(global_lock), address, size, true, true);
+  // Not caring about the contents anymore. Invalidate even if nothing was
+  // watching this range - it may be reused by another mapping, and a
+  // physical-memory client (e.g. GPU shared memory) that never armed a watch
+  // here would otherwise keep treating it as valid.
+  TriggerCallbacks(std::move(global_lock), address, size, true, true, true, true);
 
   return BaseHeap::Decommit(address, size);
 }
@@ -2038,7 +2041,7 @@ bool PhysicalHeap::Release(uint32_t base_address, uint32_t* out_region_size) {
   // thus callback handlers will keep considering this range valid forever.
   uint32_t region_size;
   if (QuerySize(base_address, &region_size)) {
-    TriggerCallbacks(std::move(global_lock), base_address, region_size, true, true);
+    TriggerCallbacks(std::move(global_lock), base_address, region_size, true, true, true, true);
   }
 
   return BaseHeap::Release(base_address, out_region_size);
@@ -2049,9 +2052,15 @@ bool PhysicalHeap::Protect(uint32_t address, uint32_t size, uint32_t protect,
   auto global_lock = global_critical_region_.Acquire();
 
   // Only invalidate if making writable again, for simplicity - not when simply
-  // marking some range as immutable, for instance.
-  if (protect & memory::kMemoryProtectWrite) {
-    TriggerCallbacks(std::move(global_lock), address, size, true, true, false);
+  // marking some range as immutable, for instance. Write-combine memory is
+  // CPU-writable too (used for GPU uploads), so treat it the same as a plain
+  // write grant. The guest is announcing a write rather than reacting to a
+  // fault, so invalidate even with no watch armed: a range that was
+  // read-only when it was last uploaded never got one, and would otherwise
+  // stay stale for as long as the guest keeps it read-only outside of its
+  // own writes.
+  if ((protect & memory::kMemoryProtectWrite) || (protect & memory::kMemoryProtectWriteCombine)) {
+    TriggerCallbacks(std::move(global_lock), address, size, true, true, false, true);
   }
 
   if (!parent_heap_->Protect(GetPhysicalAddress(address), size, protect, old_protect)) {
@@ -2174,7 +2183,8 @@ void PhysicalHeap::EnableAccessCallbacks(uint32_t physical_address, uint32_t len
 
 bool PhysicalHeap::TriggerCallbacks(std::unique_lock<std::recursive_mutex> global_lock_locked_once,
                                     uint32_t virtual_address, uint32_t length, bool is_write,
-                                    bool unwatch_exact_range, bool unprotect) {
+                                    bool unwatch_exact_range, bool unprotect,
+                                    bool invalidate_unwatched) {
   // TODO(Triang3l): Support read watches.
   assert_true(is_write);
   if (!is_write) {
@@ -2220,7 +2230,7 @@ bool PhysicalHeap::TriggerCallbacks(std::unique_lock<std::recursive_mutex> globa
       break;
     }
   }
-  if (!any_watched) {
+  if (!any_watched && !invalidate_unwatched) {
     return false;
   }
 
