@@ -76,7 +76,7 @@ uint32_t xeXamEnumerate(uint32_t handle, uint32_t flags, mapped_void buffer_ptr,
 
 u32 XamEnumerate_entry(u32 handle, u32 flags, mapped_void buffer, u32 buffer_length,
                        mapped_u32 items_returned, ppc_ptr_t<XAM_OVERLAPPED> overlapped) {
-  uint32_t dummy;
+  uint32_t dummy = 0;
   auto result =
       xeXamEnumerate(handle, flags, buffer, buffer_length,
                      !overlapped.guest_address() ? &dummy : nullptr, overlapped.guest_address());
@@ -88,7 +88,11 @@ u32 XamEnumerate_entry(u32 handle, u32 flags, mapped_void buffer, u32 buffer_len
 
 u32 XamCreateEnumeratorHandle_entry(u32 unk1, u32 unk2, u32 unk3, u32 unk4, u32 unk5, u32 unk6,
                                     u32 unk7, u32 unk8) {
-  return X_ERROR_INVALID_PARAMETER;
+  // Unimplemented. Callers (e.g. PGR4's enumerator wrapper) check this
+  // return value as an HRESULT (negative == failure), so a raw positive
+  // Win32 code here gets silently treated as success, leaving downstream
+  // XamEnumerate calls to run against a handle that was never created.
+  return X_HRESULT_FROM_WIN32(X_ERROR_INVALID_PARAMETER);
 }
 
 u32 XamGetPrivateEnumStructureFromHandle_entry(u32 handle, mapped_u32 out_object_ptr) {
