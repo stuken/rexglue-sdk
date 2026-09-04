@@ -148,12 +148,15 @@ bool build_dcbtst(BuilderContext& ctx) {
 }
 
 bool build_dcbz(BuilderContext& ctx) {
-  // Compute EA, align to 32-byte cache line, apply physical offset
+  // The Xbox 360 has no short (32-byte) cache line — every dcbz variant
+  // clears a full 128-byte line on real hardware, so plain dcbz must match
+  // dcbzl's alignment/size (see xenia-canary 72ce13097, repro titles
+  // 4E4D07E0 and 4E4D083D).
   ctx.print("\t{} = (", ctx.ea());
   if (ctx.insn.operands[0] != 0)
     ctx.print("{}.u32 + ", ctx.r(ctx.insn.operands[0]));
-  ctx.println("{}.u32) & ~31;", ctx.r(ctx.insn.operands[1]));
-  ctx.println("\tmemset((void*)REX_RAW_ADDR({}), 0, 32);", ctx.ea());
+  ctx.println("{}.u32) & ~127;", ctx.r(ctx.insn.operands[1]));
+  ctx.println("\tmemset((void*)REX_RAW_ADDR({}), 0, 128);", ctx.ea());
   return true;
 }
 
