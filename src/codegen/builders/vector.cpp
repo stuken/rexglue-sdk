@@ -114,14 +114,50 @@ bool build_vnmsubfp(BuilderContext& ctx) {
 }
 
 bool build_vmaxfp(BuilderContext& ctx) {
+  // vmaxfp: NaN-preserving max. SSE's MAXPS always returns the second
+  // operand when either input is NaN, which does not match Xbox 360
+  // hardware — the console propagates whichever operand actually *is* the
+  // NaN, payload intact (verified: FFC00000 in, FFC00000 out). Combine both
+  // max orderings with AND (matches hardware ±0 behavior too), then blend in
+  // the NaN operand wherever either input was NaN. See xenia 7ff152a5a,
+  // repro title 415607E8 ("Evil Queen's Castle" level).
   ctx.emit_set_flush_mode(true);
-  ctx.emit_vec_fp_binary("max");
+  auto vD = ctx.v(ctx.insn.operands[0]);
+  auto vA = ctx.v(ctx.insn.operands[1]);
+  auto vB = ctx.v(ctx.insn.operands[2]);
+  ctx.println("\t{{");
+  ctx.println("\t\tsimde__m128 a = simde_mm_load_ps({}.f32);", vA);
+  ctx.println("\t\tsimde__m128 b = simde_mm_load_ps({}.f32);", vB);
+  ctx.println(
+      "\t\tsimde__m128 max_ab = simde_mm_and_ps(simde_mm_max_ps(a, b), simde_mm_max_ps(b, a));");
+  ctx.println("\t\tsimde__m128 a_is_nan = simde_mm_cmpunord_ps(a, a);");
+  ctx.println("\t\tsimde__m128 nan_operand = simde_mm_blendv_ps(b, a, a_is_nan);");
+  ctx.println("\t\tsimde__m128 either_nan = simde_mm_cmpunord_ps(a, b);");
+  ctx.println(
+      "\t\tsimde_mm_store_ps({}.f32, simde_mm_blendv_ps(max_ab, nan_operand, either_nan));", vD);
+  ctx.println("\t}}");
   return true;
 }
 
 bool build_vminfp(BuilderContext& ctx) {
+  // vminfp: same NaN-payload-preserving fix as vmaxfp above, mirrored with
+  // OR instead of AND (OR also gives the correct ±0 result for min — see
+  // xenia's inline comment: "if 0 and -0, return 0! opposite of minfp").
   ctx.emit_set_flush_mode(true);
-  ctx.emit_vec_fp_binary("min");
+  auto vD = ctx.v(ctx.insn.operands[0]);
+  auto vA = ctx.v(ctx.insn.operands[1]);
+  auto vB = ctx.v(ctx.insn.operands[2]);
+  ctx.println("\t{{");
+  ctx.println("\t\tsimde__m128 a = simde_mm_load_ps({}.f32);", vA);
+  ctx.println("\t\tsimde__m128 b = simde_mm_load_ps({}.f32);", vB);
+  ctx.println(
+      "\t\tsimde__m128 min_ab = simde_mm_or_ps(simde_mm_min_ps(a, b), simde_mm_min_ps(b, a));");
+  ctx.println("\t\tsimde__m128 a_is_nan = simde_mm_cmpunord_ps(a, a);");
+  ctx.println("\t\tsimde__m128 nan_operand = simde_mm_blendv_ps(b, a, a_is_nan);");
+  ctx.println("\t\tsimde__m128 either_nan = simde_mm_cmpunord_ps(a, b);");
+  ctx.println(
+      "\t\tsimde_mm_store_ps({}.f32, simde_mm_blendv_ps(min_ab, nan_operand, either_nan));", vD);
+  ctx.println("\t}}");
   return true;
 }
 
