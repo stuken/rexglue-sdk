@@ -336,13 +336,18 @@ bool build_mtmsrd(BuilderContext& ctx) {
 }
 
 bool build_mtfsf(BuilderContext& ctx) {
+  // The L ("move") bit forces an unconditional full-word store regardless of
+  // FM - it is not just a shorthand for FM=0xFF, so it must be checked ahead
+  // of the mask expansion rather than relying on mask happening to come out
+  // as 0xFFFFFFFF.
+  bool move = ctx.insn.operands[2] != 0;
   uint32_t fm = ctx.insn.operands[0];
   uint32_t mask = 0;
   for (int j = 0; j < 8; j++) {
     if (fm & (1 << (7 - j)))
       mask |= 0xF << (4 * j);
   }
-  if (mask == 0xFFFFFFFF) {
+  if (move || mask == 0xFFFFFFFF) {
     ctx.println("\tctx.fpscr.storeFromGuest({}.u32);", ctx.f(ctx.insn.operands[1]));
   } else {
     ctx.println(
