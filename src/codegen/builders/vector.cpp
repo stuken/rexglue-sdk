@@ -1318,9 +1318,18 @@ bool build_vpkd3d128(BuilderContext& ctx) {
       // Pack 4 elements into 64 bits (2 words)
       // Guest element 0 goes to highest 16-bit position, element 3 to lowest
       // Output u16 index = (3-i) + 2*shift for element i
+      //
+      // shift==3 is a degenerate encoding: the 64-bit pack no longer fits in
+      // the 128-bit register at that word offset. Xenia's permute-mask table
+      // for this case (pack=3, shift=3) keeps elements 2-3 unwritten (old
+      // register contents survive) and relocates the elements-0-1 word to
+      // word 0 instead of its out-of-range natural slot - it does not simply
+      // extend the shift=0..2 pattern, which would index past u16[7].
+      uint32_t shift = ctx.insn.operands[4];
       for (size_t i = 0; i < 4; i++) {
+        if (shift == 3 && i >= 2) continue;  // elements 2-3 are dropped at shift=3
         size_t srcIdx = 3 - i;  // Guest element i is at host array index 3-i
-        size_t dstIdx = (3 - i) + (2 * ctx.insn.operands[4]);  // Output also reversed
+        size_t dstIdx = shift == 3 ? (1 - i) : (3 - i) + (2 * shift);
         ctx.println("\t{}.s32 = {}.s32[{}] - 0x40400000;", ctx.temp(), ctx.v(ctx.insn.operands[1]),
                     srcIdx);
         ctx.println("\t{}.s32 = {}.s32 > 32767 ? 32767 : ({}.s32 < -32767 ? -32767 : {}.s32);",
@@ -1336,12 +1345,21 @@ bool build_vpkd3d128(BuilderContext& ctx) {
       // Pack 4 elements into 64 bits (4 x 16-bit floats)
       // Guest element 0 goes to highest 16-bit position, element 3 to lowest
       // Output u16 index = (3-i) + 2*shift for element i
-      if (ctx.insn.operands[3] != 2 || ctx.insn.operands[4] > 2)
+      //
+      // shift==3 is a degenerate encoding: elements 2-3 already land in
+      // bounds (word 3) under the formula above, but elements 0-1 would
+      // index past u16[7]. Xenia's permute-mask table for this case (pack=2,
+      // shift=3) drops elements 0-1 entirely and leaves the old register
+      // contents in their place, rather than extending the shift=0..2
+      // pattern.
+      if (ctx.insn.operands[3] != 2)
         REXCODEGEN_WARN("Unexpected float16_4 pack instruction at {:X}", ctx.base);
 
+      uint32_t shift = ctx.insn.operands[4];
       for (size_t i = 0; i < 4; i++) {
+        if (shift == 3 && i < 2) continue;  // elements 0-1 are dropped at shift=3
         size_t srcIdx = 3 - i;  // Guest element i is at host array index 3-i
-        size_t dstIdx = (3 - i) + (2 * ctx.insn.operands[4]);  // Output also reversed
+        size_t dstIdx = (3 - i) + (2 * shift);  // Output also reversed
         ctx.println("\t{}.u32 = ({}.u32[{}]&0x7FFFFFFF);", ctx.temp(), ctx.v(ctx.insn.operands[1]),
                     srcIdx);
         ctx.println(
@@ -1608,8 +1626,8 @@ bool build_vupkhsh(BuilderContext& ctx) {
 
 bool build_vupklsb(BuilderContext& ctx) {
   ctx.println(
-      "\tsimde_mm_store_si128((simde__m128i*){}.s32, "
-      "simde_mm_cvtepi8_epi16(simde_mm_load_si128((simde__m128i*){}.s16)));",
+      "\tsimde_mm_store_si128((simde__m128i*){}.s16, "
+      "simde_mm_cvtepi8_epi16(simde_mm_load_si128((simde__m128i*){}.s8)));",
       ctx.v(ctx.insn.operands[0]), ctx.v(ctx.insn.operands[1]));
   return true;
 }
