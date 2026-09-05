@@ -212,6 +212,39 @@ void AudioMediaPlayer::WaitWhilePaused() {
   driver_->Resume();
 }
 
+void AudioMediaPlayer::DrainQueue() {
+  // driver_semaphore_ starts at kQueuedFrames and is created with that same
+  // maximum count (EnsureDriver), so it can never hold more than
+  // kQueuedFrames permits at once. SubmitPendingFrame acquires one permit
+  // per frame it hands to driver_->SubmitFrame(), and SDLAudioDriver
+  // releases one back once SDLCallback has actually dequeued and output
+  // that frame (see SDLCallback's semaphore_->Release() call) - so
+  // "permits available" tracks exactly how many submitted frames the
+  // driver hasn't finished outputting yet. Acquiring all kQueuedFrames of
+  // them ourselves is therefore only possible once none remain
+  // outstanding, i.e. the driver has genuinely finished outputting
+  // everything submitted for the song that just finished decoding - not
+  // just that decoding itself finished. Released back immediately after so
+  // the next song's SubmitPendingFrame calls see a full queue again.
+  int acquired = 0;
+  for (; acquired < kQueuedFrames; ++acquired) {
+    if (song_should_stop_.load(std::memory_order_relaxed)) {
+      break;  // An explicit Stop()/Play() wants an immediate cut, not this.
+    }
+    // Bounded rather than blocking forever, same reasoning as
+    // SubmitPendingFrame's own wait: a stuck/dead driver shouldn't wedge
+    // every future song behind this drain.
+    if (rex::thread::Wait(driver_semaphore_.get(), false, std::chrono::milliseconds(500)) !=
+        rex::thread::WaitResult::kSuccess) {
+      REXAPU_WARN("AudioMediaPlayer: DrainQueue timed out waiting for the driver to catch up");
+      break;
+    }
+  }
+  if (acquired > 0) {
+    driver_semaphore_->Release(acquired, nullptr);
+  }
+}
+
 std::vector<uint8_t> AudioMediaPlayer::LoadSongToMemory(rex::system::KernelState* kernel_state,
                                                         const std::u16string& file_path) {
   rex::filesystem::File* vfs_file = nullptr;
@@ -397,6 +430,15 @@ void AudioMediaPlayer::PlaySong(Song* song) {
       // state_ is already whatever that caller set it to (Stop() sets
       // kIdle itself; Play() sets kPlaying for the song it's switching to).
       // Don't auto-advance: the request already decided what's next.
+      return;
+    }
+
+    // Ending naturally: wait for the driver to actually finish outputting
+    // this song's audio (not just for decoding to finish) before letting
+    // song_ended_callback_ advance XmpApp's active_song_index_ and
+    // broadcast the "now playing" change - see DrainQueue()'s comment.
+    DrainQueue();
+    if (song_should_stop_.load(std::memory_order_relaxed)) {
       return;
     }
 

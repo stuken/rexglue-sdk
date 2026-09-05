@@ -143,6 +143,22 @@ class AudioMediaPlayer {
   // themselves.
   void WaitWhilePaused();
 
+  // Blocks until the driver has actually finished outputting every frame
+  // submitted for the song that just finished decoding, rather than just
+  // decoding it - see the .cpp definition for how driver_semaphore_ makes
+  // that observable. Called only from PlaySong()'s natural-end path (a
+  // song running out of input on its own), right before it hands control
+  // to song_ended_callback_, so XmpApp::OnSongEndedNaturally() only
+  // advances active_song_index_ - and the "now playing" notification/query
+  // only reports the new song - once the outgoing song's audio is actually
+  // done, not merely decoded. Closes the same kQueuedFrames-deep
+  // (~43ms) latency gap SetVolume/WaitWhilePaused close for volume/pause
+  // changes, applied to the auto-advance path instead. Explicit
+  // Stop()/Next()/Previous()/Play() requests don't go through this - they
+  // already want an immediate cut, not a drain - and this bails out early
+  // if one arrives mid-drain.
+  void DrainQueue();
+
   bool EnsureDriver();
   void TeardownDriver();
 
