@@ -11,6 +11,7 @@
  */
 
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -107,7 +108,10 @@ class XmpApp : public system::xam::App {
   static const uint32_t kMsgTitlePlaylistContentChanged = 0x8A000005;
   static const uint32_t kMsgDashInitChanged = 0x8A000009;
 
-  void OnStateChanged();
+  // Takes the state to broadcast explicitly rather than re-reading state_
+  // itself, so callers under playback_state_mutex_ can capture the value
+  // and release the lock before this (possibly non-trivial) broadcast call.
+  void OnStateChanged(State state);
 
   // Called from AudioMediaPlayer's worker thread (via the callback wired up
   // in the constructor) when a song finishes decoding entirely on its own -
@@ -121,18 +125,32 @@ class XmpApp : public system::xam::App {
   // on it in Next()/Previous()/the natural-completion path, so always
   // advancing sequentially is faithful, not a gap relative to xenia.
   //
-  // Safe to touch active_playlist_/active_song_index_/state_ without a lock:
-  // this only ever runs while the worker thread has *not* been asked to
-  // stop, and every dispatch-thread handler that mutates those same fields
-  // calls media_player_->Stop() first - which blocks until the worker has
-  // fully left PlaySong() (and therefore this function) - before touching
-  // them. The one exception is XMPPause()/XMPContinue(), which don't park
-  // the worker before writing state_; a natural end-of-playlist racing
-  // exactly against a pause/resume request can lose one of the two writes,
-  // which is a narrow, low-consequence race (a stale kPaused/kPlaying value,
-  // never a dangling pointer) accepted rather than adding a second
-  // synchronization mechanism for it.
+  // media_player_->Stop() parks the worker thread (so it can't be mid-way
+  // through PlaySong()/OnSongEndedNaturally() when a dispatch-thread handler
+  // starts mutating shared state) but does *not* by itself make
+  // state_/active_playlist_/active_song_index_ consistent: this function can
+  // still run to completion - including bumping active_song_index_ and
+  // starting the next song's decode - in the window before a dispatch-thread
+  // handler (possibly on a different guest thread) calls Stop(). Every read
+  // or write of those fields, from either thread, must hold
+  // playback_state_mutex_ for that reason; XMPPause()/XMPContinue() in
+  // particular don't call Stop() at all, so without the lock they raced
+  // this function's writes to state_ outright (undefined behavior, not just
+  // staleness). The lock only needs to cover the fields themselves, not the
+  // (possibly slow) media_player_->Stop()/Play() calls around it - keep
+  // critical sections short.
   Song* OnSongEndedNaturally();
+
+  // Guards state_/active_playlist_/active_song_index_ (and repeat_mode_,
+  // read by OnSongEndedNaturally on the worker thread) against concurrent
+  // access between AudioMediaPlayer's worker thread (OnSongEndedNaturally)
+  // and whichever guest thread(s) dispatch XMP* messages - see
+  // OnSongEndedNaturally()'s comment. Deliberately a plain mutex rather than
+  // global_critical_region_: several holders here block for the duration of
+  // media_player_->Stop() (up to the worker's decode-loop poll interval),
+  // which global_critical_region_'s "extremely fast, no IO" contract
+  // forbids.
+  mutable std::mutex playback_state_mutex_;
 
   State state_;
   PlaybackClient playback_client_;

@@ -51,8 +51,13 @@ X_HRESULT XmpApp::XMPGetStatus(uint32_t state_ptr) {
   }
 
   REXKRNL_TRACE("XMPGetStatus({:08X})", state_ptr);
+  State state;
+  {
+    std::lock_guard<std::mutex> lock(playback_state_mutex_);
+    state = state_;
+  }
   memory::store_and_swap<uint32_t>(memory_->TranslateVirtual(state_ptr),
-                                   static_cast<uint32_t>(state_));
+                                   static_cast<uint32_t>(state));
   return X_E_SUCCESS;
 }
 
@@ -119,7 +124,12 @@ X_HRESULT XmpApp::XMPDeleteTitlePlaylist(uint32_t playlist_handle) {
     return X_E_NOTFOUND;
   }
   auto playlist = it->second;
-  if (playlist == active_playlist_) {
+  bool is_active;
+  {
+    std::lock_guard<std::mutex> lock(playback_state_mutex_);
+    is_active = (playlist == active_playlist_);
+  }
+  if (is_active) {
     XMPStop(0);
   }
   playlists_.erase(it);
@@ -149,37 +159,51 @@ X_HRESULT XmpApp::XMPPlayTitlePlaylist(uint32_t playlist_handle, uint32_t song_h
     return X_E_FAIL;
   }
 
-  // Blocks until the worker thread has left PlaySong() (and therefore any
-  // in-flight OnSongEndedNaturally() call) before the mutations below -
-  // see that function's comment for why this ordering matters.
+  // Parks the worker thread so it can't be mid-way through PlaySong()/
+  // OnSongEndedNaturally() while the mutations below run - see
+  // OnSongEndedNaturally()'s comment for why playback_state_mutex_ is still
+  // needed on top of this.
   media_player_->Stop();
 
-  active_playlist_ = playlist;
-  active_song_index_ = 0;
-  if (song_handle) {
-    auto it = std::find_if(playlist->songs.begin(), playlist->songs.end(),
-                           [song_handle](const std::unique_ptr<Song>& song) {
-                             return song->handle == song_handle;
-                           });
-    if (it != playlist->songs.end()) {
-      active_song_index_ = static_cast<int>(std::distance(playlist->songs.begin(), it));
+  Song* song_to_play;
+  {
+    std::lock_guard<std::mutex> lock(playback_state_mutex_);
+    active_playlist_ = playlist;
+    active_song_index_ = 0;
+    if (song_handle) {
+      auto it = std::find_if(playlist->songs.begin(), playlist->songs.end(),
+                             [song_handle](const std::unique_ptr<Song>& song) {
+                               return song->handle == song_handle;
+                             });
+      if (it != playlist->songs.end()) {
+        active_song_index_ = static_cast<int>(std::distance(playlist->songs.begin(), it));
+      }
     }
+    state_ = State::kPlaying;
+    song_to_play = playlist->songs[active_song_index_].get();
   }
-
-  state_ = State::kPlaying;
-  media_player_->Play(playlist->songs[active_song_index_].get());
-  OnStateChanged();
+  media_player_->Play(song_to_play);
+  OnStateChanged(State::kPlaying);
   kernel_state_->BroadcastNotification(kMsgPlaybackBehaviorChanged, 1);
   return X_E_SUCCESS;
 }
 
 X_HRESULT XmpApp::XMPContinue() {
   REXKRNL_DEBUG("XMPContinue()");
-  if (state_ == State::kPaused) {
-    state_ = State::kPlaying;
+  State state;
+  bool was_paused;
+  {
+    std::lock_guard<std::mutex> lock(playback_state_mutex_);
+    was_paused = (state_ == State::kPaused);
+    if (was_paused) {
+      state_ = State::kPlaying;
+    }
+    state = state_;
+  }
+  if (was_paused) {
     media_player_->Continue();
   }
-  OnStateChanged();
+  OnStateChanged(state);
   return X_E_SUCCESS;
 }
 
@@ -187,80 +211,127 @@ X_HRESULT XmpApp::XMPStop(uint32_t unk) {
   assert_zero(unk);
   REXKRNL_DEBUG("XMPStop({:08X})", unk);
   media_player_->Stop();
-  active_playlist_ = nullptr;  // ?
-  active_song_index_ = 0;
-  state_ = State::kIdle;
-  OnStateChanged();
+  {
+    std::lock_guard<std::mutex> lock(playback_state_mutex_);
+    active_playlist_ = nullptr;  // ?
+    active_song_index_ = 0;
+    state_ = State::kIdle;
+  }
+  OnStateChanged(State::kIdle);
   return X_E_SUCCESS;
 }
 
 X_HRESULT XmpApp::XMPPause() {
   REXKRNL_DEBUG("XMPPause()");
-  if (state_ == State::kPlaying) {
-    state_ = State::kPaused;
+  State state;
+  bool was_playing;
+  {
+    std::lock_guard<std::mutex> lock(playback_state_mutex_);
+    was_playing = (state_ == State::kPlaying);
+    if (was_playing) {
+      state_ = State::kPaused;
+    }
+    state = state_;
+  }
+  if (was_playing) {
     media_player_->Pause();
   }
-  OnStateChanged();
+  OnStateChanged(state);
   return X_E_SUCCESS;
 }
 
 X_HRESULT XmpApp::XMPNext() {
   REXKRNL_DEBUG("XMPNext()");
-  if (!active_playlist_) {
-    return X_E_NOTFOUND;
+  {
+    std::lock_guard<std::mutex> lock(playback_state_mutex_);
+    if (!active_playlist_) {
+      return X_E_NOTFOUND;
+    }
   }
-  // See OnSongEndedNaturally()'s comment - parks the worker before touching
-  // active_song_index_/state_.
+  // Parks the worker thread - see OnSongEndedNaturally()'s comment for why
+  // playback_state_mutex_ is still needed around the mutation below even so.
   media_player_->Stop();
-  state_ = State::kPlaying;
-  active_song_index_ = (active_song_index_ + 1) % active_playlist_->songs.size();
-  media_player_->Play(active_playlist_->songs[active_song_index_].get());
-  OnStateChanged();
+  Song* song_to_play;
+  {
+    std::lock_guard<std::mutex> lock(playback_state_mutex_);
+    // Re-checked: a concurrent XMPStop()/XMPDeleteTitlePlaylist() on another
+    // guest thread may have cleared this while we were blocked in Stop()
+    // above.
+    if (!active_playlist_) {
+      return X_E_NOTFOUND;
+    }
+    state_ = State::kPlaying;
+    active_song_index_ = (active_song_index_ + 1) % active_playlist_->songs.size();
+    song_to_play = active_playlist_->songs[active_song_index_].get();
+  }
+  media_player_->Play(song_to_play);
+  OnStateChanged(State::kPlaying);
   return X_E_SUCCESS;
 }
 
 X_HRESULT XmpApp::XMPPrevious() {
   REXKRNL_DEBUG("XMPPrevious()");
-  if (!active_playlist_) {
-    return X_E_NOTFOUND;
+  {
+    std::lock_guard<std::mutex> lock(playback_state_mutex_);
+    if (!active_playlist_) {
+      return X_E_NOTFOUND;
+    }
   }
   media_player_->Stop();
-  state_ = State::kPlaying;
-  if (!active_song_index_) {
-    active_song_index_ = static_cast<int>(active_playlist_->songs.size()) - 1;
-  } else {
-    --active_song_index_;
+  Song* song_to_play;
+  {
+    std::lock_guard<std::mutex> lock(playback_state_mutex_);
+    if (!active_playlist_) {
+      return X_E_NOTFOUND;
+    }
+    state_ = State::kPlaying;
+    if (!active_song_index_) {
+      active_song_index_ = static_cast<int>(active_playlist_->songs.size()) - 1;
+    } else {
+      --active_song_index_;
+    }
+    song_to_play = active_playlist_->songs[active_song_index_].get();
   }
-  media_player_->Play(active_playlist_->songs[active_song_index_].get());
-  OnStateChanged();
+  media_player_->Play(song_to_play);
+  OnStateChanged(State::kPlaying);
   return X_E_SUCCESS;
 }
 
-void XmpApp::OnStateChanged() {
-  kernel_state_->BroadcastNotification(kMsgStateChanged, static_cast<uint32_t>(state_));
+void XmpApp::OnStateChanged(State state) {
+  kernel_state_->BroadcastNotification(kMsgStateChanged, static_cast<uint32_t>(state));
 }
 
 XmpApp::Song* XmpApp::OnSongEndedNaturally() {
-  // A concurrent XMPStop()/XMPDeleteTitlePlaylist() may have already cleared
-  // this out from under us by the time the worker thread got here - nothing
-  // to advance.
-  if (!active_playlist_ || active_playlist_->songs.empty()) {
-    return nullptr;
+  Song* next_song = nullptr;
+  State state;
+  bool has_next = false;
+  {
+    std::lock_guard<std::mutex> lock(playback_state_mutex_);
+    // A concurrent XMPStop()/XMPDeleteTitlePlaylist() may have already
+    // cleared this out from under us by the time the worker thread got
+    // here - nothing to advance.
+    if (!active_playlist_ || active_playlist_->songs.empty()) {
+      return nullptr;
+    }
+
+    const size_t next_index = static_cast<size_t>(active_song_index_) + 1;
+    if (next_index < active_playlist_->songs.size()) {
+      active_song_index_ = static_cast<int>(next_index);
+      has_next = true;
+    } else if (repeat_mode_ == RepeatMode::kPlaylist) {
+      active_song_index_ = 0;
+      has_next = true;
+    } else {
+      state_ = State::kIdle;
+    }
+    if (has_next) {
+      next_song = active_playlist_->songs[active_song_index_].get();
+    }
+    state = state_;
   }
 
-  const size_t next_index = static_cast<size_t>(active_song_index_) + 1;
-  if (next_index < active_playlist_->songs.size()) {
-    active_song_index_ = static_cast<int>(next_index);
-  } else if (repeat_mode_ == RepeatMode::kPlaylist) {
-    active_song_index_ = 0;
-  } else {
-    state_ = State::kIdle;
-    OnStateChanged();
-    return nullptr;
-  }
-
-  OnStateChanged();
-  return active_playlist_->songs[active_song_index_].get();
+  OnStateChanged(state);
+  return next_song;
 }
 
 X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
@@ -323,7 +394,12 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       REXKRNL_DEBUG("XMPSetPlaybackBehavior({:08X}, {:08X}, {:08X})", uint32_t(args->playback_mode),
                     uint32_t(args->repeat_mode), uint32_t(args->flags));
       playback_mode_ = static_cast<PlaybackMode>(uint32_t(args->playback_mode));
-      repeat_mode_ = static_cast<RepeatMode>(uint32_t(args->repeat_mode));
+      {
+        // repeat_mode_ is read unsynchronized off the worker thread inside
+        // OnSongEndedNaturally() - see playback_state_mutex_'s comment.
+        std::lock_guard<std::mutex> lock(playback_state_mutex_);
+        repeat_mode_ = static_cast<RepeatMode>(uint32_t(args->repeat_mode));
+      }
       unknown_flags_ = args->flags;
       kernel_state_->BroadcastNotification(kMsgPlaybackBehaviorChanged, 0);
       return X_E_SUCCESS;
@@ -436,10 +512,14 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       // reporting its last song as "current" forever. state_ == kPaused
       // still reports correctly, matching xenia (Pause() doesn't clear
       // active_song_ there either).
-      if (!active_playlist_ || state_ == State::kIdle) {
-        return X_E_FAIL;
+      Song* song;
+      {
+        std::lock_guard<std::mutex> lock(playback_state_mutex_);
+        if (!active_playlist_ || state_ == State::kIdle) {
+          return X_E_FAIL;
+        }
+        song = active_playlist_->songs[active_song_index_].get();
       }
-      auto& song = active_playlist_->songs[active_song_index_];
       std::memset(info, 0, sizeof(SongInfo));
       info->handle = song->handle;
       memory::store_and_swap<std::u16string>(info->title, song->name);
