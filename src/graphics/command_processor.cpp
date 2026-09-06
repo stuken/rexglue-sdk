@@ -1243,6 +1243,12 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
 void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
   SCOPE_profile_cpu_f("gpu");
 
+  if (count == 0) {
+    // Rare, but it happens - an empty indirect buffer would otherwise cause
+    // a divide-by-zero in RingBuffer's offset arithmetic (capacity == 0).
+    return;
+  }
+
   // Execute commands!
   memory::RingBuffer reader(memory_->TranslatePhysical(ptr), count * sizeof(uint32_t));
   reader.set_write_offset(count * sizeof(uint32_t));
@@ -1821,7 +1827,18 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* re
   auto endianness = static_cast<xenos::Endian>(address & 0x3);
   address &= ~0x3;
   data_value = GpuSwap(data_value, endianness);
-  memory::store(memory_->TranslatePhysical(address), data_value);
+  uint8_t* write_destination = memory_->TranslatePhysical(address);
+  if (address > 0x1FFFFFFF) {
+    uint32_t writeback_base = register_file_->values[XE_GPU_REG_WRITEBACK_START];
+    uint32_t writeback_size = register_file_->values[XE_GPU_REG_WRITEBACK_SIZE];
+    uint32_t writeback_offset = address - writeback_base;
+    // Check whether the guest has written the writeback base. If they
+    // haven't, skip the offset check and fall back to the physical alias.
+    if (writeback_base != 0 && writeback_offset < writeback_size) {
+      write_destination = memory_->TranslateVirtual(0x7F000000 + writeback_offset);
+    }
+  }
+  memory::store(write_destination, data_value);
   return true;
 }
 
