@@ -41,7 +41,25 @@ XmpApp::XmpApp(KernelState* kernel_state)
   media_player_->SetSongEndedCallback([this] { return OnSongEndedNaturally(); });
 }
 
-XmpApp::~XmpApp() = default;
+XmpApp::~XmpApp() {
+  // media_player_ hasn't been destroyed yet here - member destruction only
+  // starts once this body returns (it's declared last in the class, so it
+  // would destruct first, but that's still after this runs) - so Stop() is
+  // safe to call and guarantees its worker thread is no longer touching a
+  // Song owned by one of the playlists freed below.
+  media_player_->Stop();
+
+  // playlists_ stores raw pointers rather than unique_ptr (see
+  // XMPDeleteTitlePlaylist, which manually deletes on removal), so anything
+  // a title never explicitly deleted - the common case, since most titles
+  // just exit without cleaning up - would otherwise leak for the rest of the
+  // process's lifetime instead of being freed here.
+  auto global_lock = global_critical_region_.Acquire();
+  for (auto& entry : playlists_) {
+    delete entry.second;
+  }
+  playlists_.clear();
+}
 
 X_HRESULT XmpApp::XMPGetStatus(uint32_t state_ptr) {
   if (!XThread::GetCurrentThread()->main_thread()) {
@@ -120,8 +138,12 @@ X_HRESULT XmpApp::XMPDeleteTitlePlaylist(uint32_t playlist_handle) {
   auto global_lock = global_critical_region_.Acquire();
   auto it = playlists_.find(playlist_handle);
   if (it == playlists_.end()) {
-    REXKRNL_ERROR("Playlist {:08X} not found", playlist_handle);
-    return X_E_NOTFOUND;
+    // Matches xenia: the underlying playlist store there
+    // (AudioMediaPlayer::RemovePlaylist) silently no-ops on an unknown
+    // handle rather than surfacing an error to the title, so this doesn't
+    // return X_E_NOTFOUND either.
+    REXKRNL_WARN("XMPDeleteTitlePlaylist: playlist {:08X} not found - ignoring", playlist_handle);
+    return X_E_SUCCESS;
   }
   auto playlist = it->second;
   bool is_active;
@@ -213,7 +235,19 @@ X_HRESULT XmpApp::XMPStop(uint32_t unk) {
   media_player_->Stop();
   {
     std::lock_guard<std::mutex> lock(playback_state_mutex_);
-    active_playlist_ = nullptr;  // ?
+    // Required, not just a state reset: XMPDeleteTitlePlaylist calls this
+    // when deleting the currently-active playlist, then frees it right
+    // after. If active_playlist_ weren't cleared here it would be left
+    // dangling by that delete - xenia's own AudioMediaPlayer::RemovePlaylist
+    // has exactly this bug (it calls Stop(), which never touches
+    // active_playlist_ there either, then erases the playlist anyway,
+    // leaving active_playlist_ pointing at freed memory). One consequence
+    // of clearing it here: XMPNext()/XMPPrevious() called after XMPStop()
+    // with no intervening XMPPlayTitlePlaylist now return X_E_NOTFOUND
+    // instead of resuming the stopped playlist, which is the safer read of
+    // "stop means stopped" absent real-hardware behavior to confirm either
+    // way.
+    active_playlist_ = nullptr;
     active_song_index_ = 0;
     state_ = State::kIdle;
   }
@@ -468,8 +502,9 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
         playlist_name = memory::load_and_swap<std::u16string>(
             memory_->TranslateVirtual(args->playlist_name_ptr));
       }
-      // dummy_alloc_ptr is the result of a XamAlloc of storage_size.
-      assert_true(uint32_t(args->storage_size) == 4 + uint32_t(args->song_count) * 128);
+      // dummy_alloc_ptr is the result of a XamAlloc of storage_size, sized by
+      // case 0x0007002E above - kept in sync with that formula.
+      assert_true(uint32_t(args->storage_size) == uint32_t(args->song_count) * 0x3E8 + 0x88);
       return XMPCreateTitlePlaylist(args->songs_ptr, args->song_count, args->playlist_name_ptr,
                                     playlist_name, args->flags, args->song_handles_ptr,
                                     args->storage_ptr);
@@ -555,21 +590,28 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       }* args = memory_->TranslateVirtual<decltype(args)>(buffer_ptr);
       static_assert_size(decltype(*args), 12);
 
+      // PlaybackController values: Game=0, User=1, Dash=2, MCE=3, Restore=4.
+      const bool is_restore = args->xmp_client == 0x00000002 && args->controller == 0x00000004;
       assert_true((args->xmp_client == 0x00000002 && args->controller == 0x00000000) ||
-                  (args->xmp_client == 0x00000000 && args->controller == 0x00000001));
+                  (args->xmp_client == 0x00000000 && args->controller == 0x00000001) || is_restore);
       REXKRNL_DEBUG("XMPSetPlaybackController({:08X}, {:08X})", uint32_t(args->controller),
                     uint32_t(args->controller_locked));
 
       // xmp_client==Game(2) && controller==Game(0) means the title is
       // claiming playback control (what a game does before playing its own
       // title playlist); xmp_client==Dash(0) && controller==User(1) means
-      // the system dashboard is - those are the only two combinations the
-      // assert above allows. This directly gates XMPPlayTitlePlaylist below
-      // (it silently no-ops while playback_client_ == kSystem), so reading
-      // the wrong field here (as this used to, by misreading the third field
-      // - actually a "locked" bool, not a client id - as if it were one)
+      // the system dashboard is; xmp_client==Game(2) && controller==Restore(4)
+      // means the title is handing control back to itself after previously
+      // ceding it (xenia's XMPRestoreBackgroundMusic case, forced to Game/
+      // Game there too) - those are the only three combinations the assert
+      // above allows. This directly gates XMPPlayTitlePlaylist below (it
+      // silently no-ops while playback_client_ == kSystem), so reading the
+      // wrong field here (as this used to, by misreading the third field -
+      // actually a "locked" bool, not a client id - as if it were one)
       // silently blocked all title-driven playback whenever a title claimed
       // control this way, which XMP custom-soundtrack titles routinely do.
+      // is_restore implies xmp_client==Game already, so this reduces to the
+      // same client check either way - kept for symmetry with the assert.
       playback_client_ =
           args->xmp_client == 0x00000002 ? PlaybackClient::kTitle : PlaybackClient::kSystem;
       kernel_state_->BroadcastNotification(kMsgPlaybackControllerChanged,
@@ -698,10 +740,22 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       }* args = memory_->TranslateVirtual<decltype(args)>(buffer_ptr);
       static_assert_size(decltype(*args), 12);
 
-      assert_true(args->xmp_client == 0x00000002 || args->xmp_client == 0x00000000);
-      // We don't use the storage, so just fudge the number.
-      memory::store_and_swap<uint32_t>(memory_->TranslateVirtual(args->size_ptr),
-                                       4 + uint32_t(args->song_count) * 128);
+      // Matches xenia's XMPGetTitlePlaylistBufferSize exactly: a HUD client
+      // or a zero size_ptr/song_count is rejected outright, and only
+      // Dash/Game clients get a nonzero size back - other clients
+      // (Remote/MusicPlayer/MSAL/MCE) get 0, same as there. We don't use the
+      // storage ourselves, so the number just has to agree with the
+      // storage_size assert in case 0x0007000D below; kept identical to
+      // xenia's formula anyway rather than an arbitrary smaller one, in case
+      // some title's own internal bookkeeping for this buffer assumes it.
+      if (args->xmp_client == 0x00000001 /* HUD */ || !args->size_ptr || !args->song_count) {
+        return X_E_INVALIDARG;
+      }
+      uint32_t size = 0;
+      if (args->xmp_client == 0x00000000 /* Dash */ || args->xmp_client == 0x00000002 /* Game */) {
+        size = uint32_t(args->song_count) * 0x3E8 + 0x88;
+      }
+      memory::store_and_swap<uint32_t>(memory_->TranslateVirtual(args->size_ptr), size);
       return X_E_SUCCESS;
     }
     case 0x0007002F: {

@@ -31,6 +31,7 @@
 #include <chrono>
 #include <thread>
 
+#include <rex/kernel/xam/apps/xmp_app.h>
 #include <rex/system/flags.h>
 #include <rex/system/guest_path.h>
 #include <rex/system/user_module.h>
@@ -1134,6 +1135,29 @@ void KernelState::RegisterNotifyListener(XNotifyListener* listener) {
     // XN_SYS_INPUTDEVICECONFIGCHANGED x2
     listener->EnqueueNotification(0x00000013, 0);
     listener->EnqueueNotification(0x00000013, 0);
+  }
+
+  // kXNotifyLive = 0x00000002.
+  if (!has_notified_live_startup_ && listener->mask() & 0x00000002) {
+    has_notified_live_startup_ = true;
+    // XN_LIVE_CONNECTIONCHANGED (X_ONLINE_S_LOGON_DISCONNECTED)
+    listener->EnqueueNotification(0x02000001, 0x001510F1L);
+    // XN_LIVE_LINK_STATE_CHANGED
+    listener->EnqueueNotification(0x02000003, 0);
+  }
+
+  // kXNotifyXmp = 0x00000020. Playback state itself is idle until the media
+  // player broadcasts a transition of its own, so only the controller is
+  // worth priming here - see XmpApp::IsTitleInPlaybackControl().
+  if (!has_notified_xmp_startup_ && listener->mask() & 0x00000020) {
+    has_notified_xmp_startup_ = true;
+    auto* xmp_app =
+        static_cast<rex::kernel::xam::apps::XmpApp*>(app_manager_->LookupApp(0xFA));
+    // XN_XMP_PLAYBACK_CONTROLLER_CHANGED. XmpApp defaults to kTitle control
+    // (see its constructor), so this is the safe fallback if the app isn't
+    // registered yet for whatever reason.
+    const bool title_in_control = xmp_app ? xmp_app->IsTitleInPlaybackControl() : true;
+    listener->EnqueueNotification(0x0A000003, title_in_control);
   }
 }
 

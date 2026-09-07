@@ -101,6 +101,16 @@ class XmpApp : public system::xam::App {
   // XMPSetVolume export) rather than through a dispatched XMP message.
   rex::audio::AudioMediaPlayer* media_player() const { return media_player_.get(); }
 
+  // Whether the title (rather than the system dashboard) currently controls
+  // XMP playback - mirrors xenia's AudioMediaPlayer::IsTitleInPlaybackControl,
+  // minus the xmp_override_/is_title_rendering_enabled_ inputs xenia folds in
+  // there, which this port doesn't track. Used by
+  // KernelState::RegisterNotifyListener to prime a new kXNotifyXmp-masked
+  // listener with the current controller state, same as xenia does on
+  // startup, so a title doesn't have to wait for an explicit
+  // XMPSetPlaybackController call to find out who's currently in control.
+  bool IsTitleInPlaybackControl() const { return playback_client_ == PlaybackClient::kTitle; }
+
  private:
   static const uint32_t kMsgStateChanged = 0x0A000001;
   static const uint32_t kMsgPlaybackBehaviorChanged = 0x0A000002;
