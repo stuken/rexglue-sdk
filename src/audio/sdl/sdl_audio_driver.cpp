@@ -18,6 +18,7 @@
 #include <rex/audio/downmix.h>
 #include <rex/audio/flags.h>
 #include <rex/audio/sdl/sdl_audio_driver.h>
+#include <rex/chrono/clock.h>
 #include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/logging.h>
@@ -153,6 +154,24 @@ void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
     std::unique_lock<std::mutex> guard(frames_mutex_);
     frames_queued_.push(output_frame);
     PROFILE_BUFFER_QUEUE_DEPTH(static_cast<int64_t>(frames_queued_.size()));
+  }
+
+  // Keep playback speed/pitch in sync with the guest clock (fast-forward/
+  // slow-motion), same intent as xenia's XAudio2 driver calling
+  // SetFrequencyRatio on every submit. Without this, only how *often* frames
+  // are pumped scales with guest_time_scalar (see AudioSystem::
+  // WorkerThreadMain) - each frame still represents a fixed 48kHz-real-time
+  // duration consumed by the device at normal wall-clock speed, so the
+  // per-client semaphore's backpressure would throttle the guest back down
+  // to real-time audio speed instead of actually speeding up/slowing down
+  // the audio to match.
+  if (sdl_stream_) {
+    const double scalar = rex::chrono::Clock::guest_time_scalar();
+    float ratio = scalar > 0.0 ? static_cast<float>(scalar) : 1.0f;
+    ratio = std::clamp(ratio, 0.01f, 100.0f);
+    if (!SDL_SetAudioStreamFrequencyRatio(sdl_stream_, ratio)) {
+      REXAPU_WARN("SDL_SetAudioStreamFrequencyRatio() failed: {}", SDL_GetError());
+    }
   }
 }
 

@@ -98,6 +98,16 @@ bool XmaContext::Work() {
   }
 
   std::lock_guard<std::mutex> lock(lock_);
+  // Re-check now that the lock is held. WriteRegister's inline decode on a
+  // Kick and the background sweep thread (XmaDecoder::WorkerThreadMain) can
+  // both call Work() on the same context concurrently, and both may pass
+  // the check above before either acquires lock_ - whichever gets the lock
+  // first decodes and clears is_enabled_; without this re-check, the other
+  // would still run the full decode body a second time once the lock frees
+  // up, double-consuming this context's input for a single kick.
+  if (!is_allocated() || !is_enabled()) {
+    return false;
+  }
   set_is_enabled(false);
 
   auto context_ptr = memory()->TranslateVirtual(guest_ptr());
@@ -133,17 +143,45 @@ bool XmaContext::Work() {
   }
 
   while (remaining_subframe_blocks_in_output_buffer_ >= minimum_subframe_decode_count) {
+    const uint32_t pre_decode_offset = data.input_buffer_read_offset;
+    const uint8_t pre_remaining_subframes = current_frame_remaining_subframes_;
+
     Decode(&data);
     Consume(&output_rb, &data);
 
-    if (!data.IsAnyInputBufferValid() || data.error_status == 4) {
+    // Don't abandon a partially consumed frame. Consume() hands over at most
+    // subframe_decode_count blocks per pass, so the pass that exhausts the
+    // input typically leaves the rest of the frame undelivered. Work() has
+    // already cleared is_enabled_ and only XMAEnableContext sets it again,
+    // so if we stop here the remainder is never delivered - keep draining
+    // until the frame is out.
+    if ((!data.IsAnyInputBufferValid() || data.error_status == 4) &&
+        current_frame_remaining_subframes_ == 0) {
+      break;
+    }
+
+    // If Decode() made no progress (read offset unchanged, no new frame) and
+    // there were no pending subframes to drain, we can't make further
+    // progress this pass - break to avoid spinning forever.
+    if (pre_remaining_subframes == 0 && data.input_buffer_read_offset == pre_decode_offset &&
+        current_frame_remaining_subframes_ == 0) {
       break;
     }
   }
 
-  data.output_buffer_write_offset = output_rb.write_offset() / kOutputBytesPerBlock;
+  if (initial_data.IsAnyInputBufferValid()) {
+    data.output_buffer_write_offset = output_rb.write_offset() / kOutputBytesPerBlock;
+  } else {
+    // NFS: Carbon and NFS: Most Wanted use write_offset as a stall detector -
+    // keep it equal to read_offset when starved on input.
+    if (data.output_buffer_write_offset != data.output_buffer_read_offset) {
+      data.output_buffer_write_offset = data.output_buffer_read_offset;
+      data.output_buffer_valid = 0;
+    }
+  }
 
-  if (output_rb.empty()) {
+  // Signal the game that the output buffer is full.
+  if (remaining_subframe_blocks_in_output_buffer_ == 0 && output_rb.empty()) {
     data.output_buffer_valid = 0;
   }
 
@@ -345,7 +383,17 @@ uint32_t XmaContext::GetNextPacketReadOffset(uint8_t* buffer, uint32_t next_pack
     if (packet_frame_offset <= kMaxFrameSizeinBits) {
       return (next_packet_index * kBitsPerPacket) + packet_frame_offset;
     }
-    next_packet_index++;
+
+    // No frame *starts* in this packet - it's entirely the continuation of a
+    // frame split across the packet boundary. Follow this packet's own skip
+    // count to the next packet of the same sub-stream, rather than just
+    // checking the next sequential packet, which may belong to a different
+    // interleaved sub-stream and misidentify its data as ours.
+    const uint8_t next_skip = xma::GetPacketSkipCount(next_packet);
+    if (next_skip == 0xFF) {
+      break;
+    }
+    next_packet_index += next_skip + 1;
   }
 
   return kBitsPerPacketHeader;

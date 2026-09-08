@@ -12,6 +12,7 @@
 #pragma once
 
 #include <atomic>
+#include <mutex>
 
 #include <rex/kernel.h>
 #include <rex/memory.h>
@@ -95,14 +96,20 @@ class AudioSystem : public system::IAudioSystem {
   rex::thread::global_critical_region global_critical_region_;
   static const size_t kMaximumClientCount = 8;
   struct {
-    AudioDriver* driver;
+    AudioDriver* driver = nullptr;
     // Microsecond timestamp (steady_clock epoch) this client is next due to
     // be pumped; see kAudioPumpInterval.
-    uint64_t next_pump_us;
-    uint32_t callback;
-    uint32_t callback_arg;
-    uint32_t wrapped_callback_arg;
-    bool in_use;
+    uint64_t next_pump_us = 0;
+    uint32_t callback = 0;
+    uint32_t callback_arg = 0;
+    uint32_t wrapped_callback_arg = 0;
+    bool in_use = false;
+    // Guards this client's driver/in_use pair against WorkerThreadMain's
+    // guest-callback dispatch racing UnregisterClient's teardown. Default
+    // member initializers above replace the array's old
+    // std::memset(..., 0, ...) zeroing, which would have clobbered this
+    // mutex's already-constructed internal state.
+    std::mutex lock;
   } clients_[kMaximumClientCount];
 
   int FindFreeClient();

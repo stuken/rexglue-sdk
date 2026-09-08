@@ -49,7 +49,9 @@ AudioSystem::AudioSystem(runtime::FunctionDispatcher* function_dispatcher)
     : memory_(function_dispatcher->memory()),
       function_dispatcher_(function_dispatcher),
       worker_running_(false) {
-  std::memset(clients_, 0, sizeof(clients_));
+  // clients_ entries are zeroed via default member initializers (see
+  // audio_system.h) rather than memset, since a std::mutex member can't be
+  // safely memset once constructed.
 
   for (size_t i = 0; i < kMaximumClientCount; ++i) {
     client_semaphores_[i] = rex::thread::Semaphore::Create(0, kMaximumQueuedFrames);
@@ -186,6 +188,15 @@ void AudioSystem::WorkerThreadMain() {
     if (client_callback &&
         rex::thread::Wait(client_semaphores_[client_index].get(), false,
                           std::chrono::milliseconds(0)) == rex::thread::WaitResult::kSuccess) {
+      // Held across the dispatch below so UnregisterClient can't free this
+      // client's driver/guest callback-arg buffer out from under an
+      // in-flight guest callback.
+      std::lock_guard<std::mutex> client_guard(clients_[client_index].lock);
+      if (clients_[client_index].driver == nullptr) {
+        // Unregistered concurrently between the scan above and here.
+        continue;
+      }
+
       if (diag_pump_count < 10) {
         REXAPU_DEBUG("AudioWorker: dispatching callback {:08X} with arg {:08X} for client {}",
                      client_callback, client_callback_arg, client_index);
@@ -254,7 +265,11 @@ void AudioSystem::Shutdown() {
       if (clients_[i].wrapped_callback_arg) {
         memory()->SystemHeapFree(clients_[i].wrapped_callback_arg);
       }
-      clients_[i] = {};
+      clients_[i].driver = nullptr;
+      clients_[i].callback = 0;
+      clients_[i].callback_arg = 0;
+      clients_[i].wrapped_callback_arg = 0;
+      clients_[i].in_use = false;
     }
   }
 }
@@ -283,7 +298,6 @@ X_STATUS AudioSystem::RegisterClient(uint32_t callback, uint32_t callback_arg, s
   uint32_t ptr = memory()->SystemHeapAlloc(0x4);
   memory::store_and_swap<uint32_t>(memory()->TranslateVirtual(ptr), callback_arg);
 
-  clients_[index] = {};
   clients_[index].driver = driver;
   clients_[index].callback = callback;
   clients_[index].callback_arg = callback_arg;
@@ -312,7 +326,26 @@ void AudioSystem::SubmitFrame(size_t index, uint32_t samples_ptr) {
 
   auto global_lock = global_critical_region_.Acquire();
   assert_true(index < kMaximumClientCount);
-  assert_true(clients_[index].driver != NULL);
+  // Deliberately does NOT take clients_[index].lock: SubmitFrame is called
+  // synchronously and reentrantly from within the guest callback that
+  // WorkerThreadMain dispatches while holding that same per-client mutex
+  // (game code renders audio, then calls back into
+  // XAudioSubmitRenderDriverFrame -> here, on the worker thread, before that
+  // dispatch call returns). Taking the lock here would deadlock (or, on a
+  // non-recursive std::mutex, throw). global_critical_region_ alone is
+  // sufficient to serialize this against UnregisterClient, since neither
+  // WorkerThreadMain's dispatch nor this reentrant call holds it at the same
+  // time as UnregisterClient does.
+  if (index >= kMaximumClientCount || !clients_[index].in_use || clients_[index].driver == nullptr) {
+    // Guest called back into an already-unregistered (or never-registered)
+    // client - degrade gracefully instead of dereferencing a null driver,
+    // which previously only worked because assert_true is a no-op in
+    // release builds.
+    REXAPU_WARN(
+        "AudioSystem::SubmitFrame: called for invalid/unregistered client index {} (in_use={})",
+        index, index < kMaximumClientCount ? clients_[index].in_use : false);
+    return;
+  }
   (clients_[index].driver)->SubmitFrame(samples_ptr);
 }
 
@@ -331,11 +364,28 @@ void AudioSystem::DestroyStandaloneDriver(AudioDriver* driver) {
 void AudioSystem::UnregisterClient(size_t index) {
   SCOPE_profile_cpu_f("apu");
 
-  auto global_lock = global_critical_region_.Acquire();
   assert_true(index < kMaximumClientCount);
+
+  // Acquire the per-client lock BEFORE global_critical_region_ - the reverse
+  // of a naive ordering - so this never blocks on clients_[index].lock (held
+  // by WorkerThreadMain for the full duration of an in-flight guest
+  // callback) while holding global_critical_region_. global_critical_region_
+  // guards broad kernel state, and the guest callback can itself need it
+  // internally (e.g. via KeWaitForSingleObject/KeSetEvent); holding it here
+  // while waiting on the client lock would be a lock-order inversion against
+  // that path - WorkerThreadMain's dispatch never holds
+  // global_critical_region_ while holding this per-client lock, so this
+  // ordering can't invert against it.
+  std::lock_guard<std::mutex> client_guard(clients_[index].lock);
+  auto global_lock = global_critical_region_.Acquire();
+
   DestroyDriver(clients_[index].driver);
   memory()->SystemHeapFree(clients_[index].wrapped_callback_arg);
-  clients_[index] = {};
+  clients_[index].driver = nullptr;
+  clients_[index].callback = 0;
+  clients_[index].callback_arg = 0;
+  clients_[index].wrapped_callback_arg = 0;
+  clients_[index].in_use = false;
 
   // Drain the semaphore of its count.
   auto client_semaphore = client_semaphores_[index].get();
