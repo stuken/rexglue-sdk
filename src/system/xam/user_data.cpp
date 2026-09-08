@@ -11,8 +11,10 @@
 #include <rex/system/xam/user_data.h>
 
 #include <algorithm>
+#include <optional>
 
 #include <rex/assert.h>
+#include <rex/logging.h>
 #include <rex/memory/utils.h>
 
 namespace rex {
@@ -24,11 +26,56 @@ namespace {
 uint32_t U16BytesWithTerminator(size_t char_count) {
   return static_cast<uint32_t>((char_count + 1) * sizeof(char16_t));
 }
+
+// The UserDataTypes variant index that a given X_USER_DATA_TYPE requires -
+// mirrors UserDataTypes' <uint32_t, int32_t, float, int64_t, double,
+// u16string, vector<uint8_t>> alternative order. DATETIME and INT64 share
+// the int64_t alternative since the wire only distinguishes them by tag.
+std::optional<size_t> ExpectedVariantIndex(X_USER_DATA_TYPE type) {
+  switch (type) {
+    case X_USER_DATA_TYPE::CONTEXT:
+      return 0;
+    case X_USER_DATA_TYPE::INT32:
+      return 1;
+    case X_USER_DATA_TYPE::FLOAT:
+      return 2;
+    case X_USER_DATA_TYPE::INT64:
+    case X_USER_DATA_TYPE::DATETIME:
+      return 3;
+    case X_USER_DATA_TYPE::DOUBLE:
+      return 4;
+    case X_USER_DATA_TYPE::WSTRING:
+      return 5;
+    case X_USER_DATA_TYPE::BINARY:
+      return 6;
+    default:
+      return std::nullopt;
+  }
+}
 }  // namespace
 
 UserData::UserData(X_USER_DATA_TYPE data_type, const UserDataTypes& value) {
   wire_ = {};
   wire_.type = data_type;
+
+  // data_type is usually derived from the setting id's encoded AttributeKey
+  // bits (see UserSettingId::get_type), while value's held alternative comes
+  // from whatever the caller actually had on hand (e.g. the wire-declared
+  // data.type for a guest XamUserWriteProfileSettings call). These can
+  // disagree for ids that aren't AttributeKey-shaped, such as raw
+  // context/property ids a title sends with X_USER_DATA_TYPE::CONTEXT. A
+  // mismatch used to reach std::get<T>(value) below and throw
+  // std::bad_variant_access, crashing the whole process on guest-controlled
+  // input - treat it as an invalid setting instead.
+  const auto expected_index = ExpectedVariantIndex(data_type);
+  if (!expected_index || value.index() != *expected_index) {
+    REXSYS_ERROR(
+        "UserData: declared type {} doesn't match the supplied value (variant index {}) - "
+        "ignoring setting",
+        static_cast<uint32_t>(data_type), value.index());
+    wire_.type = X_USER_DATA_TYPE::UNSET;
+    return;
+  }
 
   switch (data_type) {
     case X_USER_DATA_TYPE::BINARY: {
