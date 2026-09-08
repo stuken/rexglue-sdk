@@ -1413,24 +1413,19 @@ std::optional<JumpTable> detectJumpTable(DecodedBinary& decoded, uint32_t bctrAd
   uint8_t ctrSourceReg = 0xFF;
   uint32_t tableAddr = 0;
   uint32_t baseAddr = 0;
-  // Pending address parts (order of lis/addi varies in backward scan)
-  // Note: addi uses sign-extended addition, ori uses OR
-  uint32_t pendingTableLo = 0, pendingTableHi = 0;
-  uint32_t pendingBaseLo = 0, pendingBaseHi = 0;
-  bool hasPendingTableLo = false, hasPendingTableHi = false;
-  bool hasPendingBaseLo = false, hasPendingBaseHi = false;
-  bool pendingTableLoIsAddi = false, pendingBaseLoIsAddi = false;
-
-  // Helper to combine lis high bits with addi/ori low bits
-  auto combineHiLo = [](uint32_t hi, uint32_t lo, bool isAddi) -> uint32_t {
-    if (isAddi) {
-      // addi: sign-extend lo and add
-      return hi + static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(lo)));
-    } else {
-      // ori: zero-extend and OR
-      return hi | lo;
-    }
-  };
+  // Address-chain tracking: the constant address isn't always built by a single lis+addi
+  // pair - the compiler may relay it through an intermediate register first, e.g.
+  // "lis r9,HI; addi r11,r9,LO1; addi r7,r11,LO2" (two chained addi's before the register
+  // that's actually used as the table/base address). tableAddrChainReg/baseAddrChainReg is
+  // the register whose definition we still need in order to keep resolving the address;
+  // *LoAccum is the signed sum of every addi immediate seen so far in that chain, which a
+  // lis discovered further back completes in one step regardless of how many hops it took.
+  uint8_t tableAddrChainReg = 0xFF;
+  int64_t tableAddrLoAccum = 0;
+  bool tableAddrChainIsAddi = true;  // false once started from an ori - chain must end at the next lis
+  uint8_t baseAddrChainReg = 0xFF;
+  int64_t baseAddrLoAccum = 0;
+  bool baseAddrChainIsAddi = true;
   JumpTableType tableType = JumpTableType::kAbsolute;
   uint8_t indexReg = 0xFF;       // Current reg being traced (0xFF = stop tracing)
   uint8_t finalIndexReg = 0xFF;  // Last valid indexReg for scanForBounds/output
@@ -1610,15 +1605,19 @@ std::optional<JumpTable> detectJumpTable(DecodedBinary& decoded, uint32_t bctrAd
           uint8_t me = insn->M.ME;
           // Check for slwi pattern: SH>0, MB=0, ME=31-SH
           if (sh > 0 && mb == 0 && me == (31 - sh)) {
+            // Record the shift regardless of whether it writes back in place - it's also the
+            // scale used to turn the raw index into a table byte-address (read stride below),
+            // which is present whenever the index is scaled at all, not just when the scale
+            // happens to overwrite its own source register.
+            indexShiftAmount = sh;
             // If the shift writes back into the same register it read from, the register no
-            // longer holds the raw switch value at bctr - record the shift so the emitted
-            // switch can compensate instead of comparing a scaled value against raw case labels.
-            // The register is now fully resolved (identity + shift): stop tracing it, since an
-            // earlier instruction that also happens to write this register number (e.g. the
-            // load that produced the raw pre-scale value) is not a clobber of what we captured.
+            // longer holds the raw switch value at bctr - the emitted switch must compensate
+            // instead of comparing a scaled value against raw case labels. The register is now
+            // fully resolved (identity + shift): stop tracing it, since an earlier instruction
+            // that also happens to write this register number (e.g. the load that produced the
+            // raw pre-scale value) is not a clobber of what we captured.
             if (insn->M.RA == insn->M.RS) {
               indexScaledInPlace = true;
-              indexShiftAmount = sh;
               indexResolved = true;
             }
             indexReg = insn->M.RS;
@@ -1652,9 +1651,11 @@ std::optional<JumpTable> detectJumpTable(DecodedBinary& decoded, uint32_t bctrAd
           uint8_t mb = insn->M.MB;
           uint8_t me = insn->M.ME;
           if (sh > 0 && mb == 0 && me == (31 - sh)) {
+            // See the mirrored comment in the main indexReg trace above: record the scale
+            // regardless of in-place-ness, since it's also the table-address byte stride.
+            tableCandShiftAmount = sh;
             if (insn->M.RA == insn->M.RS) {
               tableCandScaledInPlace = true;
-              tableCandShiftAmount = sh;
               tableCandResolved = true;
             }
             finalTableCandReg = insn->M.RS;
@@ -1680,14 +1681,21 @@ std::optional<JumpTable> detectJumpTable(DecodedBinary& decoded, uint32_t bctrAd
             "detectJumpTable: bctr=0x{:08X} found lis at 0x{:08X} hi=0x{:08X} foundLoad={}",
             bctrAddr, scanAddr, hi, foundLoad);
         if (foundLoad) {
-          if (tableAddrDestReg == 0xFF) {
-            tableAddrDestReg = static_cast<uint8_t>(insn->D.RT);
-          }
-          // After load: this is tableAddr (only capture first complete address)
           if (tableAddr == 0) {
-            tableAddr =
-                hasPendingTableLo ? combineHiLo(hi, pendingTableLo, pendingTableLoIsAddi) : hi;
-            hasPendingTableLo = false;
+            if (tableAddrChainReg == 0xFF) {
+              // No addi/ori chain seen yet: this lis is the whole address by itself (e.g. a
+              // table aligned so the low 16 bits are zero).
+              if (tableAddrDestReg == 0xFF) {
+                tableAddrDestReg = static_cast<uint8_t>(insn->D.RT);
+              }
+              if (insn->D.RT == tableAddrDestReg) {
+                tableAddr = hi;
+              }
+            } else if (insn->D.RT == tableAddrChainReg) {
+              // Completes the chain, however many addi hops preceded it.
+              tableAddr = static_cast<uint32_t>(static_cast<int64_t>(hi) + tableAddrLoAccum);
+              tableAddrChainReg = 0xFF;
+            }
             REXCODEGEN_TRACE("detectJumpTable: bctr=0x{:08X} set tableAddr=0x{:08X}", bctrAddr,
                              tableAddr);
           }
@@ -1695,8 +1703,13 @@ std::optional<JumpTable> detectJumpTable(DecodedBinary& decoded, uint32_t bctrAd
         } else {
           // Before load (between mtctr and load): this is baseAddr
           if (baseAddr == 0) {
-            baseAddr = hasPendingBaseLo ? combineHiLo(hi, pendingBaseLo, pendingBaseLoIsAddi) : hi;
-            hasPendingBaseLo = false;
+            if (baseAddrChainReg == 0xFF) {
+              // No addi/ori chain seen yet: this lis is the whole address by itself.
+              baseAddr = hi;
+            } else if (insn->D.RT == baseAddrChainReg) {
+              baseAddr = static_cast<uint32_t>(static_cast<int64_t>(hi) + baseAddrLoAccum);
+              baseAddrChainReg = 0xFF;
+            }
             REXCODEGEN_TRACE("detectJumpTable: bctr=0x{:08X} set baseAddr=0x{:08X}", bctrAddr,
                              baseAddr);
           }
@@ -1704,57 +1717,81 @@ std::optional<JumpTable> detectJumpTable(DecodedBinary& decoded, uint32_t bctrAd
         }
       }
 
-      // addi rD, rA, LO (ori also possible)
+      // addi rD, rA, LO (ori also possible) - may chain through an intermediate register
+      // before reaching the register actually used to form the table/base address, e.g.
+      // "lis r9,HI; addi r11,r9,LO1; addi r7,r11,LO2" (r11 is just a relay).
       if (insn->opcode == Opcode::addi || insn->opcode == Opcode::ori) {
         uint32_t lo = static_cast<uint16_t>(insn->D.d);
         bool isAddi = (insn->opcode == Opcode::addi);
+        int32_t signedLo = isAddi ? static_cast<int32_t>(static_cast<int16_t>(lo))
+                                   : static_cast<int32_t>(lo);
         REXCODEGEN_TRACE(
             "detectJumpTable: bctr=0x{:08X} found {} at 0x{:08X} lo=0x{:04X} foundLoad={}",
             bctrAddr, isAddi ? "addi" : "ori", scanAddr, lo, foundLoad);
         if (foundLoad) {
-          if (tableAddrDestReg == 0xFF) {
-            tableAddrDestReg = static_cast<uint8_t>(insn->D.RT);
-          }
-          // After load: this is tableAddr (only capture first complete address)
           if (tableAddr == 0) {
-            if (hasPendingTableHi) {
-              tableAddr = combineHiLo(pendingTableHi, lo, isAddi);
-              hasPendingTableHi = false;
-              REXCODEGEN_TRACE("detectJumpTable: bctr=0x{:08X} set tableAddr=0x{:08X} from pending",
-                               bctrAddr, tableAddr);
-            } else if (!hasPendingTableLo) {
-              pendingTableLo = lo;
-              pendingTableLoIsAddi = isAddi;
-              hasPendingTableLo = true;
-              REXCODEGEN_TRACE("detectJumpTable: bctr=0x{:08X} pending tableLo=0x{:04X}", bctrAddr,
-                               lo);
+            if (tableAddrChainReg == 0xFF) {
+              // Start of the chain - this must be the register that's actually combined with
+              // the index in the load (first addi/lis found scanning backward from it).
+              if (tableAddrDestReg == 0xFF) {
+                tableAddrDestReg = static_cast<uint8_t>(insn->D.RT);
+              }
+              if (insn->D.RT == tableAddrDestReg) {
+                tableAddrLoAccum = signedLo;
+                tableAddrChainIsAddi = isAddi;
+                tableAddrChainReg = static_cast<uint8_t>(insn->D.RA);
+                if (insn->D.RA == 0) {
+                  // addi rD,0,LO (== li) fully resolves the address with no lis needed.
+                  tableAddr = static_cast<uint32_t>(tableAddrLoAccum);
+                  tableAddrChainReg = 0xFF;
+                }
+              }
+            } else if (insn->D.RT == tableAddrChainReg) {
+              if (isAddi && tableAddrChainIsAddi) {
+                // Continue the chain through another relay register.
+                tableAddrLoAccum += signedLo;
+                tableAddrChainReg = static_cast<uint8_t>(insn->D.RA);
+                if (insn->D.RA == 0) {
+                  tableAddr = static_cast<uint32_t>(tableAddrLoAccum);
+                  tableAddrChainReg = 0xFF;
+                }
+              } else {
+                // A non-addi (or post-ori) write to the register we needed - can't safely
+                // combine further. Abandon the chain rather than compute a wrong address;
+                // tableAddr stays 0 so detection fails gracefully below.
+                tableAddrChainReg = 0xFF;
+              }
             }
-          } else if ((tableAddr & 0xFFFF) == 0) {
-            // tableAddr has only high bits, add low bits
-            tableAddr = combineHiLo(tableAddr, lo, isAddi);
-            REXCODEGEN_TRACE("detectJumpTable: bctr=0x{:08X} combined tableAddr=0x{:08X}", bctrAddr,
-                             tableAddr);
+            // else: writes some unrelated register - not part of the chain, ignore it.
+            REXCODEGEN_TRACE("detectJumpTable: bctr=0x{:08X} tableAddr chain reg=r{} accum=0x{:X}",
+                             bctrAddr, tableAddrChainReg, tableAddrLoAccum);
           }
           // Once tableAddr is fully set, ignore further addi instructions
         } else {
-          // Before load: this is baseAddr
+          // Before load: this is baseAddr, chained the same way as tableAddr above.
           if (baseAddr == 0) {
-            if (hasPendingBaseHi) {
-              baseAddr = combineHiLo(pendingBaseHi, lo, isAddi);
-              hasPendingBaseHi = false;
-              REXCODEGEN_TRACE("detectJumpTable: bctr=0x{:08X} set baseAddr=0x{:08X} from pending",
-                               bctrAddr, baseAddr);
-            } else if (!hasPendingBaseLo) {
-              pendingBaseLo = lo;
-              pendingBaseLoIsAddi = isAddi;
-              hasPendingBaseLo = true;
-              REXCODEGEN_TRACE("detectJumpTable: bctr=0x{:08X} pending baseLo=0x{:04X}", bctrAddr,
-                               lo);
+            if (baseAddrChainReg == 0xFF) {
+              baseAddrLoAccum = signedLo;
+              baseAddrChainIsAddi = isAddi;
+              baseAddrChainReg = static_cast<uint8_t>(insn->D.RA);
+              if (insn->D.RA == 0) {
+                baseAddr = static_cast<uint32_t>(baseAddrLoAccum);
+                baseAddrChainReg = 0xFF;
+              }
+            } else if (insn->D.RT == baseAddrChainReg) {
+              if (isAddi && baseAddrChainIsAddi) {
+                baseAddrLoAccum += signedLo;
+                baseAddrChainReg = static_cast<uint8_t>(insn->D.RA);
+                if (insn->D.RA == 0) {
+                  baseAddr = static_cast<uint32_t>(baseAddrLoAccum);
+                  baseAddrChainReg = 0xFF;
+                }
+              } else {
+                baseAddrChainReg = 0xFF;
+              }
             }
-          } else if ((baseAddr & 0xFFFF) == 0) {
-            baseAddr = combineHiLo(baseAddr, lo, isAddi);
-            REXCODEGEN_TRACE("detectJumpTable: bctr=0x{:08X} combined baseAddr=0x{:08X}", bctrAddr,
-                             baseAddr);
+            REXCODEGEN_TRACE("detectJumpTable: bctr=0x{:08X} baseAddr chain reg=r{} accum=0x{:X}",
+                             bctrAddr, baseAddrChainReg, baseAddrLoAccum);
           }
           // Once baseAddr is fully set, ignore further addi instructions
         }
@@ -1780,6 +1817,18 @@ std::optional<JumpTable> detectJumpTable(DecodedBinary& decoded, uint32_t bctrAd
     finalIndexReg = finalTableCandReg;
     indexScaledInPlace = tableCandScaledInPlace;
     indexShiftAmount = tableCandShiftAmount;
+  }
+
+  // The swap above (or the original trace) may have left finalIndexReg unresolved: the RA
+  // candidate can be invalidated to 0xFF by an unrelated write before its lis/addi destination
+  // is known to matter (see the tableCandReg mirror trace above). An unresolved index register
+  // must not reach the switch builder - it has no valid r0-r31 encoding.
+  if (finalIndexReg == 0xFF) {
+    REXCODEGEN_TRACE(
+        "detectJumpTable: bctr=0x{:08X} index register unresolved after RA/RB swap - cannot "
+        "build a switch, falling back to indirect call",
+        bctrAddr);
+    return std::nullopt;
   }
 
   // For ABSOLUTE tables, the load (lwzx) that fetches the table entry into ctrSourceReg may
@@ -1823,19 +1872,28 @@ std::optional<JumpTable> detectJumpTable(DecodedBinary& decoded, uint32_t bctrAd
   jt.indexRegister = finalIndexReg;
   jt.indexShift = indexScaledInPlace ? indexShiftAmount : 0;
 
+  // Byte stride between logical kAbsolute entries: the index is scaled (e.g.
+  // "rlwinm r6,r8,3,0,28" = index*8) before being added to the table base, regardless of
+  // whether that scale happened to write back into the same register (indexShiftAmount is
+  // captured either way - see the trace above). Entries are therefore (1 << shift) bytes apart,
+  // not always 4 - a table of 8-byte structs read with a hardcoded 4-byte stride would land on
+  // the wrong half of every other entry, fail validation, and truncate the table after entry 0.
+  uint32_t absoluteEntryStride = indexShiftAmount > 0 ? (1u << indexShiftAmount) : 4;
+
   REXCODEGEN_TRACE(
-      "detectJumpTable: bctr=0x{:08X} reading {} entries from table=0x{:08X} base=0x{:08X} type={}",
-      bctrAddr, entryCount, tableAddr, baseAddr, static_cast<int>(tableType));
+      "detectJumpTable: bctr=0x{:08X} reading {} entries from table=0x{:08X} base=0x{:08X} type={} "
+      "stride={}",
+      bctrAddr, entryCount, tableAddr, baseAddr, static_cast<int>(tableType), absoluteEntryStride);
 
   for (uint32_t i = 0; i < entryCount; i++) {
     uint32_t target = 0;
 
     switch (tableType) {
       case JumpTableType::kAbsolute: {
-        auto val = decoded.read<uint32_t>(tableAddr + i * 4);
+        auto val = decoded.read<uint32_t>(tableAddr + i * absoluteEntryStride);
         if (!val) {
           REXCODEGEN_TRACE("detectJumpTable: bctr=0x{:08X} entry[{}] read failed at 0x{:08X}",
-                           bctrAddr, i, tableAddr + i * 4);
+                           bctrAddr, i, tableAddr + i * absoluteEntryStride);
           break;
         }
         target = *val;
