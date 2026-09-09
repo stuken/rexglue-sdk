@@ -743,15 +743,17 @@ void ShaderInterpreter::ExecuteAluInstruction(ucode::AluInstruction instr) {
       state_.previous_scalar = 1.0f / std::sqrt(scalar_operands[0]);
     } break;
     case ucode::AluScalarOpcode::kMaxAs: {
+      // Scalar maxas/maxasf clamp a0 to [0, 255] (non-negative), unlike the
+      // vector maxa which allows [-256, 255]. Matches the DXBC translator.
       state_.address_register =
-          int32_t(std::floor(rex::clamp_float(scalar_operands[0], -256.0f, 255.0f) + 0.5f));
+          int32_t(std::floor(rex::clamp_float(scalar_operands[0], 0.0f, 255.0f) + 0.5f));
       state_.previous_scalar = std::isgreaterequal(scalar_operands[0], scalar_operands[1])
                                    ? scalar_operands[0]
                                    : scalar_operands[1];
     } break;
     case ucode::AluScalarOpcode::kMaxAsf: {
       state_.address_register =
-          int32_t(std::floor(rex::clamp_float(scalar_operands[0], -256.0f, 255.0f)));
+          int32_t(std::floor(rex::clamp_float(scalar_operands[0], 0.0f, 255.0f)));
       state_.previous_scalar = std::isgreaterequal(scalar_operands[0], scalar_operands[1])
                                    ? scalar_operands[0]
                                    : scalar_operands[1];

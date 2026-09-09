@@ -780,8 +780,10 @@ void DxbcShaderTranslator::ProcessScalarAluOperation(
         a_.OpRoundNI(dxbc::Dest::R(system_temp_ps_pc_p0_a0_, 0b1000),
                      dxbc::Src::R(system_temp_ps_pc_p0_a0_, dxbc::Src::kWWWW));
       }
+      // Scalar maxas/maxasf clamp a0 to [0, 255] (non-negative), unlike the
+      // vector maxa above which allows [-256, 255].
       a_.OpMax(dxbc::Dest::R(system_temp_ps_pc_p0_a0_, 0b1000),
-               dxbc::Src::R(system_temp_ps_pc_p0_a0_, dxbc::Src::kWWWW), dxbc::Src::LF(-256.0f));
+               dxbc::Src::R(system_temp_ps_pc_p0_a0_, dxbc::Src::kWWWW), dxbc::Src::LF(0.0f));
       a_.OpMin(dxbc::Dest::R(system_temp_ps_pc_p0_a0_, 0b1000),
                dxbc::Src::R(system_temp_ps_pc_p0_a0_, dxbc::Src::kWWWW), dxbc::Src::LF(255.0f));
       a_.OpFToI(dxbc::Dest::R(system_temp_ps_pc_p0_a0_, 0b1000),
