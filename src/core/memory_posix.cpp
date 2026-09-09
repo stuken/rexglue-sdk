@@ -15,7 +15,9 @@
 #include <cstring>
 #include <fstream>
 #include <functional>
+#include <mutex>
 #include <string>
+#include <unordered_set>
 
 #include <fcntl.h>
 
@@ -29,11 +31,27 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/memory/utils.h>
 #include <rex/platform.h>
 #include <rex/string.h>
+
+// memfd_create is desktop-Linux-specific; REX_PLATFORM_LINUX also covers
+// Android, which has its own ASharedMemory/ashmem path in
+// CreateFileMappingHandle and never reaches the memfd branch below.
+#if REX_PLATFORM_LINUX && !REX_PLATFORM_ANDROID
+#ifndef MFD_EXEC
+#define MFD_EXEC 0x0010U
+#endif
+
+REXCVAR_DEFINE_BOOL(use_shm_open, false, "Linux",
+                    "Back guest memory and the code cache with a /dev/shm file "
+                    "instead of memfd.\n"
+                    "Exposes both as named files that other processes can open "
+                    "to inspect guest memory or JIT output while a title runs.");
+#endif  // REX_PLATFORM_LINUX && !REX_PLATFORM_ANDROID
 
 // macOS off_t is 64-bit with no *64 large-file variants; Linux keeps the
 // explicit *64 forms for legacy 32-bit off_t distributions.
@@ -83,6 +101,14 @@ static std::string MakeShmName(const std::filesystem::path& path) {
 #endif
   return name;
 }
+
+#if REX_PLATFORM_LINUX && !REX_PLATFORM_ANDROID
+// Names of currently-open shm_open handles, so CloseFileMappingHandle only
+// unlinks handles that actually came from shm_open - memfd handles are
+// anonymous and need no cleanup.
+static std::unordered_set<std::string> g_shm_file_names;
+static std::mutex g_shm_file_names_mutex;
+#endif  // REX_PLATFORM_LINUX && !REX_PLATFORM_ANDROID
 
 #if REX_PLATFORM_ANDROID
 // May be null if no dynamically loaded functions are required.
@@ -474,6 +500,28 @@ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, siz
   }
   oflag |= O_CREAT;
   auto full_path = MakeShmName(path);
+#if REX_PLATFORM_LINUX && !REX_PLATFORM_ANDROID
+  // memfd is unaffected by noexec /dev/shm and needs no cleanup on exit.
+  if (!REXCVAR_GET(use_shm_open)) {
+    const bool needs_exec =
+        access == PageAccess::kExecuteReadOnly || access == PageAccess::kExecuteReadWrite;
+    int memfd = memfd_create(path.c_str(), MFD_CLOEXEC | (needs_exec ? MFD_EXEC : 0u));
+    if (memfd < 0 && needs_exec && errno == EINVAL) {
+      memfd = memfd_create(path.c_str(), MFD_CLOEXEC);
+    }
+    if (memfd >= 0) {
+      if (rex_ftruncate64(memfd, static_cast<off_t>(length)) != 0) {
+        REXSYS_ERROR("ftruncate(memfd {}, 0x{:X}) failed: {} ({})", path.string(), length,
+                     strerror(errno), errno);
+        close(memfd);
+        return kFileMappingHandleInvalid;
+      }
+      return static_cast<FileMappingHandle>(memfd);
+    }
+    REXSYS_WARN("memfd_create({}) failed: {} ({}), falling back to shm_open", path.string(),
+               strerror(errno), errno);
+  }
+#endif  // REX_PLATFORM_LINUX && !REX_PLATFORM_ANDROID
   int ret = shm_open(full_path.c_str(), oflag, 0777);
   if (ret < 0) {
     return kFileMappingHandleInvalid;
@@ -483,6 +531,12 @@ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, siz
     shm_unlink(full_path.c_str());
     return kFileMappingHandleInvalid;
   }
+#if REX_PLATFORM_LINUX && !REX_PLATFORM_ANDROID
+  {
+    std::lock_guard guard(g_shm_file_names_mutex);
+    g_shm_file_names.insert(full_path);
+  }
+#endif  // REX_PLATFORM_LINUX && !REX_PLATFORM_ANDROID
   return static_cast<FileMappingHandle>(ret);
 #endif
 }
@@ -491,7 +545,20 @@ void CloseFileMappingHandle(FileMappingHandle handle, const std::filesystem::pat
   close(static_cast<int>(handle));
 #if !REX_PLATFORM_ANDROID
   auto full_path = MakeShmName(path);
+#if REX_PLATFORM_LINUX
+  // Only shm_open handles are tracked and need unlinking; memfd handles are
+  // anonymous and need no cleanup.
+  bool tracked = false;
+  {
+    std::lock_guard guard(g_shm_file_names_mutex);
+    tracked = g_shm_file_names.erase(full_path) != 0;
+  }
+  if (tracked) {
+    shm_unlink(full_path.c_str());
+  }
+#else
   shm_unlink(full_path.c_str());
+#endif  // REX_PLATFORM_LINUX
 #endif
 }
 
