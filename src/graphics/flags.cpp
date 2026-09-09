@@ -33,10 +33,6 @@ REXCVAR_DEFINE_BOOL(gamma_render_target_as_unorm16, true, "GPU",
                     "Use R16G16B16A16_UNORM for gamma render targets (more accurate than sRGB)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(
-    ac6_ground_fix, false, "HACKS",
-    "This fixes(hide) issues with black ground in AC6. Use only in AC6. "
-    "Might cause issues in other titles.");
-REXCVAR_DEFINE_BOOL(
     no_discard_stencil_in_transfer_pipelines, false, "GPU.Debug",
     "Skip stencil bit discard in render target transfer pipelines. "
     "May improve performance on some GPUs.");

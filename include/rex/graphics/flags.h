@@ -15,7 +15,6 @@
 
 // GPU Core
 REXCVAR_DECLARE(bool, vsync);
-REXCVAR_DECLARE(bool, ac6_ground_fix);
 REXCVAR_DECLARE(bool, no_discard_stencil_in_transfer_pipelines);
 REXCVAR_DECLARE(bool, force_depth_clamp);
 REXCVAR_DECLARE(bool, debug_msaa_2x_as_4x);
