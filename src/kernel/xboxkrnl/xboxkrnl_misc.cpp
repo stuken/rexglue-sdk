@@ -16,9 +16,14 @@
 #include <rex/logging.h>
 #include <rex/hook.h>
 #include <rex/types.h>
+#include <rex/system/function_dispatcher.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xthread.h>
 #include <rex/system/xtypes.h>
+
+REXCVAR_DEFINE_BOOL(allow_mic_initialization, false, "Kernel",
+                    "Enable Mic Initialization\n"
+                    " Only set true when testing mic related functions");
 
 namespace rex::kernel::xboxkrnl {
 
@@ -26,9 +31,116 @@ void KeEnableFpuExceptions_entry(u32 enabled) {
   // TODO(benvanik): can we do anything about exceptions?
 }
 
+enum class XMicRequestType : uint16_t {
+  MicGetStatus = 0x0000,
+  MicStart = 0x0001,
+  MicSetGain = 0x0002,
+  MicGetData = 0x0007,
+  MicGetSampleRates = 0x0008,
+  MicGetCapabilities = 0x0009,
+  MicUnk = 0x000B,
+};
+
+enum class XMicState : uint32_t {
+  MicNotConnected = 0x00000000,
+  MicConnected = 0x00000001,
+  MicConnected2 = 0x00000002,
+  MicConnected3 = 0x00000003,
+  MicRecording = 0x00000005,
+};
+
+struct X_MIC_INFO {
+  rex::be<XMicRequestType> request_type;  // 0
+  rex::be<uint16_t> user_index;           // 2
+  rex::be<XMicState> state;               // 4
+
+  // These fields are only for requests that use overlap. Basically anything
+  // other than MicGetStatus. Seems like there is also an event object which
+  // creation isn't reported via kernel call.
+  rex::be<uint32_t> unk1;            // 8
+  rex::be<uint32_t> event_ptr;       // 0xC
+  rex::be<uint32_t> completion_ptr;  // 0x10
+  rex::be<uint32_t> unk4;            // 0x14
+};
+
+struct X_MIC_CAPABILITIES {
+  /* Hardcoded fields for 0x6000 type aka. MicDevice. 0x5000 type (Rmc) does not
+    have any hardcoded fields. features - 0 frame_length - 0x3E8 mic_color -
+    0xFF
+  */
+  rex::be<uint32_t> features;
+  rex::be<uint16_t> format_tag;  // Always 1
+  rex::be<uint16_t> channels;
+  rex::be<uint32_t> sample_rates;
+  rex::be<uint16_t> bits_per_sample;
+  rex::be<uint16_t> frame_length;
+  rex::be<uint8_t> mic_color;
+  rex::be<uint16_t> vendor_id;
+  rex::be<uint16_t> product_id;
+  rex::be<uint16_t> revision;
+  rex::be<uint32_t> device_id;
+};
+static_assert_size(X_MIC_CAPABILITIES, 0x1C);
+
+struct X_MIC_DEVICE {
+  X_MIC_INFO info;
+  // There seems to be one huge union here that depends on the request type.
+  X_MIC_CAPABILITIES capabilities;
+};
+
+u32 MicDeviceRequest_entry(ppc_ptr_t<X_MIC_DEVICE> device_ptr) {
+  if (!device_ptr) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+  REXKRNL_ERROR("MicDeviceRequest State: {:08X} Action: {:04X} USER: {:08X}",
+               static_cast<uint32_t>(device_ptr->info.state.get()),
+               static_cast<uint16_t>(device_ptr->info.request_type.get()),
+               device_ptr->info.user_index.get());
+  if (device_ptr->info.user_index > 4) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+
+  if (device_ptr->info.request_type > XMicRequestType::MicUnk) {
+    return X_STATUS_INVALID_DEVICE_REQUEST;
+  }
+
+  device_ptr->info.state =
+      REXCVAR_GET(allow_mic_initialization) ? XMicState::MicConnected : XMicState::MicNotConnected;
+
+  switch (device_ptr->info.request_type) {
+    case XMicRequestType::MicGetStatus:
+      return X_ERROR_SUCCESS;
+    case XMicRequestType::MicStart:
+    case XMicRequestType::MicGetData:
+    case XMicRequestType::MicGetSampleRates:
+      break;
+    case XMicRequestType::MicGetCapabilities:
+      device_ptr->capabilities.features = 0x100;
+      device_ptr->capabilities.format_tag = 1;
+      device_ptr->capabilities.mic_color = 0;
+      break;
+    default:
+      break;
+  }
+
+  // This should be handled by DPC.
+  if (device_ptr->info.completion_ptr) {
+    // Not sure what args should be put there, but seems like negative r4 causes
+    // instant bailout. For now leave it hardcoded to failure.
+    uint64_t args[] = {device_ptr.guest_address(), static_cast<uint64_t>(X_STATUS_UNSUCCESSFUL)};
+
+    REX_KERNEL_STATE()->function_dispatcher()->Execute(
+        XThread::GetCurrentThread()->thread_state(), device_ptr->info.completion_ptr, args,
+        rex::countof(args));
+  }
+
+  return X_STATUS_PENDING;
+}
+
 }  // namespace rex::kernel::xboxkrnl
 
 REX_EXPORT(__imp__KeEnableFpuExceptions, rex::kernel::xboxkrnl::KeEnableFpuExceptions_entry)
+REX_EXPORT(__imp__MicDeviceRequest, rex::kernel::xboxkrnl::MicDeviceRequest_entry)
 
 REX_EXPORT_STUB(__imp__ExSetBetaFeaturesEnabled);
 REX_EXPORT_STUB(__imp__ExIsBetaFeatureEnabled);
@@ -90,7 +202,6 @@ REX_EXPORT_STUB(__imp__IptvSetBoundaryKey);
 REX_EXPORT_STUB(__imp__IptvSetSessionKey);
 REX_EXPORT_STUB(__imp__IptvVerifyOmac1Signature);
 REX_EXPORT_STUB(__imp__McaDeviceRequest);
-REX_EXPORT_STUB(__imp__MicDeviceRequest);
 REX_EXPORT_STUB(__imp__MtpdBeginTransaction);
 REX_EXPORT_STUB(__imp__MtpdCancelTransaction);
 REX_EXPORT_STUB(__imp__MtpdEndTransaction);
