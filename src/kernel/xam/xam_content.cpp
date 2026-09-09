@@ -274,6 +274,16 @@ u32 XamContentOpenFile_entry(u32 user_index, mapped_string root_name, mapped_str
 
 u32 XamContentFlush_entry(mapped_string root_name, mapped_void overlapped_ptr) {
   X_RESULT result = X_ERROR_SUCCESS;
+
+  // We do not buffer any device data, so just rewrite the header.
+  auto content_manager = REX_KERNEL_STATE()->content_manager();
+  auto package = content_manager->FindPackage(root_name.value());
+  if (!package) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+  content_manager->WriteContentHeaderFile(0, package->GetPackageContentData(),
+                                          package->GetPackageLicense());
+
   if (overlapped_ptr) {
     REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped_ptr.guest_address(), result);
     return X_ERROR_IO_PENDING;

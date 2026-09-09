@@ -499,6 +499,15 @@ std::filesystem::path ContentManager::GetOpenPackagePath(const std::string_view 
   return it->second->package_path();
 }
 
+ContentPackage* ContentManager::FindPackage(const std::string_view root_name) {
+  auto global_lock = global_critical_region_.Acquire();
+  auto it = open_packages_.find(string::string_key_case(root_name));
+  if (it == open_packages_.end()) {
+    return nullptr;
+  }
+  return it->second;
+}
+
 void ContentManager::CloseOpenedFilesFromContent(const std::string_view root_name) {
   // TODO(Gliniak): Cleanup this code to care only about handles
   // related to provided content
