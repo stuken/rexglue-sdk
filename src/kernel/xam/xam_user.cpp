@@ -518,20 +518,31 @@ u32 XamUserIsUnsafeProgrammingAllowed_entry(u32 user_index, u32 unk, mapped_u32 
   return X_ERROR_SUCCESS;
 }
 
-u32 XamUserGetSubscriptionType_entry(u32 user_index, mapped_u32 subscription_ptr, mapped_u32 r5,
-                                     u32 overlapped_ptr) {
+u32 XamUserGetSubscriptionType_entry(u32 user_index, mapped_u32 subscription_length_ptr,
+                                     mapped_u32 subscription_payment_ptr, u32 overlapped_ptr) {
   if (user_index >= 4) {
     return X_E_INVALIDARG;
   }
-  if (!subscription_ptr || !r5) {
+  if (!subscription_length_ptr || !subscription_payment_ptr) {
     return X_E_INVALIDARG;
   }
   if (user_index) {
     return X_ERROR_INVALID_PARAMETER;
   }
 
-  *subscription_ptr = 6;  // Gold, matches XamUserGetMembershipTier_entry above.
-  *r5 = 0;
+  const auto& user_profile = REX_KERNEL_STATE()->user_profile();
+
+  *subscription_length_ptr = 0;
+  if (auto setting = user_profile->GetSetting(
+          static_cast<uint32_t>(UserSettingId::XPROFILE_SUBSCRIPTION_TYPE_LENGTH_IN_MONTHS))) {
+    *subscription_length_ptr = uint32_t(int32_t(setting->get_data()->data.s32));
+  }
+  *subscription_payment_ptr = 0;
+  if (auto setting = user_profile->GetSetting(
+          static_cast<uint32_t>(UserSettingId::XPROFILE_SUBSCRIPTION_PAYMENT_TYPE))) {
+    *subscription_payment_ptr = uint32_t(int32_t(setting->get_data()->data.s32));
+  }
+
   return X_ERROR_SUCCESS;
 }
 
