@@ -144,6 +144,11 @@ void XeCryptShaFinal_entry(ppc_ptr_t<XECRYPT_SHA_STATE> sha_state, ppc_ptr_t<uin
 
   std::copy_n(digest, std::min<size_t>(rex::countof(digest), out_size), static_cast<uint8_t*>(out));
   std::copy_n(sha.getDigest(), rex::countof(sha_state->state), sha_state->state);
+  // The console pads in place, so the last block it compressed is left in the
+  // context buffer, not the message tail. Only shows up when a title finalizes
+  // the same context twice and the padding needed a second block, where the
+  // tail no longer survives the first call.
+  std::copy_n(sha.getBlock(), rex::countof(sha_state->buffer), sha_state->buffer);
 }
 
 void XeCryptSha_entry(mapped_void input_1, u32 input_1_size, mapped_void input_2, u32 input_2_size,
