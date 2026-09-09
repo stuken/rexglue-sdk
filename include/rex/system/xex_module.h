@@ -22,6 +22,7 @@ class KernelState;
 
 namespace rex::runtime {
 
+constexpr memory::fourcc_t kXEX25Signature = memory::make_fourcc("XEX%");
 constexpr memory::fourcc_t kXEX1Signature = memory::make_fourcc("XEX1");
 constexpr memory::fourcc_t kXEX2Signature = memory::make_fourcc("XEX2");
 constexpr memory::fourcc_t kElfSignature = memory::make_fourcc(0x7F, 'E', 'L', 'F');
@@ -56,6 +57,7 @@ class XexModule : public Module {
   };
   enum XexFormat {
     kFormatUnknown,
+    kFormatXex25,  // %
     kFormatXex1,
     kFormatXex2,
   };

@@ -598,6 +598,21 @@ struct xex1_security_info {
   xex2_page_descriptor page_descriptors[1];
 };
 
+struct xex25_security_info {
+  be<uint32_t> header_size;
+  be<uint32_t> image_size;
+  char rsa_signature[0x100];
+  char image_digest[0x14];
+  char import_table_digest[0x14];
+  be<uint32_t> load_address;
+  char aes_key[0x10];
+  be<uint32_t> image_flags;
+  be<uint32_t> export_table;
+  be<uint32_t> allowed_media_types;
+  be<uint32_t> page_descriptor_count;
+  xex2_page_descriptor page_descriptors[1];
+};
+
 struct xex2_export_table {
   be<uint32_t> magic[3];         // 0x0
   be<uint32_t> modulenumber[2];  // 0xC

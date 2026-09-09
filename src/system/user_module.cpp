@@ -135,7 +135,8 @@ X_STATUS UserModule::LoadFromMemory(const void* addr, const size_t length) {
   be<memory::fourcc_t> magic;
   magic.value = memory::load<memory::fourcc_t>(addr);
 
-  if (magic == runtime::kXEX2Signature || magic == runtime::kXEX1Signature) {
+  if (magic == runtime::kXEX2Signature || magic == runtime::kXEX1Signature ||
+      magic == runtime::kXEX25Signature) {
     module_format_ = kModuleFormatXex;
   } else if (magic == runtime::kElfSignature) {
     module_format_ = kModuleFormatElf;
