@@ -719,6 +719,30 @@ TEST_CASE("Physical heap vE0000000 (4KB pages, write-combine)", "[memory][physic
   heap->Release(addr, nullptr);
 }
 
+TEST_CASE("AllocRange stays within the requested range", "[memory][physical]") {
+  // A ceiling that is not a multiple of the alignment must not be rounded up
+  // to the next one, which would place the allocation above it.
+  auto& memory = GetTestMemory();
+  auto* heap = MutableHeap(memory.LookupHeap(0xA0000000));
+  REQUIRE(heap != nullptr);
+
+  const uint32_t low_address = 0xA0000000;
+  const uint32_t high_address = 0xA0FF8000;
+  const uint32_t size = 0x10000;
+  const uint32_t alignment = 0x10000;
+
+  uint32_t addr = 0;
+  bool result =
+      heap->AllocRange(low_address, high_address, size, alignment,
+                        rex::memory::kMemoryAllocationReserve | rex::memory::kMemoryAllocationCommit,
+                        rex::memory::kMemoryProtectRead | rex::memory::kMemoryProtectWrite, true, &addr);
+  REQUIRE(result);
+  CHECK((addr % alignment) == 0);
+  CHECK(addr + size - 1 <= high_address);
+
+  heap->Release(addr, nullptr);
+}
+
 TEST_CASE("LookupHeapByType selects correct heap", "[memory][heap]") {
   auto& memory = GetTestMemory();
 
