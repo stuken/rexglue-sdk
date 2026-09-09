@@ -12,10 +12,18 @@
 
 #include <rex/system/export_resolver.h>
 #include <rex/system/kernel_state.h>
+#include <rex/types.h>
 
 namespace rex {
 namespace kernel {
 namespace xam {
+
+// Third argument shared by XamTaskSchedule and XMsgStartIORequestEx.
+struct X_TASK_ARGS {
+  rex::be<uint32_t> flags;
+  rex::be<uint32_t> value2;
+};
+static_assert_size(X_TASK_ARGS, 0x8);
 
 bool xeXamIsUIActive();
 

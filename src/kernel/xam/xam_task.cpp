@@ -33,21 +33,17 @@ namespace xam {
 using namespace rex::system;
 using namespace rex::system::xam;
 
-struct XTASK_MESSAGE {
-  be<uint32_t> unknown_00;
-  be<uint32_t> unknown_04;
-  be<uint32_t> unknown_08;
-  be<uint32_t> callback_arg_ptr;
-  be<uint32_t> event_handle;
-  be<uint32_t> unknown_14;
-  be<uint32_t> task_handle;
-};
-static_assert_size(XTASK_MESSAGE, 0x1C);
-
-u32 XamTaskSchedule_entry(mapped_void callback, ppc_ptr_t<XTASK_MESSAGE> message,
-                          mapped_u32 unknown, mapped_u32 handle_ptr) {
+u32 XamTaskSchedule_entry(mapped_void callback, mapped_void message,
+                          ppc_ptr_t<X_TASK_ARGS> xam_task_args_ptr, mapped_u32 handle_ptr) {
   // TODO(gibbed): figure out what this is for
   *handle_ptr = 12345;
+
+  if (xam_task_args_ptr) {
+    auto v1 = xam_task_args_ptr->flags;   // 4, 8, 0x4000008, 0x402008, etc
+    auto v2 = xam_task_args_ptr->value2;  // 10, 1000, 0xea60, etc
+
+    REXKRNL_INFO("Got xam task args: v1 = {:08X}, v2 = {:08X}", v1.get(), v2.get());
+  }
 
   uint32_t stack_size = REX_KERNEL_STATE()->GetExecutableModule()->stack_size();
 

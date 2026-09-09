@@ -46,14 +46,9 @@ u32 XMsgSystemProcessCall_entry(u32 app, u32 message, u32 buffer, u32 buffer_len
   return result;
 }
 
-struct XMSGSTARTIOREQUEST_UNKNOWNARG {
-  be<uint32_t> unk_0;
-  be<uint32_t> unk_1;
-};
-
 X_HRESULT xeXMsgStartIORequestEx(uint32_t app, uint32_t message, uint32_t overlapped_ptr,
                                  uint32_t buffer_ptr, uint32_t buffer_length,
-                                 XMSGSTARTIOREQUEST_UNKNOWNARG* unknown) {
+                                 X_TASK_ARGS* xam_task_args_ptr) {
   auto result = REX_KERNEL_STATE()->app_manager()->DispatchMessageAsync(app, message, buffer_ptr,
                                                                         buffer_length);
   if (result == X_E_NOTFOUND) {
@@ -73,9 +68,9 @@ X_HRESULT xeXMsgStartIORequestEx(uint32_t app, uint32_t message, uint32_t overla
 
 u32 XMsgStartIORequestEx_entry(u32 app, u32 message, ppc_ptr_t<XAM_OVERLAPPED> overlapped_ptr,
                                u32 buffer_ptr, u32 buffer_length,
-                               ppc_ptr_t<XMSGSTARTIOREQUEST_UNKNOWNARG> unknown_ptr) {
+                               ppc_ptr_t<X_TASK_ARGS> xam_task_args_ptr) {
   return xeXMsgStartIORequestEx(app, message, overlapped_ptr.guest_address(), buffer_ptr,
-                                buffer_length, unknown_ptr);
+                                buffer_length, xam_task_args_ptr);
 }
 
 u32 XMsgStartIORequest_entry(u32 app, u32 message, ppc_ptr_t<XAM_OVERLAPPED> overlapped_ptr,
