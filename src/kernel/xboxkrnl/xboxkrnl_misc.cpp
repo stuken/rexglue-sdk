@@ -21,6 +21,8 @@
 #include <rex/system/xthread.h>
 #include <rex/system/xtypes.h>
 
+using namespace rex::system;
+
 REXCVAR_DEFINE_BOOL(allow_mic_initialization, false, "Kernel",
                     "Enable Mic Initialization\n"
                     " Only set true when testing mic related functions");
