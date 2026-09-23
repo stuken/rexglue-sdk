@@ -10,6 +10,8 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <mutex>
+
 #include <rex/system/xobject.h>
 #include <rex/system/xtypes.h>
 #include <rex/thread.h>
@@ -44,10 +46,20 @@ class XEvent : public XObject {
 
  protected:
   rex::thread::WaitHandle* GetWaitHandle() override { return event_.get(); }
+  void WaitCallback() override;
+  void SyncFromGuest() override;
 
  private:
+  // Mirrors the signal state into the guest KEVENT header.
+  void SetGuestSignalState(uint32_t signal_state);
+
   bool manual_reset_ = false;
   std::unique_ptr<rex::thread::Event> event_;
+
+  // Guards the header write together with the host event change, so
+  // SyncFromGuest can tell guest writes from ours.
+  std::mutex state_lock_;
+  bool host_signaled_ = false;
 };
 
 }  // namespace rex::system

@@ -10,6 +10,8 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <mutex>
+
 #include <rex/system/xobject.h>
 #include <rex/system/xtypes.h>
 #include <rex/thread.h>
@@ -41,10 +43,20 @@ class XSemaphore : public XObject {
 
  protected:
   rex::thread::WaitHandle* GetWaitHandle() override { return semaphore_.get(); }
+  void WaitCallback() override;
+  void SyncFromGuest() override;
 
  private:
+  // Mirrors host_count_ into the guest KSEMAPHORE header.
+  void UpdateGuestSignalState();
+
   std::unique_ptr<rex::thread::Semaphore> semaphore_;
   uint32_t maximum_count_ = 0;
+
+  // Guards host_count_ and the header together, so SyncFromGuest can tell
+  // guest writes from ours.
+  std::mutex count_lock_;
+  int32_t host_count_ = 0;
 };
 
 }  // namespace rex::system

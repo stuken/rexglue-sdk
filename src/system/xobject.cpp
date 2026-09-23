@@ -393,8 +393,11 @@ object_ref<XObject> XObject::GetNativeObject(KernelState* kernel_state, void* na
     // TODO: assert if the type of the object != as_type
     uint32_t handle = header->wait_list_blink;
     auto object = kernel_state->object_table()->LookupObject<XObject>(handle);
-
-    // TODO(benvanik): assert nothing has been changed in the struct.
+    if (object) {
+      // The only place the guest hands us a raw dispatch header, so the only
+      // place a direct write to it can be picked up.
+      object->SyncFromGuest();
+    }
     return object;
   } else {
     // First use, create new.

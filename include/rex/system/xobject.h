@@ -209,6 +209,9 @@ class XObject {
 
   // Called on successful wait.
   virtual void WaitCallback() {}
+  // Called when the guest hands us an already-initialized dispatch header,
+  // so direct guest writes to it can be picked up.
+  virtual void SyncFromGuest() {}
   virtual rex::thread::WaitHandle* GetWaitHandle() { return nullptr; }
 
   // Creates the kernel object for guest code to use. Typically not needed.

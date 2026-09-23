@@ -22,7 +22,15 @@ XEvent::~XEvent() = default;
 void XEvent::Initialize(bool manual_reset, bool initial_state) {
   assert_false(event_);
 
-  this->CreateNative<X_KEVENT>();
+  manual_reset_ = manual_reset;
+  auto kevent = this->CreateNative<X_KEVENT>();
+  if (kevent) {
+    // Don't touch wait_list_*: SetNativePointer stashes the handle there.
+    kevent->header.type = manual_reset ? 0x00   // EventNotificationObject
+                                       : 0x01;  // EventSynchronizationObject
+    kevent->header.signal_state = initial_state ? 1 : 0;
+  }
+  host_signaled_ = initial_state;
 
   if (manual_reset) {
     event_ = rex::thread::Event::CreateManualResetEvent(initial_state);
@@ -48,12 +56,20 @@ void XEvent::InitializeNative(void* native_ptr, X_DISPATCH_HEADER* header) {
   }
 
   bool initial_state = header->signal_state ? true : false;
+  host_signaled_ = initial_state;
   if (manual_reset_) {
     event_ = rex::thread::Event::CreateManualResetEvent(initial_state);
   } else {
     event_ = rex::thread::Event::CreateAutoResetEvent(initial_state);
   }
   assert_not_null(event_);
+  SetNativePointer(memory()->HostToGuestVirtual(native_ptr), true);
+}
+
+void XEvent::SetGuestSignalState(uint32_t signal_state) {
+  if (guest_object()) {
+    guest_object<X_KEVENT>()->header.signal_state = signal_state;
+  }
 }
 
 void XEvent::Query(uint32_t* out_type, uint32_t* out_state) {
@@ -74,18 +90,61 @@ void XEvent::Query(uint32_t* out_type, uint32_t* out_state) {
 }
 
 int32_t XEvent::Set(uint32_t priority_increment, bool wait) {
+  std::lock_guard<std::mutex> lock(state_lock_);
+  SetGuestSignalState(1);
+  host_signaled_ = true;
   event_->Set();
   return 1;
 }
 
 int32_t XEvent::Pulse(uint32_t priority_increment, bool wait) {
+  std::lock_guard<std::mutex> lock(state_lock_);
+  // KePulseEvent returns the pre-pulse signal state.
+  int32_t old_signal_state = host_signaled_ ? 1 : 0;
+  if (guest_object()) {
+    old_signal_state = static_cast<int32_t>(guest_object<X_KEVENT>()->header.signal_state);
+  }
   event_->Pulse();
-  return 1;
+  // Pulse leaves the event reset after releasing waiters.
+  SetGuestSignalState(0);
+  host_signaled_ = false;
+  return old_signal_state;
 }
 
 int32_t XEvent::Reset() {
+  std::lock_guard<std::mutex> lock(state_lock_);
+  SetGuestSignalState(0);
+  host_signaled_ = false;
   event_->Reset();
   return 1;
+}
+
+void XEvent::WaitCallback() {
+  // Auto-reset events atomically clear on a successful wait; manual reset
+  // events stay set.
+  if (!manual_reset_) {
+    std::lock_guard<std::mutex> lock(state_lock_);
+    SetGuestSignalState(0);
+    host_signaled_ = false;
+  }
+}
+
+void XEvent::SyncFromGuest() {
+  if (!guest_object()) {
+    return;
+  }
+
+  std::lock_guard<std::mutex> lock(state_lock_);
+  bool guest_signaled = guest_object<X_KEVENT>()->header.signal_state ? true : false;
+  if (guest_signaled == host_signaled_) {
+    return;
+  }
+  host_signaled_ = guest_signaled;
+  if (guest_signaled) {
+    event_->Set();
+  } else {
+    event_->Reset();
+  }
 }
 
 void XEvent::Clear() {
@@ -135,6 +194,7 @@ object_ref<XEvent> XEvent::Restore(KernelState* kernel_state, stream::ByteStream
   if (signaled) {
     evt->event_->Set();
   }
+  evt->host_signaled_ = signaled;
 
   return object_ref<XEvent>(evt);
 }
