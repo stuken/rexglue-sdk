@@ -996,7 +996,10 @@ void ShaderInterpreter::ExecuteVertexFetchInstruction(ucode::VertexFetchInstruct
       uint32_t dword_address_dwords = dword_0_address_dwords + i;
       if (dword_address_dwords >= fetch_constant.address &&
           dword_address_dwords < buffer_end_dwords) {
-        dword_value = xenos::GpuSwap(memory_dwords[dword_address_dwords], fetch_constant.endian);
+        // For writeback & XPS addresses.
+        // Wrap to the physical extents like in the translators.
+        uint32_t dword_address_physical = dword_address_dwords & 0x07FFFFFF;
+        dword_value = xenos::GpuSwap(memory_dwords[dword_address_physical], fetch_constant.endian);
       }
       data[i] = dword_value;
     }

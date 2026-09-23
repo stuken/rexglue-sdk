@@ -50,7 +50,9 @@ uint32_t get_page_count(uint32_t value, uint32_t page_size, uint32_t page_size_s
 /**
  * Memory map:
  * 0x00000000 - 0x3FFFFFFF (1024mb) - virtual 4k pages
- * 0x40000000 - 0x7FFFFFFF (1024mb) - virtual 64k pages
+ * 0x40000000 - 0x7EFFFFFF (1008mb) - virtual 64k pages
+ * 0x7F000000 - 0x7FC7FFFF (12.5mb) - GPU writeback & XPS
+ * 0x7FC80000 - 0x7FFFFFFF ( 3.5mb) - MMIO
  * 0x80000000 - 0x8BFFFFFF ( 192mb) - xex 64k pages
  * 0x8C000000 - 0x8FFFFFFF (  64mb) - xex 64k pages (encrypted)
  * 0x90000000 - 0x9FFFFFFF ( 256mb) - xex 4k pages
@@ -112,6 +114,7 @@ Memory::~Memory() {
 
   heaps_.v00000000.Dispose();
   heaps_.v40000000.Dispose();
+  heaps_.v7F000000.Dispose();
   heaps_.v80000000.Dispose();
   heaps_.v90000000.Dispose();
   heaps_.vA0000000.Dispose();
@@ -200,6 +203,8 @@ bool Memory::Initialize() {
                               0x20000000, 16 * 1024 * 1024, &heaps_.physical);
   heaps_.vE0000000.Initialize(this, virtual_membase_, memory::HeapType::kGuestPhysical, 0xE0000000,
                               0x1FD00000, 4096, &heaps_.physical);
+  heaps_.v7F000000.Initialize(this, virtual_membase_, memory::HeapType::kGuestPhysical, 0x7F000000,
+                              0x00C80000, 4096, &heaps_.physical);
 
   // Protect the first and last 64kb of memory.
   heaps_.v00000000.AllocFixed(0x00000000, 0x10000, 0x10000,
@@ -210,9 +215,12 @@ bool Memory::Initialize() {
   heaps_.physical.AllocFixed(0x1FFF0000, 0x10000, 0x10000, memory::kMemoryAllocationReserve,
                              memory::kMemoryProtectNoAccess);
 
-  // GPU writeback.
-  // 0xC... is physical, 0x7F... is virtual. We may need to overlay these.
+  // GPU writeback & XPS.
+  // 0xC... is physical, 0x7F... is virtual. Overlaid.
   heaps_.vC0000000.AllocFixed(0xC0000000, 0x01000000, 32,
+                              memory::kMemoryAllocationReserve | memory::kMemoryAllocationCommit,
+                              memory::kMemoryProtectRead | memory::kMemoryProtectWrite);
+  heaps_.v7F000000.AllocFixed(0x7F000000, 0x00C80000, 32,
                               memory::kMemoryAllocationReserve | memory::kMemoryAllocationCommit,
                               memory::kMemoryProtectRead | memory::kMemoryProtectWrite);
 
@@ -269,7 +277,7 @@ static const struct {
         0x7EFFFFFF,
         0x0000000040000000ull,
     },
-    //   (16mb) - GPU writeback + 15mb of XPS?
+    //   (16mb) - GPU writeback + XPS
     {
         0x7F000000,
         0x7FFFFFFF,
@@ -399,6 +407,8 @@ const BaseHeap* Memory::LookupHeap(uint32_t address) const {
     return &heaps_.v00000000;
   } else if (address < 0x7F000000) {
     return &heaps_.v40000000;
+  } else if (address < 0x7FC80000) {
+    return &heaps_.v7F000000;
   } else if (address < 0x80000000) {
     return nullptr;
   } else if (address < 0x90000000) {
@@ -688,6 +698,8 @@ void Memory::EnablePhysicalMemoryAccessCallbacks(uint32_t physical_address, uint
                                          enable_invalidation_notifications, enable_data_providers);
   heaps_.vE0000000.EnableAccessCallbacks(physical_address, length,
                                          enable_invalidation_notifications, enable_data_providers);
+  heaps_.v7F000000.EnableAccessCallbacks(physical_address, length,
+                                         enable_invalidation_notifications, enable_data_providers);
 }
 
 uint32_t Memory::SystemHeapAlloc(uint32_t size, uint32_t alignment, uint32_t system_heap_flags) {
@@ -752,6 +764,7 @@ void Memory::DumpMap() {
   REXSYS_ERROR("------------------------------------------------------------------");
   REXSYS_ERROR("");
   heaps_.physical.DumpMap();
+  heaps_.v7F000000.DumpMap();
   heaps_.vA0000000.DumpMap();
   heaps_.vC0000000.DumpMap();
   heaps_.vE0000000.DumpMap();

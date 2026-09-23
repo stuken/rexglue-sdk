@@ -639,7 +639,8 @@ u32 KeGetImagePageTableEntry_entry(mapped_void address) {
 }
 
 u32 KeLockL2_entry() {
-  // TODO
+  // Since the L2 cache isn't emulated, the XPS range is always backed, so
+  // there's nothing to lock.
   return 0;
 }
 
