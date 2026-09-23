@@ -786,8 +786,11 @@ class PosixCondition<Thread> : public PosixConditionBase {
     uint64_t result = 0;
     auto cpu_count = std::min(CPU_SETSIZE, 64);
     for (auto i = 0u; i < cpu_count; i++) {
-      auto set = CPU_ISSET(i, &cpu_set);
-      result |= set << i;
+      // CPU_ISSET returns int, so `set << i` was an int shift: undefined from
+      // bit 31 and wrapping above it.
+      if (CPU_ISSET(i, &cpu_set)) {
+        result |= uint64_t(1) << i;
+      }
     }
     return result;
 #endif
@@ -961,12 +964,13 @@ class PosixCondition<Thread> : public PosixConditionBase {
       std::unique_lock<std::mutex> lock(state_mutex_);
       if (state_ == State::kFinished) {
         if (is_current_thread) {
-          // This is really bad. Some thread must have called Terminate() on us
-          // just before we decided to terminate ourselves
-          assert_always();
-          for (;;) {
-            // Wait for pthread_cancel() to actually happen.
-          }
+          // Another thread's Terminate() raced ours and already marked us
+          // finished. Its pthread_cancel is not guaranteed to arrive, and
+          // this loop burned a core waiting for it. Leave under our own
+          // power instead.
+          REXSYS_WARN("PosixThread::Terminate: thread was already finished");
+          lock.unlock();
+          pthread_exit(reinterpret_cast<void*>(exit_code));
         }
         return;
       }
@@ -1002,10 +1006,20 @@ class PosixCondition<Thread> : public PosixConditionBase {
 
   /// Uses sem_wait because it may be called from signal handler context.
   void WaitSuspended() {
-    int ret;
-    do {
-      ret = sem_wait(suspend_sem_ptr());
-    } while (ret == -1 && errno == EINTR);
+    // The suspend signal does not queue, and a Resume() whose sem_post lands
+    // before the signal is delivered leaves a token behind. Re-check the
+    // count rather than trusting one token, or that stale post releases the
+    // next suspend immediately.
+    while (suspend_count_.load(std::memory_order_acquire) > 0) {
+      int ret;
+      do {
+        ret = sem_wait(suspend_sem_ptr());
+      } while (ret == -1 && errno == EINTR);
+      if (ret == -1) {
+        // The semaphore is gone (the thread has been joined). Do not spin.
+        break;
+      }
+    }
   }
 
   void* native_handle() const override { return reinterpret_cast<void*>(thread_); }
@@ -1014,23 +1028,30 @@ class PosixCondition<Thread> : public PosixConditionBase {
   static void* ThreadStartRoutine(void* parameter);
   inline bool signaled() const override { return signaled_; }
   inline void post_execution() override {
-    if (thread_) {
+    // Every wait that a thread handle satisfies lands here, so a handle
+    // waited on twice joined the same thread twice, which is undefined once
+    // the id can be reused, and tore down the suspend semaphore each time
+    // rather than once after the join.
+    bool expected = false;
+    if (thread_ && joined_.compare_exchange_strong(expected, true)) {
       pthread_join(thread_, nullptr);
-    }
 #if defined(__APPLE__)
-    if (suspend_sem_ != SEM_FAILED) {
-      sem_close(suspend_sem_);
-      suspend_sem_ = SEM_FAILED;
-    }
+      if (suspend_sem_ != SEM_FAILED) {
+        sem_close(suspend_sem_);
+        suspend_sem_ = SEM_FAILED;
+      }
 #else
-    sem_destroy(&suspend_sem_);
+      sem_destroy(&suspend_sem_);
 #endif
+    }
   }
   pthread_t thread_;
   bool signaled_;
   int exit_code_;
-  State state_;             // Protected by state_mutex_
-  uint32_t suspend_count_;  // Protected by state_mutex_
+  State state_;  // Protected by state_mutex_
+  // Written under state_mutex_, but read from the suspend signal handler.
+  std::atomic<uint32_t> suspend_count_;
+  std::atomic<bool> joined_{false};  // Prevents a second pthread_join
 #if defined(__APPLE__)
   sem_t* suspend_sem_ = SEM_FAILED;
   sem_t* suspend_sem_ptr() { return suspend_sem_; }
