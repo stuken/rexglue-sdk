@@ -12,10 +12,12 @@
 #include <cstring>
 
 #include <rex/cvar.h>
+#include <rex/string.h>
 #include <rex/kernel/xam/private.h>
 #include <rex/logging.h>
 #include <rex/hook.h>
 #include <rex/types.h>
+#include <rex/system/flags.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xenumerator.h>
 #include <rex/system/xthread.h>
@@ -307,30 +309,73 @@ u32 XamGetLanguageLocaleString_entry(u32 language_id, u32 locale_id, u32 buffer_
   return X_E_SUCCESS;
 }
 
-u32 XamGetOnlineLanguageAndCountryString_entry(u32 language_id, u32 country_id, u32 buffer_length,
-                                               mapped_wstring buffer) {
+// Builds the "language-country" string, checking it fits in buffer_length
+// characters including the terminator.
+X_HRESULT xeXamGetOnlineLanguageAndCountryString(uint8_t language_id, uint8_t country_id,
+                                                 uint32_t buffer_length, std::u16string& value) {
   if (buffer_length >= 0x80000000u) {
     return X_E_INVALIDARG;
   }
 
-  auto language_str = xeXamGetOnlineLanguageString(static_cast<uint8_t>(language_id));
+  auto language_str = xeXamGetOnlineLanguageString(language_id);
   if (!language_str) {
     return X_E_NOTFOUND;
   }
 
-  auto country_str = xeXamGetOnlineCountryString(static_cast<uint8_t>(country_id));
+  auto country_str = xeXamGetOnlineCountryString(country_id);
   if (!country_str) {
     return X_E_NOTFOUND;
   }
 
-  const auto value = std::u16string(language_str) + u"-" + std::u16string(country_str);
+  value = std::u16string(language_str) + u"-" + std::u16string(country_str);
   if (value.size() + 1 > buffer_length) {
     return X_HRESULT_FROM_WIN32(X_ERROR_INSUFFICIENT_BUFFER);
+  }
+  return X_E_SUCCESS;
+}
+
+u32 XamGetOnlineLanguageAndCountryString_entry(u32 language_id, u32 country_id, u32 buffer_length,
+                                               mapped_wstring buffer) {
+  std::u16string value;
+  X_HRESULT result = xeXamGetOnlineLanguageAndCountryString(
+      static_cast<uint8_t>(language_id), static_cast<uint8_t>(country_id), buffer_length, value);
+  if (result != X_E_SUCCESS) {
+    return result;
   }
 
   memory::store_and_swap<std::u16string>(buffer, value);
   static_cast<char16_t*>(buffer)[value.size()] = 0;
   return X_E_SUCCESS;
+}
+
+// rexglue has a single local profile that is never Live-enabled, so no xuid
+// matches a Live profile and the locale always comes from the console
+// settings (the user_language / user_country cvars).
+X_HRESULT xeXamProfileGetLiveLegalLocale(uint32_t buffer_length, std::u16string& value) {
+  return xeXamGetOnlineLanguageAndCountryString(static_cast<uint8_t>(REXCVAR_GET(user_language)),
+                                                static_cast<uint8_t>(REXCVAR_GET(user_country)),
+                                                buffer_length, value);
+}
+
+u32 XamProfileGetLiveLegalLocale_entry(u64 xuid, u32 buffer_length, mapped_wstring buffer) {
+  std::u16string value;
+  X_HRESULT result = xeXamProfileGetLiveLegalLocale(buffer_length, value);
+  if (result != X_E_SUCCESS) {
+    return result;
+  }
+
+  memory::store_and_swap<std::u16string>(buffer, value);
+  static_cast<char16_t*>(buffer)[value.size()] = 0;
+  return X_E_SUCCESS;
+}
+
+u32 XapipGetLocale_entry(u32 buffer_length, mapped_string buffer) {
+  std::u16string value;
+  X_HRESULT result = xeXamProfileGetLiveLegalLocale(7, value);
+  if (result == X_E_SUCCESS) {
+    rex::string::copy_truncating(buffer, rex::string::to_utf8(value), buffer_length);
+  }
+  return result;
 }
 
 u32 XamGetLocaleString_entry(u32 id, u32 buffer_length, mapped_wstring buffer) {
@@ -403,6 +448,9 @@ REX_EXPORT(__imp__XamGetLanguageString, rex::kernel::xam::XamGetLanguageString_e
 REX_EXPORT(__imp__XamGetLanguageLocaleString, rex::kernel::xam::XamGetLanguageLocaleString_entry)
 REX_EXPORT(__imp__XamGetOnlineLanguageAndCountryString,
            rex::kernel::xam::XamGetOnlineLanguageAndCountryString_entry)
+REX_EXPORT(__imp__XamProfileGetLiveLegalLocale,
+           rex::kernel::xam::XamProfileGetLiveLegalLocale_entry)
+REX_EXPORT(__imp__XapipGetLocale, rex::kernel::xam::XapipGetLocale_entry)
 REX_EXPORT(__imp__XamGetLocaleString, rex::kernel::xam::XamGetLocaleString_entry)
 REX_EXPORT(__imp__XamGetLocaleFromOnlineCountry,
            rex::kernel::xam::XamGetLocaleFromOnlineCountry_entry)

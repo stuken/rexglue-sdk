@@ -15,9 +15,11 @@
 #include <rex/hook.h>
 #include <rex/types.h>
 #include <rex/string.h>
+#include <rex/system/flags.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/user_module.h>
 #include <rex/system/xenumerator.h>
+#include <rex/system/xio.h>
 #include <rex/system/xthread.h>
 #include <rex/system/xtypes.h>
 
@@ -223,6 +225,47 @@ u32 XamGetExecutionId_entry(mapped_u32 info_ptr) {
   return X_STATUS_SUCCESS;
 }
 
+u32 XamReadString_entry(u32 title_id, u64 id, u32 user_index, u32 string_out_ptr,
+                        mapped_u32 string_size_ptr, ppc_ptr_t<XAM_OVERLAPPED> overlapped) {
+  if (!string_out_ptr || id == 0xFFFF) {
+    return X_E_INVALIDARG;
+  }
+
+  if (!string_size_ptr) {
+    return X_E_INSUFFICIENT_BUFFER;
+  }
+
+  const uint32_t str_buffer_size = *string_size_ptr;
+  auto run = [id, string_out_ptr, str_buffer_size](uint32_t& extended_error,
+                                                   uint32_t& length) -> X_RESULT {
+    // 584111F7 reads leaderboard strings. Looked up in the running title's
+    // string table, as the title's SPA is the only one loaded.
+    std::u16string localized_string;
+    const util::XdbfGameData db = REX_KERNEL_STATE()->title_xdbf();
+    if (db.is_valid()) {
+      const XLanguage language =
+          db.GetExistingLanguage(static_cast<XLanguage>(REXCVAR_GET(user_language)));
+      localized_string =
+          rex::string::to_utf16(db.GetStringTableEntry(language, static_cast<uint16_t>(id)));
+    }
+
+    char16_t* str_buffer = REX_KERNEL_MEMORY()->TranslateVirtual<char16_t*>(string_out_ptr);
+    rex::string::copy_and_swap_truncating(str_buffer, localized_string, str_buffer_size);
+
+    extended_error = X_HRESULT_FROM_WIN32(X_ERROR_SUCCESS);
+    length = 0;
+    return X_ERROR_SUCCESS;
+  };
+
+  if (!overlapped) {
+    uint32_t extended_error, length = 0;
+    return run(extended_error, length);
+  }
+
+  REX_KERNEL_STATE()->CompleteOverlappedDeferredEx(run, overlapped.guest_address());
+  return X_ERROR_IO_PENDING;
+}
+
 void XamLoaderRegisterLaunchRequestCallback_entry(u32 callback) {
   // Only records the callback; nothing invokes it yet.
   auto xam = REX_KERNEL_STATE()->GetKernelModule<XamModule>("xam.xex");
@@ -383,6 +426,7 @@ REX_EXPORT(__imp__XGetGameRegion, rex::kernel::xam::XGetGameRegion_entry)
 REX_EXPORT(__imp__XGetLanguage, rex::kernel::xam::XGetLanguage_entry)
 REX_EXPORT(__imp__XamGetCurrentTitleId, rex::kernel::xam::XamGetCurrentTitleId_entry)
 REX_EXPORT(__imp__XamGetExecutionId, rex::kernel::xam::XamGetExecutionId_entry)
+REX_EXPORT(__imp__XamReadString, rex::kernel::xam::XamReadString_entry)
 REX_EXPORT(__imp__XamLoaderRegisterLaunchRequestCallback,
            rex::kernel::xam::XamLoaderRegisterLaunchRequestCallback_entry)
 REX_EXPORT(__imp__XamLoaderSetLaunchData, rex::kernel::xam::XamLoaderSetLaunchData_entry)
