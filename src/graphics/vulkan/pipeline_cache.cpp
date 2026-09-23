@@ -1337,6 +1337,10 @@ bool VulkanPipelineCache::TranslateAnalyzedShader(SpirvShaderTranslator& transla
           texture_binding_count * sizeof(*texture_bindings.data());
       uint64_t texture_binding_layout_hash =
           XXH3_64bits(texture_bindings.data(), texture_binding_layout_bytes);
+      // The layout vector and map are shared by the whole cache. Lock them as
+      // the D3D12 cache does, so translation on more than one thread can't
+      // grow the vector or rehash the map concurrently.
+      std::lock_guard<std::mutex> layouts_lock(layouts_mutex_);
       auto found_range = texture_binding_layout_map_.equal_range(texture_binding_layout_hash);
       for (auto it = found_range.first; it != found_range.second; ++it) {
         if (it->second.vector_span_length == texture_binding_count &&
