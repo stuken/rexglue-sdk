@@ -463,7 +463,10 @@ u32 XamContentDeleteInternal_entry(mapped_void content_data_ptr, mapped_void ove
   // INFO: Analysis of xam.xex shows that "internal" functions are wrappers with
   // 0xFE as user_index
   uint64_t xuid = REX_KERNEL_STATE()->user_profile()->xuid();
-  XCONTENT_AGGREGATE_DATA content_data = *content_data_ptr.as<XCONTENT_AGGREGATE_DATA*>();
+  // Internal callers pass XCONTENT_DATA_INTERNAL, whose xuid and title_id sit
+  // at different offsets than in XCONTENT_AGGREGATE_DATA.
+  XCONTENT_AGGREGATE_DATA content_data =
+      content_data_ptr.as<XCONTENT_DATA_INTERNAL*>()->ToAggregate();
 
   auto result = REX_KERNEL_STATE()->content_manager()->DeleteContent(xuid, content_data);
 
