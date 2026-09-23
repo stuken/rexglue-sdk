@@ -13,6 +13,7 @@
 #include <rex/hook.h>
 #include <rex/types.h>
 #include <rex/system/kernel_state.h>
+#include <rex/system/xio.h>
 #include <rex/system/xtypes.h>
 
 // Disable warnings about unused parameters for kernel functions
@@ -22,22 +23,50 @@ namespace rex {
 namespace kernel {
 namespace xam {
 
-u32 XamPartyGetUserList_entry(u32 player_count, mapped_u32 party_list) {
-  // 5345085D wants specifically this code to skip loading party data.
-  // This code is not documented in NT_STATUS code list
-  return 0x807D0003;
+// XamPartyCreate, XamPartyLeave, XamPartySendInvite, XamPartyJoinEx, and
+// XamPartyRemoveLocalUsers share one function.
+
+u32 XamPartyGetUserList_entry(u32 caller, mapped_void party_list_ptr) {
+  if (caller != 1) {
+    return X_E_NOT_IMPLEMENTED;
+  }
+  // 5345085D, 45410923
+  return 0x807D0003;  // X_PARTY_E_NOT_IN_PARTY
 }
 
-u32 XamPartySendGameInvites_entry(u32 r3, u32 r4, u32 r5) {
-  return X_ERROR_FUNCTION_FAILED;
+// Shares the same function as XamPartyAddLocalUsers, XamPartyKickUser,
+// XamPartyGetJoinable, XamPartySetJoinable, and XamPartyGetInfoEx.
+u32 XamPartySendGameInvites_entry(u32 caller, u32 user_index, u32 unknown,
+                                  ppc_ptr_t<system::XAM_OVERLAPPED> overlapped) {
+  auto run = [](uint32_t& extended_error, uint32_t& length) -> X_RESULT {
+    extended_error = X_ERROR_SUCCESS;
+    length = 0;
+    return X_ERROR_SUCCESS;
+  };
+
+  if (!overlapped) {
+    uint32_t extended_error, length;
+    return run(extended_error, length);
+  }
+
+  REX_KERNEL_STATE()->CompleteOverlappedDeferredEx(run, overlapped.guest_address());
+  return X_ERROR_IO_PENDING;
 }
 
-u32 XamPartySetCustomData_entry(u32 r3, u32 r4, u32 r5) {
-  return X_ERROR_FUNCTION_FAILED;
+u32 XamPartySetCustomData_entry(u32 caller, u32 user_index, mapped_void custom_data_ptr) {
+  if (caller != 1) {
+    return X_E_NOT_IMPLEMENTED;
+  } else if (user_index >= 4) {
+    return 0x807D0002;
+  }
+  return 0x807D0003;  // X_PARTY_E_NOT_IN_PARTY
 }
 
-u32 XamPartyGetBandwidth_entry(u32 r3, u32 r4) {
-  return X_ERROR_FUNCTION_FAILED;
+u32 XamPartyGetBandwidth_entry(u32 bandwidth_type, mapped_u64 bandwidth_statistic) {
+  if (bandwidth_statistic) {
+    *bandwidth_statistic = 0;
+  }
+  return X_ERROR_SUCCESS;
 }
 
 }  // namespace xam

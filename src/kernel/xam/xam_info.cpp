@@ -223,6 +223,14 @@ u32 XamGetExecutionId_entry(mapped_u32 info_ptr) {
   return X_STATUS_SUCCESS;
 }
 
+void XamLoaderRegisterLaunchRequestCallback_entry(u32 callback) {
+  // Only records the callback; nothing invokes it yet.
+  auto xam = REX_KERNEL_STATE()->GetKernelModule<XamModule>("xam.xex");
+  if (xam) {
+    xam->SetLaunchCallback(callback);
+  }
+}
+
 u32 XamLoaderSetLaunchData_entry(mapped_void data, u32 size) {
   auto xam = REX_KERNEL_STATE()->GetKernelModule<XamModule>("xam.xex");
   auto& loader_data = xam->loader_data();
@@ -375,6 +383,8 @@ REX_EXPORT(__imp__XGetGameRegion, rex::kernel::xam::XGetGameRegion_entry)
 REX_EXPORT(__imp__XGetLanguage, rex::kernel::xam::XGetLanguage_entry)
 REX_EXPORT(__imp__XamGetCurrentTitleId, rex::kernel::xam::XamGetCurrentTitleId_entry)
 REX_EXPORT(__imp__XamGetExecutionId, rex::kernel::xam::XamGetExecutionId_entry)
+REX_EXPORT(__imp__XamLoaderRegisterLaunchRequestCallback,
+           rex::kernel::xam::XamLoaderRegisterLaunchRequestCallback_entry)
 REX_EXPORT(__imp__XamLoaderSetLaunchData, rex::kernel::xam::XamLoaderSetLaunchData_entry)
 REX_EXPORT(__imp__XamLoaderGetLaunchDataSize, rex::kernel::xam::XamLoaderGetLaunchDataSize_entry)
 REX_EXPORT(__imp__XamLoaderGetLaunchData, rex::kernel::xam::XamLoaderGetLaunchData_entry)

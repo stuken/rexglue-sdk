@@ -37,10 +37,13 @@ class XamModule : public system::KernelModule {
     std::string launch_path;  // Full path to next xex
   };
 
+  void SetLaunchCallback(uint32_t callback) { launch_callback_ = callback; }
+
   const LoaderData& loader_data() const { return loader_data_; }
   LoaderData& loader_data() { return loader_data_; }
 
  private:
+  uint32_t launch_callback_ = 0;
   LoaderData loader_data_;
 };
 
