@@ -161,6 +161,9 @@ X_HRESULT XmpApp::XMPDeleteTitlePlaylist(uint32_t playlist_handle) {
 
 X_HRESULT XmpApp::XMPPlayTitlePlaylist(uint32_t playlist_handle, uint32_t song_handle) {
   REXKRNL_DEBUG("XMPPlayTitlePlaylist({:08X}, {:08X})", playlist_handle, song_handle);
+  if (!playlist_handle) {
+    return X_E_INVALIDARG;
+  }
   Playlist* playlist = nullptr;
   {
     auto global_lock = global_critical_region_.Acquire();
@@ -510,11 +513,12 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
                                     args->storage_ptr);
     }
     case 0x0007000E: {
+      // XMPGetCurrentSong
       assert_true(!buffer_length || buffer_length == 12);
       struct {
         rex::be<uint32_t> xmp_client;
-        rex::be<uint32_t> unk_ptr;  // 0
-        rex::be<uint32_t> info_ptr;
+        rex::be<uint32_t> unk_ptr;   // 0x494-byte struct, contents unknown
+        rex::be<uint32_t> info_ptr;  // SongInfo
       }* args = memory_->TranslateVirtual<decltype(args)>(buffer_ptr);
       static_assert_size(decltype(*args), 12);
 
@@ -653,11 +657,16 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       struct {
         rex::be<uint32_t> xmp_client;
         rex::be<uint32_t> flags;
-        rex::be<uint32_t> object_ptr;
+        rex::be<uint32_t> private_enum_structure_ptr;
       }* args = memory_->TranslateVirtual<decltype(args)>(buffer_ptr);
 
+      assert_true(args->xmp_client == 0x00000002);
       REXKRNL_DEBUG("XMPCreateUserPlaylistEnumerator({:08X}, {:08X}, {:08X})",
-                    uint32_t(args->xmp_client), uint32_t(args->flags), uint32_t(args->object_ptr));
+                    uint32_t(args->xmp_client), uint32_t(args->flags),
+                    uint32_t(args->private_enum_structure_ptr));
+      if (!args->private_enum_structure_ptr || args->xmp_client != 0x00000002) {
+        return X_E_INVALIDARG;
+      }
       return X_E_SUCCESS;
     }
     case 0x00070029: {
@@ -775,6 +784,10 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
           "XMPDashInit({:08X}, {:08X}, {:08X}, {:08X}, {:08X}, {:08X}), unimplemented",
           uint32_t(args->xmp_client), uint32_t(args->buffer_ptr), uint32_t(args->buffer_length),
           uint32_t(args->unk1), uint32_t(args->unk2), uint32_t(args->storage_ptr));
+      // Only the dashboard (client 0) may initialize XMP.
+      if (args->xmp_client != 0x00000000 || !args->storage_ptr || !args->buffer_ptr) {
+        return X_E_INVALIDARG;
+      }
       kernel_state_->BroadcastNotification(kMsgDashInitChanged, 1);
       return X_E_SUCCESS;
     }
@@ -819,6 +832,11 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
           "XMPSetMediaSourceWorkspace({:08X}, {:08X}, {:08X}, {:08X}), unimplemented",
           uint32_t(args->xmp_client), uint32_t(args->workspace_type), uint32_t(args->storage_ptr),
           uint32_t(args->storage_length));
+      // Clients above the title (client 2) are rejected, as is a missing
+      // storage buffer for any workspace type other than 3.
+      if (args->xmp_client > 0x00000002 || (!args->storage_ptr && args->workspace_type != 3)) {
+        return X_E_INVALIDARG;
+      }
       return X_E_SUCCESS;
     }
     case 0x00070053: {
