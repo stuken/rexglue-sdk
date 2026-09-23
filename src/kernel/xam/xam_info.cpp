@@ -266,6 +266,14 @@ u32 XamReadString_entry(u32 title_id, u64 id, u32 user_index, u32 string_out_ptr
   return X_ERROR_IO_PENDING;
 }
 
+u32 XamLogLocalizationEtx_entry(u32 error_code, u32 /*unk*/) {
+  // Both known codes use the second argument for something; accept them.
+  if (error_code == 0x80300034 || error_code == 0x80300035) {
+    return X_ERROR_SUCCESS;
+  }
+  return X_E_NOT_IMPLEMENTED;
+}
+
 void XamLoaderRegisterLaunchRequestCallback_entry(u32 callback) {
   // Only records the callback; nothing invokes it yet.
   auto xam = REX_KERNEL_STATE()->GetKernelModule<XamModule>("xam.xex");
@@ -427,6 +435,7 @@ REX_EXPORT(__imp__XGetLanguage, rex::kernel::xam::XGetLanguage_entry)
 REX_EXPORT(__imp__XamGetCurrentTitleId, rex::kernel::xam::XamGetCurrentTitleId_entry)
 REX_EXPORT(__imp__XamGetExecutionId, rex::kernel::xam::XamGetExecutionId_entry)
 REX_EXPORT(__imp__XamReadString, rex::kernel::xam::XamReadString_entry)
+REX_EXPORT(__imp__XamLogLocalizationEtx, rex::kernel::xam::XamLogLocalizationEtx_entry)
 REX_EXPORT(__imp__XamLoaderRegisterLaunchRequestCallback,
            rex::kernel::xam::XamLoaderRegisterLaunchRequestCallback_entry)
 REX_EXPORT(__imp__XamLoaderSetLaunchData, rex::kernel::xam::XamLoaderSetLaunchData_entry)

@@ -544,7 +544,6 @@ REX_EXPORT_STUB(__imp__XamLoaderSetGameInfo);
 REX_EXPORT_STUB(__imp__XamLoaderSetSpindleSpeed);
 REX_EXPORT_STUB(__imp__XamLoaderShouldConfirmReboot);
 REX_EXPORT_STUB(__imp__XamLocateTitle);
-REX_EXPORT_STUB(__imp__XamLogLocalizationEtx);
 REX_EXPORT_STUB(__imp__XamLookupCommonStringByIndex);
 REX_EXPORT_STUB(__imp__XamLrcEncryptDecryptTitleMessage);
 REX_EXPORT_STUB(__imp__XamLrcGetInput);

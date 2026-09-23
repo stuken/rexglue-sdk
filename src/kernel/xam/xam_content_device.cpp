@@ -123,6 +123,36 @@ u32 XamContentGetDeviceData_entry(u32 device_id, ppc_ptr_t<X_CONTENT_DEVICE_DATA
   return X_ERROR_SUCCESS;
 }
 
+// Like XamContentGetDeviceData, but names the device by its type rather than
+// by the device's own name.
+u32 XamContentGetLocalizedDeviceData_entry(u32 device_id,
+                                           ppc_ptr_t<X_CONTENT_DEVICE_DATA> device_data) {
+  auto device_info = GetDummyDeviceInfo(device_id);
+  if (device_info == nullptr) {
+    return X_ERROR_DEVICE_NOT_CONNECTED;
+  }
+  device_data.Zero();
+  device_data->device_id = static_cast<uint32_t>(device_info->device_id);
+  device_data->device_type = static_cast<uint32_t>(device_info->device_type);
+  device_data->total_bytes = device_info->total_bytes;
+  device_data->free_bytes = device_info->free_bytes;
+  std::u16string_view device_name;
+  switch (device_info->device_type) {
+    case DeviceType::HDD:
+      device_name = u"Hard Drive";
+      break;
+    case DeviceType::ODD:
+      device_name = u"Optical Drive";
+      break;
+    default:
+      device_name = u"Storage Device";
+      break;
+  }
+  rex::string::copy_and_swap_truncating(device_data->name_chars, device_name,
+                                        rex::countof(device_data->name_chars));
+  return X_ERROR_SUCCESS;
+}
+
 u32 XamContentCreateDeviceEnumerator_entry(u32 content_type, u32 content_flags, u32 max_count,
                                            mapped_u32 buffer_size_ptr, mapped_u32 handle_out) {
   assert_not_null(handle_out);
@@ -175,6 +205,8 @@ const DummyDeviceInfo* GetDummyDeviceInfo(uint32_t device_id) {
 REX_EXPORT(__imp__XamContentGetDeviceName, rex::kernel::xam::XamContentGetDeviceName_entry)
 REX_EXPORT(__imp__XamContentGetDeviceState, rex::kernel::xam::XamContentGetDeviceState_entry)
 REX_EXPORT(__imp__XamContentGetDeviceData, rex::kernel::xam::XamContentGetDeviceData_entry)
+REX_EXPORT(__imp__XamContentGetLocalizedDeviceData,
+           rex::kernel::xam::XamContentGetLocalizedDeviceData_entry)
 REX_EXPORT(__imp__XamContentCreateDeviceEnumerator,
            rex::kernel::xam::XamContentCreateDeviceEnumerator_entry)
 
@@ -183,5 +215,4 @@ REX_EXPORT_STUB(__imp__XamContentDeviceCheckUpdates);
 REX_EXPORT_STUB(__imp__XamContentGetDefaultDevice);
 REX_EXPORT_STUB(__imp__XamContentGetDeviceSerialNumber);
 REX_EXPORT_STUB(__imp__XamContentGetDeviceVolumePath);
-REX_EXPORT_STUB(__imp__XamContentGetLocalizedDeviceData);
 REX_EXPORT_STUB(__imp__XamContentRemoveCacheDevice);

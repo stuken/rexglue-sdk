@@ -15,6 +15,7 @@
 #include <rex/math.h>
 #include <rex/hook.h>
 #include <rex/types.h>
+#include <rex/filesystem/devices/stfs_xbox.h>
 #include <rex/string.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xam/content_device.h>
@@ -395,11 +396,27 @@ u32 XamContentGetThumbnail_entry(u32 user_index, mapped_void content_data_ptr,
   }
 }
 
-u32 XamContentSetThumbnail_entry(u32 user_index, mapped_void content_data_ptr,
-                                 mapped_void buffer_ptr, u32 buffer_size,
-                                 mapped_void overlapped_ptr) {
+u32 xeXamContentSetThumbnail(mapped_void content_data_ptr, uint32_t content_data_size,
+                             mapped_void buffer_ptr, uint32_t buffer_size,
+                             mapped_void overlapped_ptr) {
+  if (buffer_size > rex::filesystem::XContentMetadata::kThumbLengthV2) {
+    return X_E_INVALIDARG;
+  }
+
   uint64_t xuid = REX_KERNEL_STATE()->user_profile()->xuid();
-  XCONTENT_AGGREGATE_DATA content_data = *content_data_ptr.as<XCONTENT_DATA*>();
+  XCONTENT_AGGREGATE_DATA content_data;
+  if (content_data_size == sizeof(XCONTENT_DATA)) {
+    content_data = *content_data_ptr.as<XCONTENT_DATA*>();
+    content_data.title_id = REX_KERNEL_STATE()->title_id();
+  } else if (content_data_size == sizeof(XCONTENT_AGGREGATE_DATA)) {
+    content_data = *content_data_ptr.as<XCONTENT_AGGREGATE_DATA*>();
+    content_data.title_id = REX_KERNEL_STATE()->title_id();
+  } else if (content_data_size == sizeof(XCONTENT_DATA_INTERNAL)) {
+    content_data = content_data_ptr.as<XCONTENT_DATA_INTERNAL*>()->ToAggregate();
+  } else {
+    assert_always();
+    return X_ERROR_INVALID_PARAMETER;
+  }
 
   // Buffer is PNG data.
   auto buffer = std::vector<uint8_t>((uint8_t*)buffer_ptr, (uint8_t*)buffer_ptr + buffer_size);
@@ -412,6 +429,19 @@ u32 XamContentSetThumbnail_entry(u32 user_index, mapped_void content_data_ptr,
   } else {
     return result;
   }
+}
+
+u32 XamContentSetThumbnail_entry(u32 user_index, mapped_void content_data_ptr,
+                                 mapped_void buffer_ptr, u32 buffer_size,
+                                 mapped_void overlapped_ptr) {
+  return xeXamContentSetThumbnail(content_data_ptr, sizeof(XCONTENT_DATA), buffer_ptr, buffer_size,
+                                  overlapped_ptr);
+}
+
+u32 XamContentSetThumbnailInternal_entry(mapped_void content_data_ptr, mapped_void buffer_ptr,
+                                         u32 buffer_size) {
+  return xeXamContentSetThumbnail(content_data_ptr, sizeof(XCONTENT_DATA_INTERNAL), buffer_ptr,
+                                  buffer_size, mapped_void(nullptr));
 }
 
 u32 XamContentDelete_entry(u32 user_index, mapped_void content_data_ptr,
@@ -461,6 +491,8 @@ REX_EXPORT(__imp__XamContentClose, rex::kernel::xam::XamContentClose_entry)
 REX_EXPORT(__imp__XamContentGetCreator, rex::kernel::xam::XamContentGetCreator_entry)
 REX_EXPORT(__imp__XamContentGetThumbnail, rex::kernel::xam::XamContentGetThumbnail_entry)
 REX_EXPORT(__imp__XamContentSetThumbnail, rex::kernel::xam::XamContentSetThumbnail_entry)
+REX_EXPORT(__imp__XamContentSetThumbnailInternal,
+           rex::kernel::xam::XamContentSetThumbnailInternal_entry)
 REX_EXPORT(__imp__XamContentDelete, rex::kernel::xam::XamContentDelete_entry)
 REX_EXPORT(__imp__XamContentDeleteInternal, rex::kernel::xam::XamContentDeleteInternal_entry)
 
@@ -497,5 +529,4 @@ REX_EXPORT_STUB(__imp__XamContentRegisterChangeCallback);
 REX_EXPORT_STUB(__imp__XamContentResolveInternal);
 REX_EXPORT_STUB(__imp__XamContentSetAttributes);
 REX_EXPORT_STUB(__imp__XamContentSetMediaMetaDataInternal);
-REX_EXPORT_STUB(__imp__XamContentSetThumbnailInternal);
 REX_EXPORT_STUB(__imp__XamContentWritePackageHeader);

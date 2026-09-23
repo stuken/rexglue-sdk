@@ -116,6 +116,28 @@ struct XCONTENT_AGGREGATE_DATA : XCONTENT_DATA {
 };
 static_assert_size(XCONTENT_AGGREGATE_DATA, 0x148);
 
+// Content data as XAM passes it to its *Internal content exports.
+struct XCONTENT_DATA_INTERNAL : XCONTENT_DATA {
+  be<uint32_t> category;          // 0x134
+  be<uint64_t> xuid;              // 0x138
+  be<uint32_t> title_id;          // 0x140
+  be<uint32_t> license_mask;      // 0x144
+  be<uint64_t> content_size;      // 0x148, added in V4532
+  be<uint64_t> creation_time;     // 0x150, FILETIME, added in NXE
+  char16_t title_name_raw[0x40];  // 0x158
+  // Avatar asset or media content data, depending on content type.
+  uint8_t unused[0x24];        // 0x1D8
+  be<uint32_t> xcontent_flag;  // 0x1FC
+
+  XCONTENT_AGGREGATE_DATA ToAggregate() const {
+    XCONTENT_AGGREGATE_DATA data = static_cast<const XCONTENT_DATA&>(*this);
+    data.xuid = xuid;
+    data.title_id = title_id;
+    return data;
+  }
+};
+static_assert_size(XCONTENT_DATA_INTERNAL, 0x200);
+
 class ContentPackage {
  public:
   ContentPackage(KernelState* kernel_state, const std::string_view root_name,
