@@ -28,8 +28,38 @@ enum X_INPUT_DEVTYPE {
   XINPUT_DEVTYPE_KEYBOARD = 0x00000002,
 };
 
+enum X_INPUT_DEVSUBTYPE {
+  XINPUT_DEVSUBTYPE_USB_KEYBOARD = 0x00000000,
+  XINPUT_DEVSUBTYPE_GAMEPAD = 0x00000001,
+  XINPUT_DEVSUBTYPE_GUITAR = 0x00000006,
+  XINPUT_DEVSUBTYPE_GUITAR_ALTERNATE = 0x00000007,
+  XINPUT_DEVSUBTYPE_DRUM_KIT = 0x00000008,
+  XINPUT_DEVSUBTYPE_UNK = 0x00000009,
+  XINPUT_DEVSUBTYPE_GUITAR_BASS = 0x0000000B,
+};
+
 enum X_INPUT_FLAG {
   X_INPUT_FLAG_GAMEPAD = 0x00000001,
+};
+
+// Device class requested from XamUserGetDeviceContext.
+enum X_USER_DEVICE_CLASS : uint32_t {
+  DEVICE_CLASS_GAMEPAD = 0x00000000,
+  DEVICE_CLASS_BIG_BUTTON = 0x00000003,
+  DEVICE_CLASS_MIC = 0x00000004,
+  DEVICE_CLASS_NUI = 0x00000005,
+  DEVICE_CLASS_MASK = 0x000000FF,
+};
+
+// Device type bits in the context XamUserGetDeviceContext returns.
+enum X_USER_DEVICE_TYPE : uint32_t {
+  // DEVICE_CLASS_NUI takes any value below 8 (XamUserNuiGetUserIndexForBind,
+  // XamUserNuiBind).
+  DEVICE_TYPE_UNK1 = 0x40000000,   // Device class 1
+  DEVICE_TYPE_MIC_1 = 0x50000000,  // DEVICE_CLASS_MIC
+  DEVICE_TYPE_MIC_2 = 0x60000000,  // DEVICE_CLASS_MIC
+  DEVICE_TYPE_UNK2 = 0x70000000,   // Device class 1
+  DEVICE_TYPE_MASK = 0xF0000000,
 };
 
 enum X_INPUT_GAMEPAD_BUTTON {
@@ -89,6 +119,11 @@ struct X_INPUT_CAPABILITIES {
   X_INPUT_VIBRATION vibration;
 };
 static_assert_size(X_INPUT_CAPABILITIES, sizeof(X_INPUT_GAMEPAD) + sizeof(X_INPUT_VIBRATION) + 4);
+
+struct X_INPUT_CAPABILITIES_EX : X_INPUT_CAPABILITIES {
+  uint8_t unk[0xC];
+};
+static_assert_size(X_INPUT_CAPABILITIES_EX, sizeof(X_INPUT_CAPABILITIES) + 0xC);
 
 // https://msdn.microsoft.com/en-us/library/windows/desktop/microsoft.directx_sdk.reference.xinput_keystroke(v=vs.85).aspx
 struct X_INPUT_KEYSTROKE {

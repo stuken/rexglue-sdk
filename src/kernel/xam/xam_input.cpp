@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <rex/cvar.h>
 #include <rex/input/input.h>
 #include <rex/input/input_system.h>
 #include <rex/kernel/xam/private.h>
@@ -21,12 +22,15 @@
 
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
+REXCVAR_DECLARE(bool, allow_mic_initialization);  // defined in xboxkrnl_misc.cpp
+
 namespace rex {
 namespace kernel {
 namespace xam {
 using namespace rex::system;
 
 using rex::input::X_INPUT_CAPABILITIES;
+using rex::input::X_INPUT_CAPABILITIES_EX;
 using rex::input::X_INPUT_KEYSTROKE;
 using rex::input::X_INPUT_STATE;
 using rex::input::X_INPUT_VIBRATION;
@@ -70,10 +74,13 @@ u32 XamInputGetCapabilities_entry(u32 user_index, u32 flags, ppc_ptr_t<X_INPUT_C
 }
 
 u32 XamInputGetCapabilitiesEx_entry(u32 unk, u32 user_index, u32 flags,
-                                    ppc_ptr_t<X_INPUT_CAPABILITIES> caps) {
+                                    ppc_ptr_t<X_INPUT_CAPABILITIES_EX> caps) {
   if (!caps) {
     return X_ERROR_BAD_ARGUMENTS;
   }
+  // The Ex struct has 0xC trailing bytes past X_INPUT_CAPABILITIES that the
+  // input system doesn't fill.
+  caps.Zero();
 
   if ((flags & 0xFF) && (flags & XINPUT_FLAG_GAMEPAD) == 0) {
     // Ignore any query for other types of devices.
@@ -191,12 +198,15 @@ u32 XamInputGetKeystrokeEx_entry(mapped_u32 user_index_ptr, u32 flags,
   return result;
 }
 
-i32 XamUserGetDeviceContext_entry(u32 user_index, u32 unk, mapped_u32 out_ptr) {
+i32 XamUserGetDeviceContext_entry(u32 user_index, u32 device_class, mapped_u32 out_ptr) {
   // Games check the result - usually with some masking.
   // If this function fails they assume zero, so let's fail AND
   // set zero just to be safe.
   *out_ptr = 0;
   if (!user_index || (user_index & 0xFF) == 0xFF) {
+    if (device_class == rex::input::DEVICE_CLASS_MIC && REXCVAR_GET(allow_mic_initialization)) {
+      *out_ptr = rex::input::DEVICE_TYPE_MIC_2;
+    }
     return X_E_SUCCESS;
   } else {
     return X_E_DEVICE_NOT_CONNECTED;
