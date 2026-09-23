@@ -18,6 +18,7 @@
 
 #include <rex/assert.h>
 #include <rex/cvar.h>
+#include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline/shader/dxbc.h>
 #include <rex/graphics/pipeline/shader/dxbc_translator.h>
 #include <rex/graphics/xenos.h>
@@ -66,6 +67,7 @@ DxbcShaderTranslator::DxbcShaderTranslator(ui::GraphicsProvider::GpuVendorID ven
       vendor_id_(vendor_id),
       bindless_resources_used_(bindless_resources_used),
       edram_rov_used_(edram_rov_used),
+      zpd_full_counters_(REXCVAR_GET(occlusion_query_full_counters)),
       gamma_render_target_as_unorm8_(gamma_render_target_as_unorm8),
       msaa_2x_supported_(msaa_2x_supported),
       draw_resolution_scale_x_(draw_resolution_scale_x),
@@ -79,13 +81,19 @@ DxbcShaderTranslator::DxbcShaderTranslator(ui::GraphicsProvider::GpuVendorID ven
 }
 DxbcShaderTranslator::~DxbcShaderTranslator() = default;
 
-std::vector<uint8_t> DxbcShaderTranslator::CreateDepthOnlyPixelShader() {
+std::vector<uint8_t> DxbcShaderTranslator::CreateDepthOnlyPixelShader(
+    bool zpd_total, Modification::DepthStencilMode depth_stencil_mode) {
   is_depth_only_pixel_shader_ = true;
   // TODO(Triang3l): Handle in a nicer way (is_depth_only_pixel_shader_ is a
   // leftover from when a Shader object wasn't used during translation).
   Shader shader(xenos::ShaderType::kPixel, 0, nullptr, 0);
-  shader.AnalyzeUcode(instruction_disassembly_buffer_);
-  Shader::Translation& translation = *shader.GetOrCreateTranslation(0);
+  if (!shader.is_ucode_analyzed()) {
+    shader.AnalyzeUcode(instruction_disassembly_buffer_);
+  }
+  Modification modification(0);
+  modification.pixel.zpd_total = uint32_t(zpd_total);
+  modification.pixel.depth_stencil_mode = depth_stencil_mode;
+  Shader::Translation& translation = *shader.GetOrCreateTranslation(modification.value);
   TranslateAnalyzedShader(translation);
   is_depth_only_pixel_shader_ = false;
   return translation.translated_binary();
@@ -160,7 +168,7 @@ void DxbcShaderTranslator::Reset() {
   uav_count_ = 0;
   uav_index_shared_memory_ = kBindingIndexUnallocated;
   uav_index_edram_ = kBindingIndexUnallocated;
-  uav_index_zpd_rov_counter_ = kBindingIndexUnallocated;
+  uav_index_zpd_counter_ = kBindingIndexUnallocated;
 
   sampler_bindings_.clear();
 
@@ -1980,7 +1988,7 @@ const DxbcShaderTranslator::SystemConstantRdef DxbcShaderTranslator::system_cons
     {"xe_alpha_to_mask", ShaderRdefTypeIndex::kUint, sizeof(uint32_t)},
     {"xe_edram_32bpp_tile_pitch_dwords_scaled", ShaderRdefTypeIndex::kUint, sizeof(uint32_t)},
     {"xe_edram_depth_base_dwords_scaled", ShaderRdefTypeIndex::kUint, sizeof(uint32_t)},
-    {"xe_zpd_rov_counter_index", ShaderRdefTypeIndex::kUint, sizeof(uint32_t)},
+    {"xe_zpd_counter_index", ShaderRdefTypeIndex::kUint, sizeof(uint32_t)},
 
     {"xe_color_exp_bias", ShaderRdefTypeIndex::kFloat4, sizeof(float) * 4},
 
@@ -2001,8 +2009,7 @@ const DxbcShaderTranslator::SystemConstantRdef DxbcShaderTranslator::system_cons
 
     {"xe_edram_blend_constant", ShaderRdefTypeIndex::kFloat4, sizeof(float) * 4},
 
-    {"xe_texture_integer_scale_bits", ShaderRdefTypeIndex::kUint4Array8,
-     sizeof(uint32_t) * 32},
+    {"xe_texture_integer_scale_bits", ShaderRdefTypeIndex::kUint4Array8, sizeof(uint32_t) * 32},
 };
 
 void DxbcShaderTranslator::WriteResourceDefinition() {
@@ -2341,9 +2348,9 @@ void DxbcShaderTranslator::WriteResourceDefinition() {
   if (uav_index_edram_ != kBindingIndexUnallocated) {
     name_ptr += dxbc::AppendAlignedString(shader_object_, "xe_edram");
   }
-  uint32_t zpd_rov_counter_name_ptr = name_ptr;
-  if (uav_index_zpd_rov_counter_ != kBindingIndexUnallocated) {
-    name_ptr += dxbc::AppendAlignedString(shader_object_, "xe_zpd_rov_counter_uav");
+  uint32_t zpd_counter_name_ptr = name_ptr;
+  if (uav_index_zpd_counter_ != kBindingIndexUnallocated) {
+    name_ptr += dxbc::AppendAlignedString(shader_object_, "xe_zpd_counter_uav");
   }
 
   uint32_t bindings_position_dwords = uint32_t(shader_object_.size());
@@ -2469,13 +2476,13 @@ void DxbcShaderTranslator::WriteResourceDefinition() {
         uav.dimension = dxbc::RdefDimension::kUAVBuffer;
         uav.sample_count = UINT32_MAX;
         uav.bind_point = uint32_t(UAVRegister::kEdram);
-      } else if (i == uav_index_zpd_rov_counter_) {
-        // ROV ZPD counter buffer.
-        uav.name_ptr = zpd_rov_counter_name_ptr;
+      } else if (i == uav_index_zpd_counter_) {
+        // ZPD counter buffer.
+        uav.name_ptr = zpd_counter_name_ptr;
         uav.type = dxbc::RdefInputType::kUAVRWByteAddress;
         uav.return_type = dxbc::ResourceReturnType::kMixed;
         uav.dimension = dxbc::RdefDimension::kUAVBuffer;
-        uav.bind_point = uint32_t(UAVRegister::kZpdRovCounter);
+        uav.bind_point = uint32_t(UAVRegister::kZpdCounter);
       } else {
         assert_unhandled_case(i);
       }
@@ -2675,11 +2682,12 @@ void DxbcShaderTranslator::WriteInputSignature() {
       is_front_face.always_reads_mask = in_front_face_used_ ? 0b0001 : 0b0000;
     }
 
-    // Sample index (SV_SampleIndex) for safe memexport with sample-rate
-    // shading.
+    // Sample index (SV_SampleIndex) for safe memexport and ZPD Total counting
+    // with sample-rate shading.
     size_t sample_index_position = SIZE_MAX;
-    if (current_shader().memexport_eM_written() && IsSampleRate()) {
-      size_t sample_index_position = shader_object_.size();
+    if ((current_shader().memexport_eM_written() || GetDxbcShaderModification().pixel.zpd_total) &&
+        IsSampleRate()) {
+      sample_index_position = shader_object_.size();
       shader_object_.resize(shader_object_.size() + kParameterDwords);
       ++parameter_count;
       {
@@ -3283,12 +3291,11 @@ void DxbcShaderTranslator::WriteShaderCode() {
           dxbc::ResourceReturnTypeX4Token(dxbc::ResourceReturnType::kUInt),
           dxbc::Src::U(dxbc::Src::Dcl, uav_index_edram_, uint32_t(UAVRegister::kEdram),
                        uint32_t(UAVRegister::kEdram)));
-    } else if (i == uav_index_zpd_rov_counter_) {
-      // ROV ZPD counter buffer.
+    } else if (i == uav_index_zpd_counter_) {
+      // ZPD counter buffer.
       ao_.OpDclUnorderedAccessViewRaw(
-          0, dxbc::Src::U(dxbc::Src::Dcl, uav_index_zpd_rov_counter_,
-                          uint32_t(UAVRegister::kZpdRovCounter),
-                          uint32_t(UAVRegister::kZpdRovCounter)));
+          0, dxbc::Src::U(dxbc::Src::Dcl, uav_index_zpd_counter_,
+                          uint32_t(UAVRegister::kZpdCounter), uint32_t(UAVRegister::kZpdCounter)));
     } else {
       assert_unhandled_case(i);
     }
@@ -3383,27 +3390,26 @@ void DxbcShaderTranslator::WriteShaderCode() {
                           dxbc::Dest::V1D(in_reg_ps_position_, in_position_used_),
                           dxbc::Name::kPosition);
     }
-    bool sample_rate_memexport = current_shader().memexport_eM_written() && IsSampleRate();
+    bool zpd_total = GetDxbcShaderModification().pixel.zpd_total;
+    bool sample_rate_sample_index =
+        (current_shader().memexport_eM_written() || zpd_total) && IsSampleRate();
     // Sample-rate shading can't be done with UAV-only rendering (sample-rate
     // shading is only needed for float24 depth conversion when using a float32
     // host depth buffer).
-    assert_false(sample_rate_memexport && edram_rov_used_);
+    assert_false(sample_rate_sample_index && edram_rov_used_);
     uint32_t front_face_and_sample_index_mask =
-        uint32_t(in_front_face_used_) | (uint32_t(sample_rate_memexport) << 1);
+        uint32_t(in_front_face_used_) | (uint32_t(sample_rate_sample_index) << 1);
     if (front_face_and_sample_index_mask) {
       // Is front face, sample index.
       ao_.OpDclInputPSSGV(
           dxbc::Dest::V1D(in_reg_ps_front_face_sample_index_, front_face_and_sample_index_mask),
           dxbc::Name::kIsFrontFace);
     }
-    if (edram_rov_used_) {
+    if (edram_rov_used_ || sample_rate_sample_index || zpd_total) {
       // Sample coverage input.
       ao_.OpDclInput(dxbc::Dest::VCoverage());
-    } else {
-      if (sample_rate_memexport) {
-        // Sample coverage input.
-        ao_.OpDclInput(dxbc::Dest::VCoverage());
-      }
+    }
+    if (!edram_rov_used_) {
       // Color output.
       uint32_t color_targets_written = current_shader().writes_color_targets();
       for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {

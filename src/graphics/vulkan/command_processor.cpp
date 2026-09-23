@@ -2269,6 +2269,7 @@ void VulkanCommandProcessor::OnGammaRampPWLValueWritten() {
 void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                        uint32_t frontbuffer_height) {
   SCOPE_profile_cpu_f("gpu");
+  EndZPDFrame();
   vertex_buffers_in_sync_[0] = 0;
   vertex_buffers_in_sync_[1] = 0;
 
@@ -3253,9 +3254,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
   in_render_pass_ = true;
 
   // Resume any pending ZPD segment now that the pass is open.
-  if (GetZPDMode() != ZPDMode::kFake) {
-    OpenQuerySegment(false);
-  }
+  OpenQuerySegment(false);
 }
 
 void VulkanCommandProcessor::EndRenderPass() {
@@ -3264,12 +3263,8 @@ void VulkanCommandProcessor::EndRenderPass() {
   // Close native Vulkan occlusion queries before ending the pass. FSI counter
   // segments don't use vkCmdBeginQuery / vkCmdEndQuery and can stay logically
   // open across render passes.
-  if (GetZPDMode() != ZPDMode::kFake && zpd_active_segment_.segment_active &&
-      !zpd_active_query_is_fsi_) {
+  if (zpd_active_segment_.segment_active && !zpd_active_query_is_fsi_) {
     CloseQuerySegment();
-    if (zpd_active_segment_.logical_active) {
-      zpd_active_segment_.segment_pending_begin = true;
-    }
   }
 
   if (!in_render_pass_) {
@@ -3923,6 +3918,10 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets;
   uint32_t draw_resolution_scale_x = texture_cache_->draw_resolution_scale_x();
   uint32_t draw_resolution_scale_y = texture_cache_->draw_resolution_scale_y();
+  // ZPD segments can't mix scales. This also opens the report's pending
+  // segment at its first draw. Needs to happen before the FSI counter index
+  // goes into system constants.
+  UpdateZPDSegment(draw_resolution_scale_x * draw_resolution_scale_y, false);
 
   // Get dynamic rasterizer state.
   draw_util::ViewportInfo viewport_info;
@@ -4750,12 +4749,12 @@ void VulkanCommandProcessor::EvictOldReadbackBuffers(
 }
 
 void VulkanCommandProcessor::EnsureZPDQueryResources() {
-  if (GetZPDMode() == ZPDMode::kFake || !REXCVAR_GET(occlusion_query_enable) ||
+  if (zpd_mode_ == ZPDMode::kFake || !REXCVAR_GET(occlusion_query_enable) ||
       !zpd_host_query_pool_) {
     return;
   }
 
-  bool can_recreate = !zpd_active_segment_.logical_active &&
+  bool can_recreate = zpd_current_report_.handle == kInvalidReportHandle &&
                       !zpd_active_segment_.segment_active &&
                       zpd_active_query_index_ == UINT32_MAX && !zpd_active_query_is_fsi_ &&
                       !zpd_host_query_pool_->has_pending_resolve_batch() &&
@@ -4824,8 +4823,7 @@ bool VulkanCommandProcessor::CanOpenZPDQuery() const {
   return use_fsi_counter_path || in_render_pass_;
 }
 
-CommandProcessor::QueryOpenResult VulkanCommandProcessor::OpenZPDQuery(
-    ReportHandle report_handle, bool can_close_submission) {
+CommandProcessor::QueryOpenResult VulkanCommandProcessor::OpenZPDQuery(bool can_close_submission) {
   bool use_fsi_counter_path = zpd_query_pool_needs_fsi_counter_ && zpd_host_query_pool_ &&
                               zpd_host_query_pool_->fsi_initialized();
 
@@ -4846,7 +4844,7 @@ CommandProcessor::QueryOpenResult VulkanCommandProcessor::OpenZPDQuery(
       is_pool_exhausted = !zpd_host_query_pool_->has_free_indices();
     }
 
-    if (is_pool_exhausted && GetZPDMode() == ZPDMode::kFast) {
+    if (is_pool_exhausted && zpd_mode_ != ZPDMode::kStrict) {
       return QueryOpenResult::kPoolExhausted;
     }
 
@@ -4993,41 +4991,8 @@ bool VulkanCommandProcessor::CloseZPDQuery(ReportHandle report_handle, uint64_t&
   return true;
 }
 
-bool VulkanCommandProcessor::DiscardZPDQuery() {
-  if (zpd_active_query_is_fsi_) {
-    // The slot counter may be dirty if draws ran between OpenZPDQuery and
-    // here, but the next OpenZPDQuery clears it before any new shader adds.
-    zpd_host_query_pool_->ReleaseQueryIndex(zpd_active_query_index_, zpd_active_query_generation_);
-    zpd_active_query_index_ = UINT32_MAX;
-    zpd_active_query_generation_ = 0;
-    zpd_active_query_is_fsi_ = false;
-    zpd_fsi_counter_index_force_update_ = true;
-    return true;
-  }
-
-  if (!in_render_pass_) {
-    // vkCmdEndQuery is invalid outside a render pass for occlusion queries.
-    // Defer the release until the submission containing the stale BeginQuery
-    // completes on the GPU.
-    zpd_deferred_releases_.push_back({GetCurrentSubmission(), zpd_active_query_index_,
-                                      zpd_active_query_generation_});
-    zpd_active_query_index_ = UINT32_MAX;
-    zpd_active_query_generation_ = 0;
-    zpd_active_query_is_fsi_ = false;
-    return true;
-  }
-
-  // Inside a render pass, EndQuery must be issued before releasing the slot.
-  zpd_host_query_pool_->EndQuery(deferred_command_buffer_, zpd_active_query_index_);
-  zpd_host_query_pool_->ReleaseQueryIndex(zpd_active_query_index_, zpd_active_query_generation_);
-  zpd_active_query_index_ = UINT32_MAX;
-  zpd_active_query_generation_ = 0;
-  zpd_active_query_is_fsi_ = false;
-  return true;
-}
-
 void VulkanCommandProcessor::PumpQueryResolves() {
-  if (GetZPDMode() == ZPDMode::kFake || !zpd_host_query_pool_) {
+  if (zpd_mode_ == ZPDMode::kFake || !zpd_host_query_pool_) {
     return;
   }
 
@@ -5063,24 +5028,24 @@ void VulkanCommandProcessor::PumpQueryResolves() {
       uint64_t raw_samples = zpd_host_query_pool_->GetQueryReadbackValue(resolve.query_index,
                                                                          resolve.uses_fsi_counter);
       zpd_host_query_pool_->ReleaseQueryIndex(resolve.query_index, resolve.query_generation);
-      OnZPDQueryResolved(resolve.report_handle, raw_samples, resolve.scale_area);
+      // Vulkan only counts passing samples, native or FSI, so everything
+      // resolves as ZPass.
+      OnZPDQueryResolved(resolve.report_handle, XenosZPDReport::FromNativeQuery(raw_samples),
+                         resolve.scale_area);
     }
   }
 }
 
 bool VulkanCommandProcessor::AwaitQueryResolve(ReportHandle report_handle,
                                                uint64_t wait_for_submission) {
-  if (GetZPDMode() == ZPDMode::kFake) {
+  if (zpd_mode_ == ZPDMode::kFake) {
     return false;
   }
 
   PumpQueryResolves();
 
-  auto it = logical_zpd_reports_.find(report_handle);
-  if (it == logical_zpd_reports_.end()) {
-    return true;
-  }
-  if (it->second.pending_segments == 0 && it->second.ended) {
+  const ZPDReport* report = FindZPDReport(report_handle);
+  if (!report || !report->pending_segments) {
     return true;
   }
   if (wait_for_submission == 0) {
@@ -5107,9 +5072,8 @@ bool VulkanCommandProcessor::AwaitQueryResolve(ReportHandle report_handle,
 
   PumpQueryResolves();
 
-  it = logical_zpd_reports_.find(report_handle);
-  return it == logical_zpd_reports_.end() ||
-         (it->second.pending_segments == 0 && it->second.ended);
+  report = FindZPDReport(report_handle);
+  return !report || !report->pending_segments;
 }
 
 void VulkanCommandProcessor::PollCompletedSubmission() {
@@ -5546,7 +5510,7 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
     }
 
     // Can't cross command buffer boundaries. Close the active segment first.
-    if (GetZPDMode() != ZPDMode::kFake) {
+    if (zpd_mode_ != ZPDMode::kFake) {
       CloseQuerySegment();
     }
 

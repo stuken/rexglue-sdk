@@ -138,7 +138,7 @@ class D3D12CommandProcessor : public CommandProcessor {
     kEdramR32UintUAV,
     kEdramR32G32UintUAV,
     kEdramR32G32B32A32UintUAV,
-    kZpdROVCounterRawUAV,
+    kZpdCounterRawUAV,
 
     kGammaRampTableSRV,
     kGammaRampPWLSRV,
@@ -195,18 +195,17 @@ class D3D12CommandProcessor : public CommandProcessor {
 
   // ZPD occlusion queries backend.
   // BeginQuery/EndQuery must be in the same command list, segments split at
-  // EndSubmission, resume at BeginSubmission. Discarded queries still need
-  // EndQuery or the heap slot breaks on some drivers. RecordZPDResolveBatch
-  // emits coalesced ResolveQueryData and ROV counter copies at submit.
+  // EndSubmission, resume at BeginSubmission. RecordZPDResolveBatch emits
+  // coalesced ResolveQueryData and counter copies at submit.
   void EnsureZPDQueryResources() override;
   void ShutdownZPDQueryResources() override {
     zpd_resolves_in_flight_.clear();
     zpd_active_query_index_ = UINT32_MAX;
     zpd_active_query_generation_ = 0;
     zpd_active_query_is_rov_ = false;
-    zpd_query_pool_needs_rov_counter_ = false;
-    bindful_zpd_rov_counter_buffer_ = nullptr;
-    bindful_zpd_rov_counter_capacity_ = 0;
+    zpd_rov_path_ = false;
+    bindful_zpd_counter_buffer_ = nullptr;
+    bindful_zpd_counter_capacity_ = 0;
     if (!bindless_resources_used_) {
       draw_view_bindful_heap_index_ =
           rex::ui::d3d12::D3D12DescriptorHeapPool::kHeapIndexInvalid;
@@ -219,9 +218,8 @@ class D3D12CommandProcessor : public CommandProcessor {
   bool IsZPDQueryPoolReady() const override;
   bool CanOpenZPDQuery() const override;
 
-  QueryOpenResult OpenZPDQuery(ReportHandle report_handle, bool can_close_submission) override;
+  QueryOpenResult OpenZPDQuery(bool can_close_submission) override;
   bool CloseZPDQuery(ReportHandle report_handle, uint64_t& out_submission) override;
-  bool DiscardZPDQuery() override;
   void PumpQueryResolves() override;
   bool AwaitQueryResolve(ReportHandle report_handle, uint64_t wait_for_submission) override;
 
@@ -434,7 +432,7 @@ class D3D12CommandProcessor : public CommandProcessor {
   void InvalidateVertexBufferResidencyRange(uint32_t first_vfetch, uint32_t last_vfetch);
 
   void WriteGammaRampSRV(bool is_pwl, D3D12_CPU_DESCRIPTOR_HANDLE handle) const;
-  void WriteZPDROVCounterRawUAVDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle) const;
+  void WriteZPDCounterRawUAVDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle) const;
 
   bool device_removed_ = false;
 
@@ -443,16 +441,18 @@ class D3D12CommandProcessor : public CommandProcessor {
     uint32_t query_index = UINT32_MAX;
     uint32_t query_generation = 0;
     uint32_t scale_area = 1;
-    bool uses_rov_counter = false;
+    bool rov = false;
+    bool hybrid = false;
     ReportHandle report_handle = kInvalidReportHandle;
   };
   uint32_t zpd_active_query_index_ = UINT32_MAX;
   uint32_t zpd_active_query_generation_ = 0;
   bool zpd_active_query_is_rov_ = false;
-  bool zpd_query_pool_needs_rov_counter_ = false;
+  bool zpd_rov_path_ = false;
+  bool zpd_hybrid_supported_ = false;
   std::deque<PendingQueryResolve> zpd_resolves_in_flight_;
-  ID3D12Resource* bindful_zpd_rov_counter_buffer_ = nullptr;
-  uint32_t bindful_zpd_rov_counter_capacity_ = 0;
+  ID3D12Resource* bindful_zpd_counter_buffer_ = nullptr;
+  uint32_t bindful_zpd_counter_capacity_ = 0;
   std::unique_ptr<ZPDQueryPool> zpd_host_query_pool_;
 
   bool cache_clear_requested_ = false;

@@ -457,11 +457,9 @@ class VulkanCommandProcessor : public CommandProcessor {
   bool IsZPDQueryPoolReady() const override;
   bool CanOpenZPDQuery() const override;
 
-  QueryOpenResult OpenZPDQuery(ReportHandle report_handle,
-                               bool can_close_submission) override;
+  QueryOpenResult OpenZPDQuery(bool can_close_submission) override;
   bool CloseZPDQuery(ReportHandle report_handle,
                      uint64_t& out_submission) override;
-  bool DiscardZPDQuery() override;
   void PumpQueryResolves() override;
   bool AwaitQueryResolve(ReportHandle report_handle,
                          uint64_t wait_for_submission) override;
