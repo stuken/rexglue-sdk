@@ -11,6 +11,7 @@
 
 #include <array>
 #include <cstring>
+#include <memory>
 #include <queue>
 #include <string>
 
@@ -38,6 +39,29 @@ static const char* kGameContentHeaderDirName = "Headers";
 
 static int content_device_id_ = 0;
 
+// Xenia writes the package's own STFS header to the .header file instead of an
+// XCONTENT_AGGREGATE_DATA, so content copied from a Xenia install carries one.
+static std::unique_ptr<rex::filesystem::StfsHeader> ReadStfsHeaderFile(
+    const std::filesystem::path& header_path) {
+  std::error_code ec;
+  if (std::filesystem::file_size(header_path, ec) < sizeof(rex::filesystem::StfsHeader) || ec) {
+    return nullptr;
+  }
+
+  auto file = rex::filesystem::OpenFile(header_path, "rb");
+  if (!file) {
+    return nullptr;
+  }
+  auto header = std::make_unique<rex::filesystem::StfsHeader>();
+  size_t read = fread(header.get(), 1, sizeof(rex::filesystem::StfsHeader), file);
+  fclose(file);
+
+  if (read != sizeof(rex::filesystem::StfsHeader) || !header->header.is_magic_valid()) {
+    return nullptr;
+  }
+  return header;
+}
+
 ContentPackage::ContentPackage(KernelState* kernel_state, const std::string_view root_name,
                                const XCONTENT_AGGREGATE_DATA& data,
                                const std::filesystem::path& package_path)
@@ -61,6 +85,16 @@ ContentPackage::~ContentPackage() {
 
 void ContentPackage::LoadPackageLicenseMask(const std::filesystem::path header_path) {
   if (!std::filesystem::exists(header_path)) {
+    return;
+  }
+
+  if (auto stfs = ReadStfsHeaderFile(header_path)) {
+    license_ = 0;
+    for (const auto& license : stfs->header.licenses) {
+      if (license.license_flags) {
+        license_ |= license.license_bits;
+      }
+    }
     return;
   }
 
@@ -230,6 +264,19 @@ X_RESULT ContentManager::ReadContentHeaderFile(const std::string_view file_name,
 
   if (!std::filesystem::exists(header_file_path)) {
     return X_ERROR_FILE_NOT_FOUND;
+  }
+
+  if (auto stfs = ReadStfsHeaderFile(header_file_path)) {
+    std::memset(&data, 0, sizeof(data));
+    data.device_id = static_cast<uint32_t>(DummyDeviceId::HDD);
+    data.content_type = stfs->metadata.content_type;
+    auto display_name = stfs->metadata.display_name(rex::system::XLanguage::kEnglish);
+    data.set_display_name(display_name.empty() ? rex::path_to_utf16(rex::to_path(file_name))
+                                                : display_name);
+    data.set_file_name(file_name);
+    data.xuid = xuid;
+    data.title_id = title_id;
+    return X_ERROR_SUCCESS;
   }
 
   auto file = rex::filesystem::OpenFile(header_file_path, "rb");
